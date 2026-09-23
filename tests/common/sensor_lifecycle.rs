@@ -299,6 +299,7 @@ pub async fn create_paired_stream(
 /// `slope` and `intercept` compute `calibrated_value = slope * raw + intercept` at insert time,
 /// which is what the ingestion path does once a curve covers the reading. Use
 /// `insert_readings_without_curve` for the case where none does.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_readings(
     db: &DatabaseConnection,
     stream_id: Uuid,

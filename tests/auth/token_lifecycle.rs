@@ -270,7 +270,7 @@ async fn per_token_rate_limit_returns_429() {
         limited_statuses.push(s);
     }
     assert!(
-        limited_statuses.iter().any(|&s| s == 429),
+        limited_statuses.contains(&429),
         "a rate-limited key must eventually 429 in a burst, got {limited_statuses:?}"
     );
 

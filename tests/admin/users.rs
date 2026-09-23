@@ -341,9 +341,7 @@ async fn assign_roles_errors_when_role_removal_fails() {
         }),
     )
     .await;
-    let err = result
-        .err()
-        .expect("a failed role removal must not report success");
+    let err = result.expect_err("a failed role removal must not report success");
     assert!(
         format!("{err:?}").contains("500"),
         "error should carry the Keycloak status: {err:?}"

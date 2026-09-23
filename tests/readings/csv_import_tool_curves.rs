@@ -121,6 +121,13 @@ async fn a_request_curve_nothing_carries_is_refused() {
 #[tokio::test]
 #[serial]
 async fn the_plan_reports_each_slot_and_a_bad_cell_is_the_rows_error() {
+    // The plan runs the tool over each row, so its outputs are screened with its inputs.
+    if !crate::common::profile::Service::ToolsRunner
+        .require("the_plan_reports_each_slot_and_a_bad_cell_is_the_rows_error")
+        .await
+    {
+        return;
+    }
     let fx = setup().await;
     let curve = create_curve(&fx, "Plate A").await;
     let other = create_curve(&fx, "Plate B").await;

@@ -248,3 +248,7 @@ async fn named_projects(state: &AppState, ids: Option<&[Uuid]>) -> AppResult<Vec
         })
         .collect())
 }
+
+#[cfg(test)]
+#[path = "tests/me.rs"]
+mod tests;

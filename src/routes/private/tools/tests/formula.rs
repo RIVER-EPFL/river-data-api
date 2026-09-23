@@ -155,7 +155,7 @@ fn test_a_step_is_ordered_whatever_case_its_reader_names_it_in() {
     let mut step = formula("Zz", 0, "field_bp * 1.0", None, &[("field_bp", "Field_BP")]);
     step.intermediate = true;
     let reader = formula("aa", 0, "ZZ * 2", Some("aa"), &[]);
-    assert_eq!(codes(&vec![step, reader]), vec!["Zz", "aa"]);
+    assert_eq!(codes(&[step, reader]), vec!["Zz", "aa"]);
 }
 
 /// A step nothing reads is still a formula of the set, ordered by the tie-break like any other.
@@ -170,7 +170,7 @@ fn test_an_unread_step_keeps_the_ordinal_tie_break() {
         Some("aa"),
         &[("field_bp", "Field_BP")],
     );
-    assert_eq!(codes(&vec![step, other]), vec!["aa", "zz"]);
+    assert_eq!(codes(&[step, other]), vec!["aa", "zz"]);
 }
 
 /// Two steps reading each other have no runnable order, and the cycle is named rather than
@@ -181,7 +181,7 @@ fn test_two_steps_reading_each_other_are_a_cycle() {
     first.intermediate = true;
     let mut second = formula("bb", 0, "aa + 1", None, &[]);
     second.intermediate = true;
-    let err = in_order(&vec![first, second]).expect_err("a cycle has no order");
+    let err = in_order(&[first, second]).expect_err("a cycle has no order");
     assert!(err.contains("aa") && err.contains("bb"), "{err}");
 }
 

@@ -492,6 +492,7 @@ fn supersedes(alias: &str, kind: Kind) -> Expr {
 /// One `reading_decisions` row per reading a run moved, read from the CTE `source` (as `alias`) the
 /// write returned. `filter` holds the insert to the rows that actually moved; a statement whose
 /// returned rows all moved by construction passes none.
+#[allow(clippy::too_many_arguments)]
 fn ledger_insert(
     kind: Kind,
     origin: Origin,

@@ -289,7 +289,7 @@ async fn flagging_replicate_zero_keeps_the_grab_served() {
     let series = fetch_temp_series(&app, &token, "&include_flagged=false").await;
     let empty = series["parameters"][0]["values"]
         .as_array()
-        .map_or(true, Vec::is_empty);
+        .is_none_or(Vec::is_empty);
     assert!(
         empty,
         "a fully flagged grab disappears from the unflagged served set: {series}"

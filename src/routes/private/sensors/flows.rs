@@ -56,10 +56,9 @@ impl Job for ReprocessSensor {
                     .to_owned(),
             ))
             .await
+            && let Ok(site_id) = row.try_get::<Uuid>("", "site_id")
         {
-            if let Ok(site_id) = row.try_get::<Uuid>("", "site_id") {
-                ctx.set_site(site_id).await;
-            }
+            ctx.set_site(site_id).await;
         }
         ctx.report(
             JobReport::new()

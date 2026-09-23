@@ -362,7 +362,7 @@ async fn scalar(
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!(
+            format!(
                 "SELECT {column} AS v FROM readings WHERE parameter_id = $1 AND time = $2 LIMIT 1"
             ),
             [param.into(), time.into()],

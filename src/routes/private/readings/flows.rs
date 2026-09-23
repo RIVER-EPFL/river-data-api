@@ -103,7 +103,7 @@ pub(super) async fn displace_spot_tail(
         .column(readings::Column::ReplicateIndex)
         .column_as(reason, "reason")
         .filter(readings::Column::StreamId.eq(stream_id))
-        .filter(readings::Column::Time.eq(time_value.clone()))
+        .filter(readings::Column::Time.eq(time_value))
         .filter(readings::Column::ReplicateIndex.gte(count))
         .filter(readings::Column::MeasurementType.eq("spot"))
         .filter(readings::Column::WithdrawnAt.is_null())
@@ -148,7 +148,7 @@ pub(super) async fn displace_spot_tail(
         Kind::Withdraw,
         Condition::all()
             .add(r(readings::Column::StreamId).eq(stream_id))
-            .add(r(readings::Column::Time).eq(time_value.clone()))
+            .add(r(readings::Column::Time).eq(time_value))
             .add(r(readings::Column::ReplicateIndex).gte(count))
             .add(r(readings::Column::MeasurementType).eq("spot"))
             .add(r(readings::Column::WithdrawnAt).is_null()),

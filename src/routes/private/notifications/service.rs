@@ -127,7 +127,7 @@ pub(super) async fn resolve_live(state: &AppState, sub: &str) -> Option<RoleReso
 /// unresolvable user, receives nothing (fail closed).
 pub async fn accessible_project_ids(state: &AppState, sub: &str) -> Option<HashSet<Uuid>> {
     match state.authorizer.resolve(state, sub).await {
-        Some(RoleResolution::Active(role)) if role == Role::Administrator => None,
+        Some(RoleResolution::Active(Role::Administrator)) => None,
         Some(RoleResolution::Active(_)) => {
             Some((*load_grants(&state.db, &state.grants_cache, sub).await).clone())
         }
@@ -1480,7 +1480,7 @@ pub(super) async fn job_total_since(
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             PG,
-            &format!(
+            format!(
                 "SELECT COALESCE(SUM({value}), 0)::bigint AS n FROM reprocessing_jobs \
                   WHERE trigger_type = $1 AND status = 'completed' AND completed_at > $2"
             ),

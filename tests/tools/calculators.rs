@@ -70,7 +70,8 @@ async fn test_list_tools_excludes_removed() {
     // same database and cleanup does not remove them, so assert the reference set is served.
     // `doc` is the one R tool the fixtures carry; the portal's other calculators are formula
     // calculations authored by hand and reach no database from here.
-    for expected in ["doc"] {
+    {
+        let expected = "doc";
         assert!(names.contains(&expected), "missing tool {expected}");
     }
     assert!(!names.contains(&"ions"));

@@ -600,10 +600,8 @@ async fn seed_chain(
     declare_chain_parameter(db, &peak_id, "Peak", 1, true).await;
     crate::common::exec(
         db,
-        &format!(
-            "INSERT INTO tool_scripts (name, label, engine, created_by) \
-             VALUES ('chain', 'Chain', 'formula', 'test')"
-        ),
+        "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('chain', 'Chain', 'formula', 'test')",
     )
     .await;
     let script_id = db

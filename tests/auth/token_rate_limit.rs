@@ -82,7 +82,7 @@ async fn sync_session_token_is_never_throttled() {
         "a sync session token must never be rate-limited (bulk feeds), got {statuses:?}"
     );
     assert!(
-        statuses.iter().any(|&s| s == 200),
+        statuses.contains(&200),
         "the sync token should actually be ingesting (some 200s), got {statuses:?}"
     );
 }

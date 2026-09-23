@@ -5,12 +5,15 @@ const ROW: Option<Uuid> = Some(Uuid::from_u128(1));
 const STREAM: Option<Uuid> = Some(Uuid::from_u128(2));
 const SLOT: Option<Uuid> = Some(Uuid::from_u128(3));
 
+/// Three candidate ids in the order the writer names them, and the one expected to win.
+type Case = (Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<Uuid>);
+
 /// Every combination of the three candidates, so the precedence is pinned rather than the one
 /// happy path. The two orders differ only in the middle rung, which is the thing a swap changes
 /// and the thing a route test cannot see.
 #[test]
 fn test_batch_prefers_the_row_then_the_slot_then_the_stream() {
-    let cases: [(Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<Uuid>); 8] = [
+    let cases: [Case; 8] = [
         (ROW, SLOT, STREAM, ROW),
         (ROW, SLOT, None, ROW),
         (ROW, None, STREAM, ROW),
@@ -31,7 +34,7 @@ fn test_batch_prefers_the_row_then_the_slot_then_the_stream() {
 
 #[test]
 fn test_ingest_prefers_the_row_then_the_stream_then_the_slot() {
-    let cases: [(Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<Uuid>); 8] = [
+    let cases: [Case; 8] = [
         (ROW, STREAM, SLOT, ROW),
         (ROW, STREAM, None, ROW),
         (ROW, None, SLOT, ROW),

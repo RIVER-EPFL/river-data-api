@@ -97,8 +97,7 @@ async fn apply_plan(app: &Router, jwt: &str, plan_id: &str) -> serde_json::Value
     // apply binds.
     crate::common::plans::acknowledge_plan(app, jwt, plan_id).await;
     let (status, res) =
-        crate::common::post_plan_action_parse_with_token(app, &plan_id.to_string(), "apply", jwt)
-            .await;
+        crate::common::post_plan_action_parse_with_token(app, plan_id, "apply", jwt).await;
     assert_eq!(status, 200, "apply ({status}): {res}");
     let job_id = res["job_id"]
         .as_str()

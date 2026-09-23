@@ -1157,3 +1157,310 @@ fn test_an_attached_row_is_not_a_duplicate() {
 
     assert!(entries[0].warnings.is_empty(), "{:?}", entries[0].warnings);
 }
+
+#[test]
+fn test_near_duplicate_names_both_spellings_in_one_sentence() {
+    let warning = super::PlanWarning::near_duplicate("site", "FP-1", "FP1");
+    assert_eq!(warning.kind, "near_duplicate");
+    assert_eq!(
+        warning.message,
+        "This plan would create the site 'FP-1', and 'FP1' already exists. They differ only in \
+         case, spacing or punctuation."
+    );
+    assert!(warning.parameter.is_none());
+    assert!(warning.existing.is_none());
+}
+
+#[test]
+fn test_plan_group_reads_the_declared_category() {
+    let group = super::plan_group(&serde_json::json!({
+        "parameter": {
+            "category": "  Dissolved Gases ",
+            "category_ordinal": 3,
+            "description": " CO2 and CH4 ",
+        }
+    }))
+    .expect("a declared category is a group");
+    assert_eq!(group.code, "dissolved_gases");
+    assert_eq!(group.label, "Dissolved Gases");
+    assert_eq!(group.ordinal, 3);
+    assert_eq!(group.description.as_deref(), Some("CO2 and CH4"));
+    assert!(group.create);
+}
+
+#[test]
+fn test_plan_group_defaults_what_the_source_leaves_out() {
+    let group = super::plan_group(&serde_json::json!({
+        "parameter": { "category": "Nutrients", "category_ordinal": 1_i64 << 40, "description": " " }
+    }))
+    .expect("a declared category is a group");
+    assert_eq!(group.ordinal, 0);
+    assert!(group.description.is_none());
+}
+
+#[test]
+fn test_plan_group_is_none_without_a_category() {
+    assert!(super::plan_group(&serde_json::json!({})).is_none());
+    assert!(super::plan_group(&serde_json::json!({ "parameter": {} })).is_none());
+    assert!(super::plan_group(&serde_json::json!({ "parameter": { "category": "  " } })).is_none());
+    assert!(super::plan_group(&serde_json::json!({ "parameter": { "category": 4 } })).is_none());
+}
+
+#[test]
+fn test_plan_replicates_counts_the_declared_columns() {
+    let metadata = serde_json::json!({
+        "replicates": {
+            "source_columns": ["doc_1", "doc_2", "doc_3"],
+            "curve_ref_column": "doc_std_curve_id",
+            "portal_mean_column": "doc_avg",
+            "portal_sd_column": "doc_sd",
+        }
+    });
+    let reps = super::plan_replicates(&metadata).expect("a replicate spec");
+    assert_eq!(reps.n, 3);
+    assert_eq!(reps.member_columns, vec!["doc_1", "doc_2", "doc_3"]);
+    assert_eq!(reps.curve_ref_column.as_deref(), Some("doc_std_curve_id"));
+    assert_eq!(reps.portal_mean_column.as_deref(), Some("doc_avg"));
+    assert_eq!(reps.portal_sd_column.as_deref(), Some("doc_sd"));
+}
+
+#[test]
+fn test_plan_replicates_is_none_for_a_single_column_stream() {
+    assert!(super::plan_replicates(&serde_json::json!({ "parameter": {} })).is_none());
+}
+
+fn column(idx: usize, name: &str, units: &str) -> (usize, String, String) {
+    (idx, name.to_string(), units.to_string())
+}
+
+fn grouped(entries: &[(usize, String, String)]) -> Vec<(String, String, Vec<usize>)> {
+    let mut groups: Vec<_> = super::group_streams_by_parameter(entries)
+        .into_iter()
+        .map(|g| {
+            let mut idx = g.entry_indices;
+            idx.sort_unstable();
+            (g.proposed_name, g.units, idx)
+        })
+        .collect();
+    groups.sort();
+    groups
+}
+
+/// Scenario: a station exports lettered and suffixed columns that share a unit.
+/// Expected behaviour: only identical names group, case aside; a shared unit or a shared stem is
+/// not one parameter.
+#[test]
+fn test_group_streams_by_parameter_groups_identical_names_only() {
+    let entries = vec![
+        column(0, "Nitrate", "µg/L"),
+        column(1, "Ammonia", "µg/L"),
+        column(2, "nitrate", "µg/L"),
+        column(3, "Chla_a", "µg/L"),
+        column(4, "Chla_b", "µg/L"),
+        column(5, "Chla_acid_ugL", "µg/L"),
+        column(6, "Chla_acid_ugm2", "µg/m2"),
+        column(7, "Nitrate", "mg/L"),
+    ];
+    let groups = grouped(&entries);
+    assert_eq!(groups.len(), 7, "{groups:?}");
+    let nitrate: Vec<_> = groups
+        .iter()
+        .filter(|(name, _, _)| name.eq_ignore_ascii_case("nitrate"))
+        .collect();
+    assert_eq!(nitrate.len(), 2, "{nitrate:?}");
+    assert!(
+        nitrate
+            .iter()
+            .any(|(_, units, idx)| units == "µg/l" && *idx == vec![0, 2])
+    );
+    assert!(
+        nitrate
+            .iter()
+            .any(|(_, units, idx)| units == "mg/l" && *idx == vec![7])
+    );
+}
+
+#[test]
+fn test_group_streams_by_parameter_keeps_every_spelling_it_folded() {
+    let entries = vec![
+        column(0, "DOC", "ppb"),
+        column(1, "doc", "ppb"),
+        column(2, "DOC", "ppb"),
+    ];
+    let proposals = super::group_streams_by_parameter(&entries);
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].original_names, vec!["DOC", "doc"]);
+    assert_eq!(proposals[0].entry_indices.len(), 3);
+}
+
+#[test]
+fn test_group_streams_by_parameter_of_nothing_is_nothing() {
+    assert!(super::group_streams_by_parameter(&[]).is_empty());
+}
+
+fn sensor(metadata: Option<serde_json::Value>) -> crate::routes::private::sensors::Model {
+    serde_json::from_value(serde_json::json!({
+        "id": Uuid::new_v4(),
+        "kind": "device",
+        "data_frequency": "high",
+        "metadata": metadata,
+        "deployments": [],
+    }))
+    .expect("a sensor")
+}
+
+#[test]
+fn test_is_minted_default_reads_the_registration_marker() {
+    let marker = crate::routes::private::sensors::models::MINTED_FROM_STREAM;
+    assert!(super::is_minted_default(&sensor(Some(
+        serde_json::json!({ marker: "cnet:DOC_avg_ppb" })
+    ))));
+    assert!(!super::is_minted_default(&sensor(None)));
+    assert!(!super::is_minted_default(&sensor(Some(
+        serde_json::json!({ "serial": "X1" })
+    ))));
+}
+
+fn coordinates(
+    stream_id: Uuid,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    alt: Option<f64>,
+) -> PlanEntryUpdate {
+    serde_json::from_value(serde_json::json!({
+        "stream_id": stream_id,
+        "site_latitude": lat,
+        "site_longitude": lon,
+        "site_altitude_m": alt,
+    }))
+    .expect("a plan entry update")
+}
+
+/// Scenario: a new station has three feeds and another new station one; the operator edits the
+/// coordinates on one feed of the first.
+/// Expected behaviour: every feed of that station takes the edit, whatever the case of its name,
+/// and the other station is untouched.
+#[test]
+fn test_apply_site_attribute_updates_moves_every_entry_of_the_site() {
+    let mut entries = vec![
+        plan_entry("FP1", "Depth", "none", 0),
+        plan_entry("fp1", "CDOM", "none", 0),
+        plan_entry("FP1", "Turbidity", "none", 0),
+        plan_entry("FP2", "Depth", "none", 0),
+    ];
+    let update = coordinates(entries[1].stream_id, Some(46.1), None, Some(1520.0));
+    super::apply_site_attribute_updates(&mut entries, &[update]);
+    for entry in &entries[..3] {
+        assert_eq!(entry.site.latitude, Some(46.1));
+        assert_eq!(entry.site.longitude, None);
+        assert_eq!(entry.site.altitude_m, Some(1520.0));
+    }
+    assert_eq!(entries[3].site.latitude, None);
+    assert_eq!(entries[3].site.altitude_m, None);
+}
+
+#[test]
+fn test_apply_site_attribute_updates_leaves_an_existing_site_alone() {
+    let mut entries = vec![
+        plan_entry("FP1", "Depth", "none", 0),
+        plan_entry("FP1", "CDOM", "none", 0),
+    ];
+    let existing = Uuid::new_v4();
+    for entry in &mut entries {
+        entry.site.id = Some(existing);
+    }
+    let update = coordinates(entries[0].stream_id, Some(46.1), Some(7.2), Some(1520.0));
+    super::apply_site_attribute_updates(&mut entries, &[update]);
+    assert!(entries.iter().all(|e| e.site.latitude.is_none()));
+}
+
+#[test]
+fn test_apply_site_attribute_updates_ignores_an_entry_that_does_not_exist() {
+    let mut entries = vec![plan_entry("FP1", "Depth", "none", 0)];
+    let update = coordinates(Uuid::new_v4(), Some(46.1), Some(7.2), Some(1520.0));
+    super::apply_site_attribute_updates(&mut entries, &[update]);
+    assert!(entries[0].site.latitude.is_none());
+    assert!(entries[0].site.longitude.is_none());
+}
+
+#[test]
+fn test_apply_site_attribute_updates_skips_an_update_naming_no_coordinate() {
+    let mut entries = vec![plan_entry("FP1", "Depth", "none", 0)];
+    entries[0].site.latitude = Some(45.0);
+    let update = coordinates(entries[0].stream_id, None, None, None);
+    super::apply_site_attribute_updates(&mut entries, &[update]);
+    assert_eq!(entries[0].site.latitude, Some(45.0));
+}
+
+fn decision(key: &str, accepted: bool) -> crate::routes::private::sync::models::PlanObjectUpdate {
+    crate::routes::private::sync::models::PlanObjectUpdate {
+        key: key.to_string(),
+        accepted,
+    }
+}
+
+#[test]
+fn test_apply_object_updates_keeps_the_first_acceptance() {
+    let mut accepted = Vec::new();
+    super::apply_object_updates(&mut accepted, &[decision("site:FP1", true)], "alice");
+    super::apply_object_updates(&mut accepted, &[decision("site:FP1", true)], "bob");
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].key, "site:FP1");
+    assert_eq!(accepted[0].accepted_by.as_deref(), Some("alice"));
+}
+
+#[test]
+fn test_apply_object_updates_takes_a_decision_back() {
+    let mut accepted = Vec::new();
+    super::apply_object_updates(
+        &mut accepted,
+        &[decision("site:FP1", true), decision("parameter:DOC", true)],
+        "alice",
+    );
+    super::apply_object_updates(
+        &mut accepted,
+        &[decision("site:FP1", false), decision("project:CNET", false)],
+        "bob",
+    );
+    let keys: Vec<_> = accepted.iter().map(|a| a.key.as_str()).collect();
+    assert_eq!(keys, vec!["parameter:DOC"]);
+}
+
+fn holds_sql(scope: &crate::common::authz::AccessScope) -> Option<String> {
+    use sea_orm::{EntityTrait, QueryFilter, QueryTrait};
+    super::holds_in_scope(scope).map(|condition| {
+        super::hold_model::Entity::find()
+            .filter(condition)
+            .build(sea_orm::DatabaseBackend::Postgres)
+            .to_string()
+    })
+}
+
+#[test]
+fn test_holds_in_scope_confines_nothing_for_an_unrestricted_caller() {
+    assert!(holds_sql(&crate::common::authz::AccessScope::Unrestricted).is_none());
+}
+
+/// Scenario: a caller confined to one project reads the review queue.
+/// Expected behaviour: a hold is in scope through its stream's pairing or through the site a
+/// stream-less finding names, and both arms confine to that project.
+#[test]
+fn test_holds_in_scope_reaches_a_hold_through_its_pairing_or_its_site() {
+    let project = Uuid::new_v4();
+    let sql = holds_sql(&crate::common::authz::AccessScope::one(project)).expect("a condition");
+    assert_eq!(sql.matches("EXISTS").count(), 2, "{sql}");
+    assert_eq!(sql.matches(&project.to_string()).count(), 2, "{sql}");
+    assert!(
+        sql.contains(r#""sp_scope"."id" = "ds"."site_parameter_id""#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#""st"."id" = "h"."site_id""#), "{sql}");
+    assert!(sql.contains(" OR "), "{sql}");
+}
+
+#[test]
+fn test_holds_in_scope_with_no_projects_confines_to_nothing() {
+    let scope = crate::common::authz::AccessScope::Projects(std::sync::Arc::new(HashSet::new()));
+    let sql = holds_sql(&scope).expect("a condition");
+    assert!(sql.contains("1 = 2"), "{sql}");
+}

@@ -499,10 +499,10 @@ async fn test_formula_injection_attempt() {
         );
 
         // If it was somehow accepted (2xx), clean up
-        if (200..300).contains(&status) {
-            if let Some(id) = json["id"].as_str() {
-                cleanup_derived_param(&app, &token, id).await;
-            }
+        if (200..300).contains(&status)
+            && let Some(id) = json["id"].as_str()
+        {
+            cleanup_derived_param(&app, &token, id).await;
         }
     }
 }

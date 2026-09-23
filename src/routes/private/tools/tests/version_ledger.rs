@@ -1,5 +1,10 @@
 use crate::routes::private::tools::models::{Engine, PinnedFormula};
-use crate::routes::private::tools::service::{render, version_formulas, version_ledger_sql};
+use crate::routes::private::tools::service::{render, version_formulas, version_ledger_query};
+
+fn version_ledger_sql() -> String {
+    use sea_orm::sea_query::PostgresQueryBuilder;
+    version_ledger_query(uuid::Uuid::nil()).to_string(PostgresQueryBuilder)
+}
 
 fn pco2(expr: &str) -> PinnedFormula {
     PinnedFormula {
@@ -60,15 +65,15 @@ fn an_unreadable_formula_body_names_the_calculation() {
 fn the_ledger_groups_computations_by_the_version_they_name() {
     let sql = version_ledger_sql();
     assert!(
-        sql.contains("d.new ->> 'derived_version_id' = v.id::text"),
+        sql.contains(r#"("d"."new" ->> 'derived_version_id') = CAST("v"."id" AS text)"#),
         "the grouping key is the version the decision names: {sql}"
     );
     assert!(
-        sql.contains("d.kind IN ('derived_computed', 'formula_transition')"),
+        sql.contains(r#""d"."kind" IN ('derived_computed', 'formula_transition')"#),
         "only the kinds that carry a computation count: {sql}"
     );
     assert!(
-        sql.contains("COUNT(DISTINCT (d.stream_id, d.time, d.replicate_index))"),
+        sql.contains(r#"COUNT(DISTINCT (CASE WHEN ("d"."stream_id" IS NOT NULL) THEN ("d"."stream_id", "d"."time", "d"."replicate_index") END))"#),
         "a reading moved twice under one version is one reading: {sql}"
     );
 }
@@ -78,7 +83,7 @@ fn the_ledger_groups_computations_by_the_version_they_name() {
 #[test]
 fn a_version_with_no_decision_counts_nothing_rather_than_the_empty_join_row() {
     assert!(
-        version_ledger_sql().contains("FILTER (WHERE d.stream_id IS NOT NULL)"),
+        version_ledger_sql().contains(r#"CASE WHEN ("d"."stream_id" IS NOT NULL) THEN"#),
         "the count is held to the rows a decision is actually on: {}",
         version_ledger_sql()
     );
@@ -90,12 +95,12 @@ fn a_version_with_no_decision_counts_nothing_rather_than_the_empty_join_row() {
 fn a_version_that_computed_nothing_is_still_a_row() {
     let sql = version_ledger_sql();
     assert!(
-        sql.contains("FROM tool_script_versions v")
-            && sql.contains("LEFT JOIN reading_decisions d"),
+        sql.contains(r#"FROM "tool_script_versions" AS "v""#)
+            && sql.contains(r#"LEFT JOIN "reading_decisions" AS "d""#),
         "every version is a row, joined to whatever it left: {sql}"
     );
     assert!(
-        sql.contains("ORDER BY v.version_no DESC"),
+        sql.contains(r#"ORDER BY "v"."version_no" DESC"#),
         "newest version first: {sql}"
     );
 }
@@ -106,10 +111,10 @@ fn a_version_that_computed_nothing_is_still_a_row() {
 fn the_row_spans_both_the_instants_and_the_computing() {
     let sql = version_ledger_sql();
     for expected in [
-        "MIN(d.time) AS first_instant",
-        "MAX(d.time) AS last_instant",
-        "MIN(d.at) AS first_computed",
-        "MAX(d.at) AS last_computed",
+        r#"MIN("d"."time") AS "first_instant""#,
+        r#"MAX("d"."time") AS "last_instant""#,
+        r#"MIN("d"."at") AS "first_computed""#,
+        r#"MAX("d"."at") AS "last_computed""#,
     ] {
         assert!(sql.contains(expected), "{expected} missing: {sql}");
     }
@@ -175,4 +180,32 @@ fn a_first_version_is_numbered_one_and_the_next_follows_the_latest() {
     assert_eq!(next_version_no(None), 1);
     // 4 + 1
     assert_eq!(next_version_no(Some(4)), 5);
+}
+
+#[test]
+fn a_clash_on_the_version_number_or_the_content_is_a_conflict_and_nothing_else_is() {
+    use crate::routes::private::tools::service::version_conflict;
+    let number = r#"duplicate key value violates unique constraint "tool_script_versions_tool_script_id_version_no_key""#;
+    let content = r#"duplicate key value violates unique constraint "tool_script_versions_tool_script_id_content_hash_key""#;
+    assert!(version_conflict(number).is_some_and(|m| m.contains("save again")));
+    assert!(version_conflict(content).is_some_and(|m| m.contains("identical")));
+    assert_eq!(
+        version_conflict(r#"violates unique constraint "tool_scripts_name_key""#),
+        None
+    );
+}
+
+#[test]
+fn the_normalise_query_casts_each_document_through_jsonb_and_names_no_table() {
+    use sea_orm::sea_query::PostgresQueryBuilder;
+    let (sql, values) = crate::routes::private::tools::service::normalise_query(
+        r#"{"b":1,"a":2}"#.to_string(),
+        "[]".to_string(),
+    )
+    .build(PostgresQueryBuilder);
+    assert_eq!(
+        sql,
+        r#"SELECT CAST(CAST($1 AS jsonb) AS text) AS "manifest", CAST(CAST($2 AS jsonb) AS text) AS "test_cases""#
+    );
+    assert_eq!(values.0.len(), 2);
 }

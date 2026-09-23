@@ -27,12 +27,11 @@ fn parse_sse_frames(text: &str) -> Vec<(String, serde_json::Value)> {
     for line in text.lines() {
         if let Some(ev) = line.strip_prefix("event:") {
             current_event = Some(ev.trim().to_string());
-        } else if let Some(data) = line.strip_prefix("data:") {
-            if let Some(ev) = current_event.take() {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data.trim()) {
-                    frames.push((ev, json));
-                }
-            }
+        } else if let Some(data) = line.strip_prefix("data:")
+            && let Some(ev) = current_event.take()
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(data.trim())
+        {
+            frames.push((ev, json));
         }
     }
     frames

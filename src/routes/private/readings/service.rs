@@ -1525,6 +1525,7 @@ pub(super) fn refuse_historical(kind: Kind) -> AppResult<()> {
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_many<C: ConnectionTrait>(
     conn: &C,
     kind: Kind,
@@ -5410,6 +5411,9 @@ pub(super) async fn fetch_run_sources(
     Ok(found.into_iter().collect())
 }
 
+/// A calculation formula as `(id, code, name, output_parameter_id, tool_script_id)`.
+type FormulaOutputRow = (Uuid, String, String, Option<Uuid>, Option<Uuid>);
+
 /// The calculation behind every derived row, keyed by the output parameter it writes, and the
 /// versions the stored values name, keyed by their own ids. A row naming no version keeps the
 /// definition and reports no formula, because the text that produced it is not recoverable (M134).
@@ -5432,18 +5436,17 @@ pub(super) async fn fetch_calculations(
     if parameter_ids.is_empty() {
         return Ok((HashMap::new(), HashMap::new()));
     }
-    let definitions: Vec<(Uuid, String, String, Option<Uuid>, Option<Uuid>)> =
-        calculation_formulas::Entity::find()
-            .filter(calculation_formulas::Column::OutputParameterId.is_in(parameter_ids))
-            .select_only()
-            .column(calculation_formulas::Column::Id)
-            .column(calculation_formulas::Column::Code)
-            .column(calculation_formulas::Column::Name)
-            .column(calculation_formulas::Column::OutputParameterId)
-            .column(calculation_formulas::Column::ToolScriptId)
-            .into_tuple()
-            .all(db)
-            .await?;
+    let definitions: Vec<FormulaOutputRow> = calculation_formulas::Entity::find()
+        .filter(calculation_formulas::Column::OutputParameterId.is_in(parameter_ids))
+        .select_only()
+        .column(calculation_formulas::Column::Id)
+        .column(calculation_formulas::Column::Code)
+        .column(calculation_formulas::Column::Name)
+        .column(calculation_formulas::Column::OutputParameterId)
+        .column(calculation_formulas::Column::ToolScriptId)
+        .into_tuple()
+        .all(db)
+        .await?;
     let mut by_parameter: HashMap<Uuid, CalculationInfo> = HashMap::new();
     let mut output_codes: HashMap<Uuid, String> = HashMap::new();
     for (id, code, name, output_parameter_id, tool_script_id) in definitions {
@@ -8724,7 +8727,7 @@ pub(super) async fn import_tool_csv(
     use super::models::GrabSampleRequest;
     use super::models::GrabWriteMode;
     use super::views::insert_grab_samples;
-    use crate::routes::private::tools::flows::execute_and_store_run;
+    use crate::routes::private::tools::flows::{execute_and_store_run, preview_run};
     use crate::routes::private::tools::service as engine;
 
     let tool = engine::find_active_tool(&state.db, tool_name).await?;
@@ -8997,122 +9000,122 @@ pub(super) async fn import_tool_csv(
         )));
     }
 
-    // The cells the file stores as readings are the replicate inputs; outputs exist only once
-    // the tool has run, so they are screened by the grab save's own gate, not here.
-    let mut cells: Vec<(usize, Uuid, chrono::DateTime<chrono::Utc>, f64)> = Vec::new();
-    for row in &rows {
-        for (name, parameter_id) in &saved_inputs {
-            let values: Vec<f64> = match row.body.get(name) {
-                Some(serde_json::Value::Array(list)) => {
-                    list.iter().filter_map(serde_json::Value::as_f64).collect()
-                }
-                Some(v) => v.as_f64().into_iter().collect(),
-                None => Vec::new(),
-            };
-            cells.extend(
-                values
-                    .into_iter()
-                    .map(|v| (row.line, *parameter_id, row.time, v)),
-            );
-        }
-    }
-    let check = Some(screen_import(state, auth, req, site.id, &cells).await?);
-
+    // --- Run ---
+    // A dry run previews each row and stores nothing; a commit stores the run its save names.
     let row_count = rows.len();
-    let mut inserted_total = 0usize;
+    let actor = crate::common::actor::label(auth);
+    let mut computed: Vec<(usize, Option<Uuid>, Vec<GrabSampleReading>)> = Vec::new();
     let mut tool_runs_created = 0usize;
-    if !req.dry_run {
-        let actor = crate::common::actor::label(auth);
-        for ToolRow {
-            line,
-            time,
-            mut body,
-            curves,
-        } in rows
-        {
-            for (slot, id) in &curves {
-                body.insert(slot.clone(), serde_json::json!({ "standard_curve_id": id }));
-            }
-            body.insert("site_id".into(), serde_json::json!(site.id));
-            body.insert(
-                "collected_at".into(),
-                serde_json::json!(time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-            );
-            let body = serde_json::Value::Object(body);
-            let body_bytes =
-                serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
-            let result = match execute_and_store_run(
-                state,
-                &tool,
-                &body_bytes,
-                &actor,
-                "csv_import",
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    record_error(line, e.to_string(), &mut errors, &mut error_count);
-                    continue;
-                }
-            };
-            tool_runs_created += 1;
-
-            let mut readings: Vec<GrabSampleReading> = saved_outputs
-                .iter()
-                .filter_map(|(key, parameter_id)| {
-                    result
-                        .calculation
-                        .results
-                        .get(key)
-                        .and_then(serde_json::Value::as_f64)
-                        .map(|value| GrabSampleReading {
-                            parameter_id: *parameter_id,
-                            sensor_id: None,
-                            value,
-                            time,
-                            replicate_index: None,
-                            output: Some(key.clone()),
-                            input: None,
-                            standard_curve_id: None,
-                        })
-                })
-                .collect();
-            for (name, parameter_id) in &saved_inputs {
-                let Some(values) = body.get(name).and_then(serde_json::Value::as_array) else {
-                    continue;
-                };
-                // A curve is fitted on one instrument, so the replicate it corrects is that
-                // instrument's measurement.
-                let standard_curve_id = replicate_curve(&tool.manifest.params, name, &curves);
-                let sensor_id = standard_curve_id.map(|id| stored_curves[&id].sensor_id);
-                for (position, cell) in values.iter().enumerate() {
-                    let (Some(value), Ok(replicate_index)) =
-                        (cell.as_f64(), i16::try_from(position))
-                    else {
-                        continue;
-                    };
-                    readings.push(GrabSampleReading {
-                        parameter_id: *parameter_id,
-                        sensor_id,
-                        value,
-                        time,
-                        replicate_index: Some(replicate_index),
-                        output: None,
-                        input: Some(name.clone()),
-                        standard_curve_id,
-                    });
-                }
-            }
-            if readings.is_empty() {
-                record_error(
-                    line,
-                    "the run produced no savable output for this row".to_string(),
-                    &mut errors,
-                    &mut error_count,
-                );
+    for ToolRow {
+        line,
+        time,
+        mut body,
+        curves,
+    } in rows
+    {
+        for (slot, id) in &curves {
+            body.insert(slot.clone(), serde_json::json!({ "standard_curve_id": id }));
+        }
+        body.insert("site_id".into(), serde_json::json!(site.id));
+        body.insert(
+            "collected_at".into(),
+            serde_json::json!(time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        );
+        let body_bytes = serde_json::to_vec(&serde_json::Value::Object(body.clone()))
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let run = if req.dry_run {
+            preview_run(state, &tool, &body_bytes)
+                .await
+                .map(|calculation| (None, calculation))
+        } else {
+            execute_and_store_run(state, &tool, &body_bytes, &actor, "csv_import")
+                .await
+                .map(|result| (Some(result.run_id), result.calculation))
+        };
+        let (run_id, calculation) = match run {
+            Ok(run) => run,
+            Err(e) => {
+                record_error(line, e.to_string(), &mut errors, &mut error_count);
                 continue;
             }
+        };
+        if run_id.is_some() {
+            tool_runs_created += 1;
+        }
+
+        let mut readings: Vec<GrabSampleReading> = saved_outputs
+            .iter()
+            .filter_map(|(key, parameter_id)| {
+                calculation
+                    .results
+                    .get(key)
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|value| GrabSampleReading {
+                        parameter_id: *parameter_id,
+                        sensor_id: None,
+                        value,
+                        time,
+                        replicate_index: None,
+                        output: Some(key.clone()),
+                        input: None,
+                        standard_curve_id: None,
+                    })
+            })
+            .collect();
+        for (name, parameter_id) in &saved_inputs {
+            let Some(values) = body.get(name).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            // A curve is fitted on one instrument, so the replicate it corrects is that
+            // instrument's measurement.
+            let standard_curve_id = replicate_curve(&tool.manifest.params, name, &curves);
+            let sensor_id = standard_curve_id.map(|id| stored_curves[&id].sensor_id);
+            for (position, cell) in values.iter().enumerate() {
+                let (Some(value), Ok(replicate_index)) = (cell.as_f64(), i16::try_from(position))
+                else {
+                    continue;
+                };
+                readings.push(GrabSampleReading {
+                    parameter_id: *parameter_id,
+                    sensor_id,
+                    value,
+                    time,
+                    replicate_index: Some(replicate_index),
+                    output: None,
+                    input: Some(name.clone()),
+                    standard_curve_id,
+                });
+            }
+        }
+        if readings.is_empty() {
+            record_error(
+                line,
+                "the run produced no savable output for this row".to_string(),
+                &mut errors,
+                &mut error_count,
+            );
+            continue;
+        }
+        computed.push((line, run_id, readings));
+    }
+
+    // --- Screen ---
+    // Every value a row stores is screened, the replicates it entered and the outputs its run
+    // published, and each save is held to the check that screened them.
+    let cells: Vec<(usize, Uuid, chrono::DateTime<chrono::Utc>, f64)> = computed
+        .iter()
+        .flat_map(|(line, _, readings)| {
+            readings
+                .iter()
+                .map(|r| (*line, r.parameter_id, r.time, r.value))
+        })
+        .collect();
+    let check = screen_import(state, auth, req, site.id, &cells).await?;
+
+    // --- Save ---
+    let mut inserted_total = 0usize;
+    if !req.dry_run {
+        for (line, run_id, readings) in computed {
             let request = GrabSampleRequest {
                 expected_replicates: None,
                 pending_inputs: false,
@@ -9122,8 +9125,8 @@ pub(super) async fn import_tool_csv(
                 notes: None,
                 mode: (req.conflict == ConflictMode::Overwrite).then_some(GrabWriteMode::Replace),
                 dry_run: false,
-                tool_run_id: Some(result.run_id),
-                check_id: None,
+                tool_run_id: run_id,
+                check_id: check.check_id,
                 // The tool's manifest is read by the save path itself; nothing here overrides
                 // the slot's declaration.
                 readings,
@@ -9141,6 +9144,7 @@ pub(super) async fn import_tool_csv(
             }
         }
     }
+    let check = Some(check);
 
     Ok(ImportCsvResponse {
         site_id: site.id,
@@ -9635,7 +9639,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         )
         .await?;
         outcome.withdrawn = to_withdraw.len();
-        outcome.withdrawn_keys = to_withdraw.iter().copied().collect();
+        outcome.withdrawn_keys = to_withdraw.to_vec();
     }
 
     if !reinstate.is_empty() {
@@ -9657,7 +9661,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         )
         .await?;
         outcome.reinstated = reinstate.len();
-        outcome.reinstated_keys = reinstate.iter().copied().collect();
+        outcome.reinstated_keys = reinstate.to_vec();
     }
 
     Ok(outcome)

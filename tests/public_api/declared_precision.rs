@@ -226,11 +226,8 @@ async fn the_public_arm_rounds_and_the_private_arm_is_bit_exact() {
         "the private arm serves the stored double: {raw}"
     );
 
-    let (status, body) = crate::common::get_json(
-        &app,
-        &format!("/api/public/test-river/sites/upstream/parameters"),
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_json(&app, "/api/public/test-river/sites/upstream/parameters").await;
     assert_eq!(status, 200, "{body}");
     assert!(
         body[0].get("decimal_places").is_none(),

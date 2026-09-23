@@ -30,13 +30,8 @@ pub async fn patch_plan(
     plan_id: &str,
     updates: serde_json::Value,
 ) -> serde_json::Value {
-    let (status, body) = super::patch_plan_with_token(
-        app,
-        &plan_id.to_string(),
-        &json!({ "updates": updates }),
-        token,
-    )
-    .await;
+    let (status, body) =
+        super::patch_plan_with_token(app, plan_id, &json!({ "updates": updates }), token).await;
     assert_eq!(status, 200, "PATCH plan ({status}): {body}");
     serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("PATCH response is JSON: {e}\nBody: {body}"))
@@ -202,8 +197,7 @@ pub async fn run_plan_action(
     if action == "apply" {
         acknowledge_plan(app, token, plan_id).await;
     }
-    let (status, res) =
-        super::post_plan_action_parse_with_token(app, &plan_id.to_string(), action, token).await;
+    let (status, res) = super::post_plan_action_parse_with_token(app, plan_id, action, token).await;
     assert_eq!(status, 200, "{action} ({status}): {res}");
     let job_id = res["job_id"]
         .as_str()

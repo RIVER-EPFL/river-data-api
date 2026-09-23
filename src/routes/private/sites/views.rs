@@ -1307,7 +1307,7 @@ pub async fn get_site_status_events(
         .order_by(status_events::Column::Time, dir.clone())
         .order_by(status_events::Column::StreamId, dir);
     if let Some(window) = page {
-        rows = rows.limit(window.limit as u64).offset(window.offset as u64);
+        rows = rows.limit(window.limit).offset(window.offset);
     }
 
     let events: Vec<StatusEventData> = rows

@@ -118,7 +118,7 @@ async fn test_site_threshold_overrides_the_global_row() {
     let temp_param = params.iter().find(|p| {
         p["name"]
             .as_str()
-            .map_or(false, |n| n.contains("temperature"))
+            .is_some_and(|n| n.contains("temperature"))
     });
 
     assert!(

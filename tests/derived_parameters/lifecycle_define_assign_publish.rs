@@ -181,7 +181,7 @@ async fn derived_assignment_backfills_and_publishes() {
     e2e::set_site_parameter_public(&db, &sp_id).await;
 
     let pub_uri = "/api/public/e2e_derived/sites/e2e_derived_site1/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z";
-    let (status, pub_readings) = crate::common::get_json(&app, &pub_uri).await;
+    let (status, pub_readings) = crate::common::get_json(&app, pub_uri).await;
     assert_eq!(status, 200, "public readings ({status}): {pub_readings}");
     assert!(
         !e2e::values_for(&pub_readings, "DOmgL_e2e").is_empty(),

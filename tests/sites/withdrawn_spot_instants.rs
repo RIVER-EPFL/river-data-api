@@ -63,7 +63,7 @@ async fn read(app: &axum::Router, token: &str, extra: &str) -> serde_json::Value
     body
 }
 
-fn series<'a>(body: &'a serde_json::Value) -> &'a serde_json::Value {
+fn series(body: &serde_json::Value) -> &serde_json::Value {
     body["parameters"]
         .as_array()
         .expect("parameters")

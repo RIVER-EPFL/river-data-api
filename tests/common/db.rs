@@ -7,7 +7,7 @@ use sea_orm_migration::MigratorTrait;
 
 /// The advisory-lock key one suite holds for its whole run. Advisory locks are per-database, so a
 /// run against an isolated database never waits on the shared one.
-pub const HARNESS_LOCK_KEY: i64 = 0x5249_5645_52; // "RIVER"
+pub const HARNESS_LOCK_KEY: i64 = 0x52_4956_4552; // "RIVER"
 
 /// How long a second runner waits for the first to finish before giving up and saying so.
 const LOCK_WAIT: Duration = Duration::from_secs(1800);
@@ -284,9 +284,6 @@ pub const FIXTURE_SENSOR_ID: &str = "00000000-0000-4000-e000-000000000999";
 /// The tables the TRUNCATE empties. With [`CLEANUP_DELETED_TABLES`] this is the whole of what
 /// `cleanup_test_db` covers, and `tests/harness/cleanup_coverage.rs` holds the pair against the
 /// schema.
-///
-/// `constants` is migration-seeded reference data; truncating it cannot be undone by
-/// `seed_test_data`, so it is deliberately absent.
 pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
     "readings",
     "reading_decisions",
@@ -346,10 +343,28 @@ pub const CLEANUP_DELETED_TABLES: &[&str] = &[
     "tool_script_activations",
     "tool_script_versions",
     "tool_scripts",
+    "constants",
+];
+
+/// The constants the baseline seeds. Truncating `constants` cannot be undone by
+/// `seed_test_data`, so cleanup keeps these and deletes what a test added.
+pub const SEEDED_CONSTANTS: &[&str] = &[
+    "gas_const_r_atm",
+    "h_co2_29815k",
+    "c_const",
+    "vol_sa",
+    "vol_water",
+    "lab_press_avg_atm",
+    "lab_temp_avg_degC",
+    "h_ch4_29815k",
+    "gas_const_r_mol",
+    "vial_volume",
+    "h3po4_added",
+    "ch4_in_sa",
 ];
 
 /// Reference data a test reads and never owns.
-pub const CLEANUP_EXEMPT_TABLES: &[&str] = &["constants", "seaql_migrations"];
+pub const CLEANUP_EXEMPT_TABLES: &[&str] = &["seaql_migrations"];
 
 /// End work a finished test left running, so the TRUNCATE below cannot deadlock against it.
 ///
@@ -419,6 +434,15 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
     for sql in &stmts {
         exec(db, sql).await;
     }
+    let seeded: Vec<String> = SEEDED_CONSTANTS.iter().map(|n| format!("'{n}'")).collect();
+    exec(
+        db,
+        &format!(
+            "DELETE FROM constants WHERE name NOT IN ({})",
+            seeded.join(", ")
+        ),
+    )
+    .await;
     exec(
         db,
         &format!("TRUNCATE {} CASCADE", CLEANUP_TRUNCATED_TABLES.join(", ")),

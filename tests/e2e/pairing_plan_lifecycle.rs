@@ -270,10 +270,8 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert_eq!(
         count(
             &db,
-            &format!(
-                "SELECT count(*) AS c FROM readings r JOIN data_streams ds ON r.stream_id = ds.id \
+            "SELECT count(*) AS c FROM readings r JOIN data_streams ds ON r.stream_id = ds.id \
              WHERE ds.source_system = 'metalp' AND r.site_id IS NOT NULL"
-            )
         )
         .await,
         0,

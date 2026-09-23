@@ -373,7 +373,7 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
     let status_row = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT status FROM reprocessing_jobs WHERE id = '{id}'"),
+            format!("SELECT status, detail FROM reprocessing_jobs WHERE id = '{id}'"),
         ))
         .await
         .unwrap()
@@ -383,6 +383,21 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
         "completed",
         "the janitor job completes"
     );
+    // One report carries every step of the tick: the gap fill's counts stand beside the sweep's.
+    let detail: serde_json::Value = status_row.try_get("", "detail").unwrap();
+    for key in [
+        "gaps_found",
+        "filled",
+        "refused_slots",
+        "recomposed",
+        "pruned",
+    ] {
+        assert!(
+            detail["counts"].get(key).is_some(),
+            "the janitor reports {key}: {detail}"
+        );
+    }
+    assert_eq!(detail["counts"]["recomposed"], 2, "{detail}");
 
     let recomposed = db
         .query_all_raw(Statement::from_string(

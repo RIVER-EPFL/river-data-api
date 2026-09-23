@@ -2,7 +2,9 @@
 //! evaluation, the closure walk, script linting and the runner calls.
 
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::sea_query::{Alias, Expr, Func, JoinType, Order, PostgresQueryBuilder, Query};
+use sea_orm::sea_query::{
+    Alias, Expr, Func, IntoIden, JoinType, Order, PostgresQueryBuilder, Query, UnionType,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
@@ -23,13 +25,13 @@ use super::models::script::{self, ToolScript};
 use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
 use super::models::{
-    ActiveTool, CalculationHealth, CalculationImpact, CalculationRepair, CaseResult, CatalogFindings, ClosureQuery,
-    Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter, LintFinding, Manifest, ManifestCurve,
-    ManifestEventInput, ManifestOutput, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck,
-    ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
-    RunnerRuntime, ScannedName, ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent,
-    Subject, ToolScriptOperations, TraceCell, TraceReduction, TraceStep, ValidateResponse,
-    kind_accepts, parse_manifest,
+    ActiveTool, CalculationHealth, CalculationImpact, CalculationRepair, CaseResult,
+    CatalogFindings, ClosureQuery, Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter,
+    LintFinding, Manifest, ManifestCurve, ManifestEventInput, ManifestOutput, ManifestSiteInput,
+    MissingConstant, ParamWhen, ParseCheck, ParseError, PinnedFormula, Produced, ResolvedBy,
+    ResolvedCurve, ResolvedParameter, RunOutcome, RunnerRuntime, ScannedName, ScriptInspection,
+    ScriptScan, SlotCoverage, StoredVersionContent, Subject, ToolScriptOperations, TraceCell,
+    TraceReduction, TraceStep, ValidateResponse, kind_accepts, parse_manifest,
 };
 use super::staged::StagedVisit;
 use crate::common::AppState;
@@ -1620,6 +1622,36 @@ async fn formula_revisions(
         .collect())
 }
 
+/// What a run used of the keys it was sent, and what it ignored, so every sent key is in one of
+/// the two. A script naming its `inputs_used` is taken at its word over what it was sent; one
+/// naming nothing used every declared param it was sent. A curve sent and resolved was used.
+pub(crate) fn account_inputs(
+    provided: &[String],
+    param_names: &[&str],
+    declared_used: Vec<String>,
+    curves_consumed: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut used: Vec<String> = if declared_used.is_empty() {
+        provided
+            .iter()
+            .filter(|k| param_names.contains(&k.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        declared_used
+            .into_iter()
+            .filter(|k| provided.contains(k))
+            .collect()
+    };
+    used.extend(curves_consumed);
+    let ignored = provided
+        .iter()
+        .filter(|k| !used.contains(k))
+        .cloned()
+        .collect();
+    (used, ignored)
+}
+
 /// Hand a resolved run to the runner and shape its answer: NA outputs dropped, manifest
 /// aggregates applied, `inputs_used` accounted.
 pub async fn execute_resolved(
@@ -1702,25 +1734,8 @@ pub async fn execute_resolved(
         .remove("inputs_used")
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let mut inputs_used: Vec<String> = if declared_used.is_empty() {
-        provided
-            .iter()
-            .filter(|k| param_names.contains(&k.as_str()))
-            .cloned()
-            .collect()
-    } else {
-        declared_used
-            .into_iter()
-            .filter(|k| provided.contains(k))
-            .collect()
-    };
-    // A curve that was sent and resolved was consumed by definition.
-    inputs_used.extend(curves_consumed);
-    let inputs_ignored: Vec<String> = provided
-        .iter()
-        .filter(|k| !inputs_used.contains(k))
-        .cloned()
-        .collect();
+    let (inputs_used, inputs_ignored) =
+        account_inputs(&provided, &param_names, declared_used, curves_consumed);
 
     Ok(RunOutcome {
         results,
@@ -3208,12 +3223,15 @@ pub(super) fn stored_curves(stored: &serde_json::Value) -> HashMap<String, Curve
         .unwrap_or_default()
 }
 
+/// A run's scalar inputs and its replicate families, by name.
+type FormulaBindings = (HashMap<String, f64>, HashMap<String, Vec<Option<f64>>>);
+
 /// The scalar and per-replicate bindings a formula set runs over, split out of one input object.
 /// An array is a replicate family, one entry per index with `null` for a repeat not measured, and
 /// is carried separately rather than dropped by the scalar read.
 pub(super) fn formula_bindings(
     inputs: &serde_json::Map<String, serde_json::Value>,
-) -> (HashMap<String, f64>, HashMap<String, Vec<Option<f64>>>) {
+) -> FormulaBindings {
     let replicates = inputs
         .iter()
         .filter_map(|(name, value)| {
@@ -3286,78 +3304,209 @@ fn trace_cell(index: Option<usize>, evaluated: &Evaluated) -> TraceCell {
 /// an edit, on a page that must answer in one round trip, and the two agree wherever the
 /// attribution is right.
 pub async fn parameters_of(db: &DatabaseConnection, subject: &Subject) -> AppResult<Vec<Uuid>> {
-    let (sql, values): (&str, Vec<sea_orm::Value>) = match subject {
-        Subject::Parameters(ids) => return Ok(ids.clone()),
-        Subject::Calibration(id) => (
-            "SELECT DISTINCT p FROM (
-               SELECT c.parameter_id AS p FROM sensor_calibrations c WHERE c.id = $1
-               UNION ALL
-               SELECT d.parameter_id FROM sensor_deployments d
-                 JOIN sensor_calibrations c ON c.sensor_id = d.sensor_id
-                WHERE c.id = $1 AND c.parameter_id IS NULL
-             ) q WHERE p IS NOT NULL",
-            vec![(*id).into()],
-        ),
-        Subject::Slot(id) => (
-            "SELECT parameter_id AS p FROM site_parameters WHERE id = $1",
-            vec![(*id).into()],
-        ),
+    let Some(query) = parameters_of_query(subject) else {
+        let Subject::Parameters(ids) = subject else {
+            unreachable!("only a parameter list has no statement")
+        };
+        return Ok(ids.clone());
+    };
+    let rows = db.query_all_raw(build(&query)).await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in &rows {
+        ids.push(row.try_get::<Uuid>("", "p")?);
+    }
+    Ok(ids)
+}
+
+/// The statement behind [`parameters_of`], selecting the parameter ids as `p`; `None` for a
+/// subject that is already a parameter list.
+#[must_use]
+pub fn parameters_of_query(subject: &Subject) -> Option<sea_orm::sea_query::SelectStatement> {
+    use crate::routes::private::sensor_calibrations::models as calibrations;
+    use crate::routes::private::sensor_deployments::models as deployments;
+    use sea_orm::sea_query::ExprTrait;
+    let p = Alias::new("p");
+    let query = match subject {
+        Subject::Parameters(_) => return None,
+        Subject::Calibration(id) => {
+            let c = Alias::new("c");
+            let d = Alias::new("d");
+            let q = Alias::new("q");
+            let deployed = Query::select()
+                .column((d.clone(), deployments::Column::ParameterId))
+                .from_as(deployments::Entity, d.clone())
+                .join_as(
+                    JoinType::InnerJoin,
+                    calibrations::Entity,
+                    c.clone(),
+                    Expr::col((c.clone(), calibrations::Column::SensorId))
+                        .equals((d, deployments::Column::SensorId)),
+                )
+                .and_where(Expr::col((c.clone(), calibrations::Column::Id)).eq(*id))
+                .and_where(Expr::col((c.clone(), calibrations::Column::ParameterId)).is_null())
+                .to_owned();
+            let own = Query::select()
+                .expr_as(
+                    Expr::col((c.clone(), calibrations::Column::ParameterId)),
+                    p.clone(),
+                )
+                .from_as(calibrations::Entity, c.clone())
+                .and_where(Expr::col((c.clone(), calibrations::Column::Id)).eq(*id))
+                .union(UnionType::All, deployed)
+                .to_owned();
+            Query::select()
+                .distinct()
+                .column((q.clone(), p.clone()))
+                .from_subquery(own, q.clone())
+                .and_where(Expr::col((q, p.clone())).is_not_null())
+                .to_owned()
+        }
+        Subject::Slot(id) => Query::select()
+            .expr_as(Expr::col(site_parameters::Column::ParameterId), p.clone())
+            .from(site_parameters::Entity)
+            .and_where(Expr::col(site_parameters::Column::Id).eq(*id))
+            .to_owned(),
         // A replicate of a group is the same parameter as its siblings, so the index the caller
         // holds the reading by does not narrow the answer.
-        Subject::Reading { stream_id, .. } => (
-            "SELECT sp.parameter_id AS p
-               FROM data_streams s
-               JOIN site_parameters sp ON sp.id = s.site_parameter_id
-              WHERE s.id = $1",
-            vec![(*stream_id).into()],
-        ),
-        Subject::Calculation(name) => (
-            "SELECT DISTINCT out.id AS p
-               FROM tool_scripts s
-               JOIN tool_script_versions v ON v.id = s.active_version_id
-               CROSS JOIN LATERAL jsonb_array_elements(COALESCE(v.manifest->'outputs', '[]'::jsonb)) o
-               JOIN parameters out
-                 ON LOWER(out.code) = LOWER(o->>'suggested_parameter_code')
-              WHERE s.name = $1",
-            vec![name.clone().into()],
-        ),
+        Subject::Reading { stream_id, .. } => Query::select()
+            .expr_as(
+                Expr::col((
+                    site_parameters::Entity,
+                    site_parameters::Column::ParameterId,
+                )),
+                p.clone(),
+            )
+            .from(data_streams::Entity)
+            .join(
+                JoinType::InnerJoin,
+                site_parameters::Entity,
+                Expr::col((site_parameters::Entity, site_parameters::Column::Id))
+                    .equals((data_streams::Entity, data_streams::Column::SiteParameterId)),
+            )
+            .and_where(Expr::col((data_streams::Entity, data_streams::Column::Id)).eq(*stream_id))
+            .to_owned(),
+        Subject::Calculation(name) => {
+            let s = Alias::new("s");
+            let v = Alias::new("v");
+            let o = Alias::new("o");
+            let out = Alias::new("out");
+            Query::select()
+                .distinct()
+                .expr_as(Expr::col((out.clone(), parameters::Column::Id)), p.clone())
+                .from_as(script::Entity, s.clone())
+                .join_as(
+                    JoinType::InnerJoin,
+                    version_entity::Entity,
+                    v.clone(),
+                    Expr::col((v.clone(), version_entity::Column::Id))
+                        .equals((s.clone(), script::Column::ActiveVersionId)),
+                )
+                .join(
+                    JoinType::InnerJoin,
+                    manifest_elements(&v, "outputs", &o),
+                    Expr::cust("TRUE"),
+                )
+                .join_as(
+                    JoinType::InnerJoin,
+                    parameters::Entity,
+                    out.clone(),
+                    Expr::expr(Func::lower(Expr::col((out, parameters::Column::Code))))
+                        .eq(Func::lower(element_field(&o, "suggested_parameter_code"))),
+                )
+                .and_where(Expr::col((s, script::Column::Name)).eq(name.clone()))
+                .to_owned()
+        }
         // A constant is an input to whichever active calculations declare it, so the subject
         // reduces to what those calculations read: the walk then returns the declaring
         // calculations themselves and everything downstream of them, which is what a correction
         // moves. Their outputs would return only the downstream half. The manifest's `constants`
         // is a name list, so the join is on the constant's name rather than its id, and the read
         // codes are `event_inputs` plus every `replicates` param, matching `Manifest::read_codes`.
-        Subject::Constant(id) => (
-            "SELECT DISTINCT p.id AS p
-               FROM constants c
-               JOIN tool_script_versions v
-                 ON jsonb_exists(COALESCE(v.manifest->'constants', '[]'::jsonb), c.name)
-               JOIN tool_scripts s ON s.active_version_id = v.id
-               CROSS JOIN LATERAL (
-                 SELECT e->>'parameter_code' AS code
-                   FROM jsonb_array_elements(COALESCE(v.manifest->'event_inputs', '[]'::jsonb)) e
-                 UNION ALL
-                 SELECT r->>'parameter_code'
-                   FROM jsonb_array_elements(COALESCE(v.manifest->'params', '[]'::jsonb)) r
-                  WHERE r->>'kind' = 'replicates'
-               ) reads
-               JOIN parameters p ON LOWER(p.code) = LOWER(reads.code)
-              WHERE c.id = $1",
-            vec![(*id).into()],
-        ),
+        Subject::Constant(id) => {
+            let c = Alias::new("c");
+            let v = Alias::new("v");
+            let s = Alias::new("s");
+            let e = Alias::new("e");
+            let r = Alias::new("r");
+            let reads = Alias::new("reads");
+            let code = Alias::new("code");
+            let par = Alias::new("par");
+            let read_codes = Query::select()
+                .expr_as(element_field(&e, "parameter_code"), code.clone())
+                .from(manifest_elements(&v, "event_inputs", &e))
+                .union(
+                    UnionType::All,
+                    Query::select()
+                        .expr(element_field(&r, "parameter_code"))
+                        .from(manifest_elements(&v, "params", &r))
+                        .and_where(element_field(&r, "kind").eq("replicates"))
+                        .to_owned(),
+                )
+                .to_owned();
+            Query::select()
+                .distinct()
+                .expr_as(Expr::col((par.clone(), parameters::Column::Id)), p.clone())
+                .from_as(constants::Entity, c.clone())
+                .join_as(
+                    JoinType::InnerJoin,
+                    version_entity::Entity,
+                    v.clone(),
+                    Expr::expr(
+                        Func::cust("jsonb_exists")
+                            .arg(manifest_array(&v, "constants"))
+                            .arg(Expr::col((c.clone(), constants::Column::Name))),
+                    ),
+                )
+                .join_as(
+                    JoinType::InnerJoin,
+                    script::Entity,
+                    s.clone(),
+                    Expr::col((s, script::Column::ActiveVersionId))
+                        .equals((v, version_entity::Column::Id)),
+                )
+                .join_lateral(
+                    JoinType::InnerJoin,
+                    read_codes,
+                    reads.clone(),
+                    Expr::cust("TRUE"),
+                )
+                .join_as(
+                    JoinType::InnerJoin,
+                    parameters::Entity,
+                    par.clone(),
+                    Expr::expr(Func::lower(Expr::col((par, parameters::Column::Code))))
+                        .eq(Func::lower(Expr::col((reads, code)))),
+                )
+                .and_where(Expr::col((c, constants::Column::Id)).eq(*id))
+                .to_owned()
+        }
     };
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await?;
-    let mut ids = Vec::with_capacity(rows.len());
-    for row in &rows {
-        ids.push(row.try_get::<Uuid>("", "p")?);
-    }
-    Ok(ids)
+    Some(query)
+}
+
+/// `COALESCE(v.manifest->'key', '[]'::jsonb)`: one of a version's manifest arrays, empty where the
+/// manifest leaves it out.
+fn manifest_array(version: &Alias, key: &str) -> Expr {
+    use sea_orm::sea_query::ExprTrait;
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    Expr::expr(Func::coalesce([
+        Expr::col((version.clone(), version_entity::Column::Manifest)).get_json_field(key),
+        Expr::val("[]").cast_as("jsonb"),
+    ]))
+}
+
+/// `jsonb_array_elements(<manifest array>) AS alias`, one row per element of the array.
+fn manifest_elements(version: &Alias, key: &str, alias: &Alias) -> sea_orm::sea_query::TableRef {
+    sea_orm::sea_query::TableRef::FunctionCall(
+        Func::cust("jsonb_array_elements").arg(manifest_array(version, key)),
+        alias.clone().into_iden(),
+    )
+}
+
+/// `alias.value->>'field'`: a text field of one element [`manifest_elements`] yields.
+fn element_field(alias: &Alias, field: &str) -> Expr {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    Expr::col((alias.clone(), Alias::new("value"))).cast_json_field(field)
 }
 
 /// What a constant has already been used to compute: the readings whose stored provenance records
@@ -3369,21 +3518,35 @@ pub async fn stored_usage_of_constant(
     db: &DatabaseConnection,
     id: Uuid,
 ) -> AppResult<Option<crate::routes::private::tools::models::StoredUsage>> {
-    let Some(row) = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT c.name AS name,
-                    COUNT(DISTINCT r.collection_event_id)::bigint AS visits,
-                    COUNT(r.*)::bigint AS readings
-               FROM constants c
-               LEFT JOIN readings r
-                 ON jsonb_exists(r.provenance -> 'constants', c.name)
-              WHERE c.id = $1
-              GROUP BY c.name",
-            vec![id.into()],
-        ))
-        .await?
-    else {
+    use sea_orm::sea_query::ExprTrait;
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    let c = Alias::new("c");
+    let r = Alias::new("r");
+    let query = Query::select()
+        .column((c.clone(), constants::Column::Name))
+        .expr_as(
+            Func::count_distinct(Expr::col((r.clone(), readings::Column::CollectionEventId))),
+            Alias::new("visits"),
+        )
+        .expr_as(
+            Func::count(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("readings"),
+        )
+        .from_as(constants::Entity, c.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            readings::Entity,
+            r.clone(),
+            Expr::expr(
+                Func::cust("jsonb_exists")
+                    .arg(Expr::col((r, readings::Column::Provenance)).get_json_field("constants"))
+                    .arg(Expr::col((c.clone(), constants::Column::Name))),
+            ),
+        )
+        .and_where(Expr::col((c.clone(), constants::Column::Id)).eq(id))
+        .group_by_col((c, constants::Column::Name))
+        .to_owned();
+    let Some(row) = db.query_one_raw(build(&query)).await? else {
         return Ok(None);
     };
     Ok(Some(crate::routes::private::tools::models::StoredUsage {
@@ -3404,22 +3567,40 @@ pub async fn version_usage(
     db: &DatabaseConnection,
     script_id: Uuid,
 ) -> AppResult<Vec<crate::routes::private::tools::models::VersionUsage>> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT v.id AS version_id,
-                    v.version_no AS version_no,
-                    COUNT(DISTINCT r.collection_event_id)::bigint AS visits,
-                    COUNT(r.*)::bigint AS readings
-               FROM tool_script_versions v
-               LEFT JOIN readings r
-                 ON r.provenance -> 'tool_version' ->> 'script_version_id' = v.id::text
-              WHERE v.tool_script_id = $1
-              GROUP BY v.id, v.version_no
-              ORDER BY v.version_no DESC",
-            vec![script_id.into()],
-        ))
-        .await?;
+    use sea_orm::sea_query::ExprTrait;
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    let v = Alias::new("v");
+    let r = Alias::new("r");
+    let query = Query::select()
+        .expr_as(
+            Expr::col((v.clone(), version_entity::Column::Id)),
+            Alias::new("version_id"),
+        )
+        .column((v.clone(), version_entity::Column::VersionNo))
+        .expr_as(
+            Func::count_distinct(Expr::col((r.clone(), readings::Column::CollectionEventId))),
+            Alias::new("visits"),
+        )
+        .expr_as(
+            Func::count(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("readings"),
+        )
+        .from_as(version_entity::Entity, v.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            readings::Entity,
+            r.clone(),
+            Expr::col((r, readings::Column::Provenance))
+                .get_json_field("tool_version")
+                .cast_json_field("script_version_id")
+                .eq(Expr::col((v.clone(), version_entity::Column::Id)).cast_as("text")),
+        )
+        .and_where(Expr::col((v.clone(), version_entity::Column::ToolScriptId)).eq(script_id))
+        .group_by_col((v.clone(), version_entity::Column::Id))
+        .group_by_col((v.clone(), version_entity::Column::VersionNo))
+        .order_by((v, version_entity::Column::VersionNo), Order::Desc)
+        .to_owned();
+    let rows = db.query_all_raw(build(&query)).await?;
     rows.iter()
         .map(|row| {
             Ok(crate::routes::private::tools::models::VersionUsage {
@@ -3432,7 +3613,7 @@ pub async fn version_usage(
         .collect()
 }
 
-/// The statement behind [`version_ledger`], as text, so a test can read what it asks for.
+/// The statement behind [`version_ledger`].
 ///
 /// The grouping key is the version the decision names, which outlives every job row, so a stream
 /// pass needs no run identity of its own. Only the two kinds that carry a computation are counted:
@@ -3440,26 +3621,73 @@ pub async fn version_usage(
 /// distinct `(stream_id, time, replicate_index)` is what makes a reading moved twice under one
 /// version one reading; `at` is when the computing happened and `time` where the value sits.
 ///
-/// The `FILTER` is load-bearing: a row of all-NULL columns from the outer join is not itself NULL,
+/// The `CASE` is load-bearing: a row of all-NULL columns from the outer join is not itself NULL,
 /// so `COUNT(DISTINCT ...)` over it counts one, and a version that computed nothing would report a
 /// reading it never made.
 #[must_use]
-pub fn version_ledger_sql() -> &'static str {
-    "SELECT v.id AS version_id,
-            v.version_no AS version_no,
-            COUNT(DISTINCT (d.stream_id, d.time, d.replicate_index))
-              FILTER (WHERE d.stream_id IS NOT NULL)::bigint AS readings,
-            MIN(d.time) AS first_instant,
-            MAX(d.time) AS last_instant,
-            MIN(d.at) AS first_computed,
-            MAX(d.at) AS last_computed
-       FROM tool_script_versions v
-       LEFT JOIN reading_decisions d
-         ON d.kind IN ('derived_computed', 'formula_transition')
-        AND d.new ->> 'derived_version_id' = v.id::text
-      WHERE v.tool_script_id = $1
-      GROUP BY v.id, v.version_no
-      ORDER BY v.version_no DESC"
+pub fn version_ledger_query(script_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::readings::decision_model as decisions;
+    use sea_orm::sea_query::ExprTrait;
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    let v = Alias::new("v");
+    let d = Alias::new("d");
+    let decision = |column: decisions::Column| Expr::col((d.clone(), column));
+    let reading = Expr::tuple([
+        decision(decisions::Column::StreamId),
+        decision(decisions::Column::Time),
+        decision(decisions::Column::ReplicateIndex),
+    ]);
+    Query::select()
+        .expr_as(
+            Expr::col((v.clone(), version_entity::Column::Id)),
+            Alias::new("version_id"),
+        )
+        .expr_as(
+            Expr::col((v.clone(), version_entity::Column::VersionNo)),
+            Alias::new("version_no"),
+        )
+        .expr_as(
+            Expr::expr(Func::count_distinct(Expr::case(
+                decision(decisions::Column::StreamId).is_not_null(),
+                reading,
+            )))
+            .cast_as("bigint"),
+            Alias::new("readings"),
+        )
+        .expr_as(
+            Func::min(decision(decisions::Column::Time)),
+            Alias::new("first_instant"),
+        )
+        .expr_as(
+            Func::max(decision(decisions::Column::Time)),
+            Alias::new("last_instant"),
+        )
+        .expr_as(
+            Func::min(decision(decisions::Column::At)),
+            Alias::new("first_computed"),
+        )
+        .expr_as(
+            Func::max(decision(decisions::Column::At)),
+            Alias::new("last_computed"),
+        )
+        .from_as(version_entity::Entity, v.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            decisions::Entity,
+            d.clone(),
+            decision(decisions::Column::Kind)
+                .is_in(["derived_computed", "formula_transition"])
+                .and(
+                    decision(decisions::Column::New)
+                        .cast_json_field("derived_version_id")
+                        .eq(Expr::col((v.clone(), version_entity::Column::Id)).cast_as("text")),
+                ),
+        )
+        .and_where(Expr::col((v.clone(), version_entity::Column::ToolScriptId)).eq(script_id))
+        .group_by_col((v.clone(), version_entity::Column::Id))
+        .group_by_col((v.clone(), version_entity::Column::VersionNo))
+        .order_by((v, version_entity::Column::VersionNo), Order::Desc)
+        .to_owned()
 }
 
 /// What each version of a calculation has computed on the stream arm, newest first (Q232).
@@ -3472,11 +3700,7 @@ pub async fn version_ledger(
     script_id: Uuid,
 ) -> AppResult<Vec<crate::routes::private::tools::models::VersionLedgerRow>> {
     let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            version_ledger_sql(),
-            vec![script_id.into()],
-        ))
+        .query_all_raw(build(&version_ledger_query(script_id)))
         .await?;
     let instant = |row: &sea_orm::QueryResult,
                    column: &str|
@@ -3689,18 +3913,12 @@ pub async fn stored_version_content<C: ConnectionTrait>(
     test_cases: &serde_json::Value,
 ) -> Result<StoredVersionContent, DbErr> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm_migration::sea_orm::DatabaseBackend::Postgres,
-            "SELECT $1::jsonb::text AS manifest, $2::jsonb::text AS test_cases",
-            [
-                serde_json::to_string(manifest)
-                    .map_err(|e| DbErr::Custom(format!("manifest is not serialisable: {e}")))?
-                    .into(),
-                serde_json::to_string(test_cases)
-                    .map_err(|e| DbErr::Custom(format!("test cases are not serialisable: {e}")))?
-                    .into(),
-            ],
-        ))
+        .query_one_raw(build(&normalise_query(
+            serde_json::to_string(manifest)
+                .map_err(|e| DbErr::Custom(format!("manifest is not serialisable: {e}")))?,
+            serde_json::to_string(test_cases)
+                .map_err(|e| DbErr::Custom(format!("test cases are not serialisable: {e}")))?,
+        )))
         .await?
         .ok_or_else(|| {
             DbErr::Custom("normalising the version content returned no row".to_string())
@@ -3722,6 +3940,27 @@ pub async fn stored_version_content<C: ConnectionTrait>(
         manifest,
         test_cases,
     })
+}
+
+/// `SELECT $1::jsonb::text AS manifest, $2::jsonb::text AS test_cases`: the two documents as
+/// Postgres normalises jsonb, over no table.
+#[must_use]
+pub fn normalise_query(
+    manifest: String,
+    test_cases: String,
+) -> sea_orm::sea_query::SelectStatement {
+    use sea_orm::sea_query::ExprTrait;
+    let normalised = |document: String| Expr::val(document).cast_as("jsonb").cast_as("text");
+    Query::select()
+        .expr_as(normalised(manifest), Alias::new("manifest"))
+        .expr_as(normalised(test_cases), Alias::new("test_cases"))
+        .to_owned()
+}
+
+/// A manifest or case set as [`stored_version_content`] normalised it, read back for the insert.
+pub(super) fn normalised_json(text: &str) -> AppResult<serde_json::Value> {
+    serde_json::from_str(text)
+        .map_err(|e| AppError::Internal(format!("normalised version content is not JSON: {e}")))
 }
 
 pub(super) fn parse_ids(csv: Option<&str>) -> AppResult<Vec<Uuid>> {
@@ -3995,8 +4234,8 @@ pub async fn calculation_health(db: &DatabaseConnection) -> AppResult<Vec<Calcul
 /// calculation name the Recompute action writes into the job's params.
 async fn latest_repairs(db: &DatabaseConnection) -> AppResult<Vec<(String, CalculationRepair)>> {
     use crate::routes::private::reprocessing_jobs::models::job;
-    use sea_orm::sea_query::extension::postgres::PgExpr as _;
     use sea_orm::sea_query::ExprTrait as _;
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
 
     let calculation = || Expr::col(job::Column::Params).cast_json_field("calculation");
     let runs = job::Entity::find()
@@ -4015,11 +4254,9 @@ async fn latest_repairs(db: &DatabaseConnection) -> AppResult<Vec<(String, Calcu
             continue;
         }
         seen.push(tool.to_string());
-        if let Some(state) =
-            crate::routes::private::collection_events::service::calculation_repair(Some(
-                &run.status,
-            ))
-        {
+        if let Some(state) = crate::routes::private::collection_events::service::calculation_repair(
+            Some(&run.status),
+        ) {
             out.push((
                 tool.to_string(),
                 CalculationRepair {
@@ -4137,6 +4374,7 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
 
     check_manifest_codes_resolve(db, &calculation.name, &manifest).await?;
 
+    lock_calculation(db, script_id).await?;
     if let Some(existing) = version_entity::Entity::find()
         .filter(version_entity::Column::ToolScriptId.eq(script_id))
         .filter(version_entity::Column::ContentHash.eq(content_hash.clone()))
@@ -4156,25 +4394,19 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
         return Ok(Some(existing.id));
     }
 
-    let latest: Option<i32> = latest_version_no_query(script_id)
-        .into_tuple()
-        .one(db)
-        .await?
-        .flatten();
-    let version_id = Uuid::new_v4();
-    version_entity::ActiveModel {
-        id: Set(version_id),
-        tool_script_id: Set(script_id),
-        version_no: Set(next_version_no(latest)),
-        script: Set(body),
-        entry_function: Set("formula".to_string()),
-        manifest: Set(manifest),
-        content_hash: Set(content_hash),
-        created_by: Set(actor.map(str::to_string)),
-        validated_at: Set(Some(chrono::Utc::now())),
-        ..Default::default()
-    }
-    .insert(db)
+    let version_id = insert_version(
+        db,
+        version_entity::ActiveModel {
+            tool_script_id: Set(script_id),
+            script: Set(body),
+            entry_function: Set("formula".to_string()),
+            manifest: Set(manifest),
+            content_hash: Set(content_hash),
+            created_by: Set(actor.map(str::to_string)),
+            validated_at: Set(Some(chrono::Utc::now())),
+            ..Default::default()
+        },
+    )
     .await?;
     activate(
         db,
@@ -4185,6 +4417,58 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
     )
     .await?;
     Ok(Some(version_id))
+}
+
+/// Hold the calculation's row until the transaction ends, so two writers numbering its versions
+/// take their turns rather than reading the same latest.
+async fn lock_calculation<C: ConnectionTrait>(db: &C, script_id: Uuid) -> AppResult<()> {
+    script::Entity::find_by_id(script_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Tool script {script_id} not found")))?;
+    Ok(())
+}
+
+/// Store a new version of a calculation, numbered after its latest, and return its id. The caller
+/// sets everything but the id and the number.
+pub async fn insert_version<C: ConnectionTrait>(
+    db: &C,
+    mut version: version_entity::ActiveModel,
+) -> AppResult<Uuid> {
+    let script_id = *version.tool_script_id.as_ref();
+    lock_calculation(db, script_id).await?;
+    let latest: Option<i32> = latest_version_no_query(script_id)
+        .into_tuple()
+        .one(db)
+        .await?
+        .flatten();
+    let id = Uuid::new_v4();
+    version.id = Set(id);
+    version.version_no = Set(next_version_no(latest));
+    version.insert(db).await.map_err(|e| match e.sql_err() {
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(message)) => {
+            version_conflict(&message).map_or(AppError::Database(e), AppError::Conflict)
+        }
+        _ => AppError::Database(e),
+    })?;
+    Ok(id)
+}
+
+/// The refusal a unique violation on `tool_script_versions` reads as, or `None` for a constraint
+/// that is not one of the version's own.
+#[must_use]
+pub fn version_conflict(message: &str) -> Option<String> {
+    if message.contains("tool_script_versions_tool_script_id_content_hash_key") {
+        return Some("an identical version of this calculation already exists".to_string());
+    }
+    if message.contains("tool_script_versions_tool_script_id_version_no_key") {
+        return Some(
+            "another version of this calculation was saved at the same moment; save again"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// The highest `version_no` a calculation holds, NULL when it holds none.
@@ -4343,7 +4627,11 @@ pub async fn take_back_steps<C: ConnectionTrait>(
         .collect();
     let declared: Vec<(Uuid, String)> = declarations
         .iter()
-        .filter_map(|d| names.get(&d.tool_script_id).map(|n| (d.formula_id, n.clone())))
+        .filter_map(|d| {
+            names
+                .get(&d.tool_script_id)
+                .map(|n| (d.formula_id, n.clone()))
+        })
         .collect();
     let taken = steps_taken_back(name, payload_ids, &declared).map_err(AppError::BadRequest)?;
     if taken.is_empty() {
@@ -4662,14 +4950,7 @@ async fn member_ids<C: ConnectionTrait>(db: &C, group_id: Uuid) -> AppResult<Vec
 pub(super) async fn active_calculations<C: ConnectionTrait>(
     db: &C,
 ) -> AppResult<Vec<rules::Calculation>> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT s.name, v.manifest FROM tool_scripts s \
-               JOIN tool_script_versions v ON v.id = s.active_version_id",
-            [],
-        ))
-        .await?;
+    let rows = db.query_all_raw(build(&active_tool_query())).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let ActiveManifestRow { name, manifest } = ActiveManifestRow::from_query_result(row, "")?;
@@ -4775,7 +5056,6 @@ pub(crate) fn check_engine(engine: &str) -> Result<(), ApiError> {
 }
 
 /// One calculation's version count and the number of the version that is live.
-#[derive(FromQueryResult)]
 pub(super) struct VersionCounts {
     id: Uuid,
     active_version_no: Option<i32>,
@@ -4790,22 +5070,42 @@ pub(super) async fn counts<C: ConnectionTrait>(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT s.id, av.version_no AS active_version_no,
-                     (SELECT count(*) FROM tool_script_versions v
-                       WHERE v.tool_script_id = s.id) AS version_count
-                FROM tool_scripts s
-                LEFT JOIN tool_script_versions av ON av.id = s.active_version_id
-               WHERE s.id = ANY($1)",
-            [ids.to_vec().into()],
-        ))
+    let active: Vec<(Uuid, Option<i32>)> = script::Entity::find()
+        .select_only()
+        .column(script::Column::Id)
+        .column(version_entity::Column::VersionNo)
+        .join(
+            sea_orm::JoinType::LeftJoin,
+            script::Entity::belongs_to(version_entity::Entity)
+                .from(script::Column::ActiveVersionId)
+                .to(version_entity::Column::Id)
+                .into(),
+        )
+        .filter(script::Column::Id.is_in(ids.to_vec()))
+        .into_tuple()
+        .all(db)
         .await
         .map_err(ApiError::database)?;
-    rows.iter()
-        .map(|row| VersionCounts::from_query_result(row, "").map_err(ApiError::database))
-        .collect()
+    let totals: HashMap<Uuid, i64> = version_entity::Entity::find()
+        .select_only()
+        .column(version_entity::Column::ToolScriptId)
+        .column_as(version_entity::Column::Id.count(), "version_count")
+        .filter(version_entity::Column::ToolScriptId.is_in(ids.to_vec()))
+        .group_by(version_entity::Column::ToolScriptId)
+        .into_tuple::<(Uuid, i64)>()
+        .all(db)
+        .await
+        .map_err(ApiError::database)?
+        .into_iter()
+        .collect();
+    Ok(active
+        .into_iter()
+        .map(|(id, active_version_no)| VersionCounts {
+            id,
+            active_version_no,
+            version_count: totals.get(&id).copied().unwrap_or(0),
+        })
+        .collect())
 }
 
 impl CRUDOperations for ToolScriptOperations {
@@ -5440,3 +5740,7 @@ mod families_tests;
 #[cfg(test)]
 #[path = "tests/version_ledger.rs"]
 mod version_ledger_tests;
+
+#[cfg(test)]
+#[path = "tests/parameters_of.rs"]
+mod parameters_of_tests;

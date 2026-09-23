@@ -1,5 +1,17 @@
-use crate::routes::private::tools::models::RecomputeScope;
+use sea_orm::sea_query::PostgresQueryBuilder;
 use uuid::Uuid;
+
+use crate::routes::private::tools::models::RecomputeScope;
+
+fn events_sql(scope: &RecomputeScope) -> String {
+    scope.events_query().to_string(PostgresQueryBuilder)
+}
+
+fn site() -> Uuid {
+    Uuid::from_u128(1)
+}
+
+const SITE: &str = "'00000000-0000-0000-0000-000000000001'";
 
 fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
@@ -12,7 +24,7 @@ fn an_empty_scope_is_not_bounded_and_any_single_term_is() {
     assert!(!RecomputeScope::default().is_bounded());
     assert!(
         RecomputeScope {
-            site_id: Some(Uuid::new_v4()),
+            site_id: Some(site()),
             ..Default::default()
         }
         .is_bounded()
@@ -42,25 +54,21 @@ fn an_empty_scope_is_not_bounded_and_any_single_term_is() {
 
 #[test]
 fn portal_sync_visits_are_excluded_whatever_the_scope() {
-    let (sql, binds) = RecomputeScope {
+    let sql = events_sql(&RecomputeScope {
         only_findings: true,
         ..Default::default()
-    }
-    .events_sql();
-    assert!(sql.contains("ce.source <> 'portal_sync'"));
-    assert!(binds.is_empty());
+    });
+    assert!(sql.contains(r#""ce"."source" <> 'portal_sync'"#), "{sql}");
 }
 
 #[test]
-fn a_calculation_narrows_the_findings_arm_and_binds_its_name() {
-    let (sql, binds) = RecomputeScope {
+fn a_calculation_narrows_the_findings_arm_to_its_name() {
+    let sql = events_sql(&RecomputeScope {
         only_findings: true,
         calculation: Some("pco2".to_string()),
         ..Default::default()
-    }
-    .events_sql();
-    assert!(sql.contains("AND h.tool = $1"), "{sql}");
-    assert_eq!(binds.len(), 1);
+    });
+    assert!(sql.contains(r#""h"."tool" = 'pco2'"#), "{sql}");
 }
 
 #[test]
@@ -78,20 +86,19 @@ fn a_calculation_alone_is_not_a_scope() {
 /// and a calculation there would silently drop the ones it has raised nothing about.
 #[test]
 fn a_calculation_without_only_findings_adds_no_clause() {
-    let (sql, binds) = RecomputeScope {
-        site_id: Some(Uuid::new_v4()),
+    let sql = events_sql(&RecomputeScope {
+        site_id: Some(site()),
         calculation: Some("pco2".to_string()),
         ..Default::default()
-    }
-    .events_sql();
-    assert!(!sql.contains("h.tool"), "{sql}");
-    assert_eq!(binds.len(), 1, "the site is the only bind");
+    });
+    assert!(!sql.contains(r#""h"."tool""#), "{sql}");
+    assert!(!sql.contains("'pco2'"), "{sql}");
 }
 
 #[test]
-fn each_term_adds_its_clause_with_binds_in_order() {
+fn each_term_adds_its_clause() {
     let scope = RecomputeScope {
-        site_id: Some(Uuid::new_v4()),
+        site_id: Some(site()),
         start: Some(at("2025-06-01T00:00:00Z")),
         end: Some(at("2025-06-30T00:00:00Z")),
         only_findings: true,
@@ -99,28 +106,48 @@ fn each_term_adds_its_clause_with_binds_in_order() {
         version: None,
         constant: None,
     };
-    let (sql, binds) = scope.events_sql();
-    assert!(sql.contains("ce.site_id = $1"));
-    assert!(sql.contains("ce.collected_at >= $2"));
-    assert!(sql.contains("ce.collected_at <= $3"));
-    assert_eq!(binds.len(), 3);
-    assert!(sql.contains("h.kind IN ('missing_output', 'stale_output', 'skipped_output')"));
-    assert!(sql.contains("h.status = 'pending'"));
-    assert!(sql.trim_end().ends_with("ORDER BY ce.collected_at"));
+    let sql = events_sql(&scope);
+    assert!(
+        sql.contains(&format!(r#""ce"."site_id" = {SITE}"#)),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""ce"."collected_at" >= '2025-06-01"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""ce"."collected_at" <= '2025-06-30"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""h"."kind" IN ('missing_output', 'stale_output', 'skipped_output')"#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#""h"."status" = 'pending'"#), "{sql}");
+    assert!(
+        sql.ends_with(r#"ORDER BY "ce"."collected_at" ASC"#),
+        "{sql}"
+    );
 }
 
 #[test]
-fn a_range_alone_binds_two_and_names_no_site() {
+fn a_range_alone_names_no_site() {
     let scope = RecomputeScope {
         start: Some(at("2025-06-01T00:00:00Z")),
         end: Some(at("2025-06-30T00:00:00Z")),
         ..Default::default()
     };
-    let (sql, binds) = scope.events_sql();
-    assert!(!sql.contains("ce.site_id"));
-    assert!(!sql.contains("replicate_audit_holds"));
-    assert!(sql.contains(">= $1") && sql.contains("<= $2"));
-    assert_eq!(binds.len(), 2);
+    let sql = events_sql(&scope);
+    assert!(!sql.contains(r#""ce"."site_id""#), "{sql}");
+    assert!(!sql.contains("replicate_audit_holds"), "{sql}");
+    assert!(
+        sql.contains(r#""ce"."collected_at" >= '2025-06-01"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""ce"."collected_at" <= '2025-06-30"#),
+        "{sql}"
+    );
 }
 
 /// The set a backfill asks for: every manual visit at a site, in a window, whether or not a
@@ -129,7 +156,7 @@ fn a_range_alone_binds_two_and_names_no_site() {
 #[test]
 fn a_site_and_range_without_only_findings_names_no_holds() {
     let scope = RecomputeScope {
-        site_id: Some(Uuid::new_v4()),
+        site_id: Some(site()),
         start: Some(at("2025-06-01T00:00:00Z")),
         end: Some(at("2025-06-30T00:00:00Z")),
         only_findings: false,
@@ -138,45 +165,60 @@ fn a_site_and_range_without_only_findings_names_no_holds() {
         constant: None,
     };
     assert!(scope.is_bounded());
-    let (sql, binds) = scope.events_sql();
+    let sql = events_sql(&scope);
     assert!(!sql.contains("replicate_audit_holds"), "{sql}");
-    assert!(sql.contains("ce.site_id = $1"));
-    assert!(sql.contains("ce.collected_at >= $2"));
-    assert!(sql.contains("ce.collected_at <= $3"));
-    assert_eq!(binds.len(), 3);
+    assert!(
+        sql.contains(&format!(r#""ce"."site_id" = {SITE}"#)),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""ce"."collected_at" >= '2025-06-01"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""ce"."collected_at" <= '2025-06-30"#),
+        "{sql}"
+    );
 }
 
 /// A site alone is a scope: the whole history of entered visits there.
 #[test]
 fn a_site_alone_names_every_manual_visit_there() {
     let scope = RecomputeScope {
-        site_id: Some(Uuid::new_v4()),
+        site_id: Some(site()),
         ..Default::default()
     };
-    let (sql, binds) = scope.events_sql();
+    let sql = events_sql(&scope);
     assert!(!sql.contains("replicate_audit_holds"), "{sql}");
-    assert!(!sql.contains("ce.collected_at >="), "{sql}");
-    assert!(sql.contains("ce.site_id = $1"));
-    assert_eq!(binds.len(), 1);
+    assert!(!sql.contains(r#""ce"."collected_at" >="#), "{sql}");
+    assert!(
+        sql.contains(&format!(r#""ce"."site_id" = {SITE}"#)),
+        "{sql}"
+    );
 }
 
 /// A superseded script version is a bound of its own: the visits it produced values at are a
 /// finite set the provenance names, which is what an author's migrate arm has to cover.
 #[test]
 fn a_superseded_version_is_a_scope_and_selects_by_provenance() {
+    let version = Uuid::new_v4();
     let scope = RecomputeScope {
-        version: Some(Uuid::new_v4()),
+        version: Some(version),
         ..Default::default()
     };
     assert!(scope.is_bounded());
-    let (sql, binds) = scope.events_sql();
+    let sql = events_sql(&scope);
     assert!(!sql.contains("replicate_audit_holds"), "{sql}");
     assert!(
-        sql.contains("'tool_version' ->> 'script_version_id' = $1"),
+        sql.contains(&format!(
+            r#"(("r"."provenance" -> 'tool_version') ->> 'script_version_id') = '{version}'"#
+        )),
         "{sql}"
     );
-    assert!(sql.contains("r.collection_event_id = ce.id"), "{sql}");
-    assert_eq!(binds.len(), 1);
+    assert!(
+        sql.contains(r#""r"."collection_event_id" = "ce"."id""#),
+        "{sql}"
+    );
 }
 
 /// The version is a bound, not a narrowing of the findings arm: a migrate has to reach the visits
@@ -184,14 +226,16 @@ fn a_superseded_version_is_a_scope_and_selects_by_provenance() {
 #[test]
 fn a_version_narrows_a_site_scope_rather_than_replacing_it() {
     let scope = RecomputeScope {
-        site_id: Some(Uuid::new_v4()),
+        site_id: Some(site()),
         version: Some(Uuid::new_v4()),
         ..Default::default()
     };
-    let (sql, binds) = scope.events_sql();
-    assert!(sql.contains("ce.site_id = $1"), "{sql}");
-    assert!(sql.contains("script_version_id' = $2"), "{sql}");
-    assert_eq!(binds.len(), 2);
+    let sql = events_sql(&scope);
+    assert!(
+        sql.contains(&format!(r#""ce"."site_id" = {SITE}"#)),
+        "{sql}"
+    );
+    assert!(sql.contains("'script_version_id'"), "{sql}");
 }
 
 /// Scenario: a constant's value is corrected, so every visit whose stored provenance names that
@@ -213,30 +257,30 @@ fn a_constant_is_a_scope_on_its_own() {
 
 #[test]
 fn a_constant_selects_the_visits_whose_provenance_names_it() {
-    let (sql, binds) = RecomputeScope {
+    let sql = events_sql(&RecomputeScope {
         constant: Some("molar_mass_c".to_string()),
         ..Default::default()
-    }
-    .events_sql();
-    assert!(sql.contains("jsonb_exists"), "{sql}");
-    assert!(sql.contains("'constants'"), "{sql}");
-    assert!(sql.contains("$1"), "{sql}");
-    assert_eq!(binds.len(), 1);
+    });
+    assert!(
+        sql.contains(r#"jsonb_exists("r"."provenance" -> 'constants', 'molar_mass_c')"#),
+        "{sql}"
+    );
 }
 
 /// A constant narrows a site-and-range scope rather than replacing it: a correction confined to
 /// one site repairs that site's visits naming the constant and no others.
 #[test]
-fn a_constant_narrows_a_site_scope_and_binds_after_it() {
-    let (sql, binds) = RecomputeScope {
-        site_id: Some(Uuid::new_v4()),
+fn a_constant_narrows_a_site_scope() {
+    let sql = events_sql(&RecomputeScope {
+        site_id: Some(site()),
         constant: Some("molar_mass_c".to_string()),
         ..Default::default()
-    }
-    .events_sql();
-    assert!(sql.contains("ce.site_id = $1"), "{sql}");
-    assert!(sql.contains("$2"), "{sql}");
-    assert_eq!(binds.len(), 2);
+    });
+    assert!(
+        sql.contains(&format!(r#""ce"."site_id" = {SITE}"#)),
+        "{sql}"
+    );
+    assert!(sql.contains("'molar_mass_c'"), "{sql}");
 }
 
 /// The audit reports on the set the repair can repair: a synced visit is the portal's, so neither

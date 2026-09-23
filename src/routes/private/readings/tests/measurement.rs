@@ -1,5 +1,8 @@
 use super::*;
 
+/// A reading override, a stream default, the owning sensor, and the classification expected.
+type Case<'a> = (Option<&'a str>, Option<&'a str>, Option<Uuid>, &'a str);
+
 #[test]
 fn test_measurement_type_rejection_admits_every_member() {
     for v in MeasurementType::ALL {
@@ -35,7 +38,7 @@ fn test_resolve_measurement_type_takes_the_most_specific_rung() {
     let mut sensors = HashMap::new();
     sensors.insert(sensor, MeasurementType::Spot.as_str());
 
-    let cases: [(Option<&str>, Option<&str>, Option<Uuid>, &str); 6] = [
+    let cases: [Case; 6] = [
         // An override wins over a stream default and a sensor that both say otherwise.
         (Some("derived"), Some("spot"), Some(sensor), "derived"),
         // With no override, the stream's default wins over the sensor's frequency.

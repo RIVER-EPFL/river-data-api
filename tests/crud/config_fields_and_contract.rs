@@ -547,21 +547,6 @@ async fn status_event_pages_cover_every_tied_row_exactly_once() {
     );
 }
 
-/// Run a request on its own task so a panic inside the handler is reported as an error rather than
-/// unwinding the test.
-async fn get_without_unwinding(
-    app: &axum::Router,
-    uri: &str,
-    token: &str,
-) -> Result<(u16, String), String> {
-    let app = app.clone();
-    let uri = uri.to_string();
-    let token = token.to_string();
-    tokio::spawn(async move { get_with_token(&app, &uri, &token).await })
-        .await
-        .map_err(|e| e.to_string())
-}
-
 struct RecordingChannel {
     sent: Arc<Mutex<Vec<OutgoingMessage>>>,
 }

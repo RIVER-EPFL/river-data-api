@@ -401,7 +401,7 @@ async fn matching_resend_supersedes_stale_hold() {
     .await;
     let hold_id = pending_hold_id(&fx).await;
 
-    let body = ingest_audited(
+    let _body = ingest_audited(
         &fx,
         batch,
         json!([{"time": T1, "expected_mean": 20.0, "expected_sd": 10.0}]),

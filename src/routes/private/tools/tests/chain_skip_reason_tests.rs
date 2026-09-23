@@ -28,3 +28,19 @@ fn anything_else_fails_the_run() {
         "a runner that cannot be reached is not a tool that cannot be computed"
     );
 }
+
+/// The reason a run gave for skipping one output, read from its `skipped` list.
+#[test]
+fn test_skipped_reason_names_only_the_output_asked_for() {
+    let skipped = vec![
+        serde_json::json!({ "output": "doc_avg", "reason": "no value for blank" }),
+        serde_json::json!({ "output": "doc_sd" }),
+    ];
+    assert_eq!(
+        super::skipped_reason(&skipped, "doc_avg"),
+        Some("no value for blank".to_string())
+    );
+    assert_eq!(super::skipped_reason(&skipped, "doc_sd"), None);
+    assert_eq!(super::skipped_reason(&skipped, "dom"), None);
+    assert_eq!(super::skipped_reason(&[], "doc_avg"), None);
+}

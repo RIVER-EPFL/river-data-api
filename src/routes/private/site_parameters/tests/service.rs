@@ -186,21 +186,28 @@ fn test_partition_calculation_separates_missing_inputs_from_outputs_to_mint() {
     let suva = (Uuid::from_u128(12), "suva".to_string());
     let held = [doc.0, a254.0].into_iter().collect();
 
-    let partition =
-        super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &held);
+    let partition = super::partition_calculation(
+        &[doc.clone(), a254.clone()],
+        std::slice::from_ref(&suva),
+        &held,
+    );
     assert_eq!(partition.inputs_present, vec![doc.clone(), a254.clone()]);
     assert!(partition.inputs_missing.is_empty());
     assert!(partition.outputs_existing.is_empty());
     assert_eq!(partition.outputs_to_create, vec![suva.clone()]);
 
     let without_a254 = [doc.0].into_iter().collect();
-    let partition =
-        super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &without_a254);
+    let partition = super::partition_calculation(
+        &[doc.clone(), a254.clone()],
+        std::slice::from_ref(&suva),
+        &without_a254,
+    );
     assert_eq!(partition.inputs_missing, vec![a254.clone()]);
     assert_eq!(partition.outputs_to_create, vec![suva.clone()]);
 
     let with_suva = [doc.0, a254.0, suva.0].into_iter().collect();
-    let partition = super::partition_calculation(&[doc, a254], &[suva.clone()], &with_suva);
+    let partition =
+        super::partition_calculation(&[doc, a254], std::slice::from_ref(&suva), &with_suva);
     assert_eq!(partition.outputs_existing, vec![suva]);
     assert!(partition.outputs_to_create.is_empty());
 }
@@ -258,4 +265,28 @@ fn test_a_held_input_does_not_decide_the_arm() {
         .is_empty(),
         "a set holding everything it reads decides nothing, and takes the visit arm"
     );
+}
+
+fn member(id: Uuid, code: &str) -> super::GroupMember {
+    (id, code.to_string(), code.to_string())
+}
+
+/// Scenario: a group names DOC, a254 and DOC again; the site already carries a254.
+/// Expected behaviour: a254 is existing, DOC is created once.
+#[test]
+fn test_partition_members_splits_held_slots_from_those_to_create() {
+    let doc = Uuid::new_v4();
+    let a254 = Uuid::new_v4();
+    let members = vec![member(doc, "DOC"), member(a254, "a254"), member(doc, "DOC")];
+    let held = std::collections::HashSet::from([a254]);
+    let (create, existing) = super::partition_members(&members, &held);
+    assert_eq!(create, vec![member(doc, "DOC")]);
+    assert_eq!(existing, vec![member(a254, "a254")]);
+}
+
+#[test]
+fn test_partition_members_of_an_empty_group_is_empty() {
+    let (create, existing) = super::partition_members(&[], &std::collections::HashSet::new());
+    assert!(create.is_empty());
+    assert!(existing.is_empty());
 }

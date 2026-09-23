@@ -73,10 +73,10 @@ fn test_every_schema_ref_in_the_committed_document_resolves() {
 
     let mut dangling = std::collections::BTreeSet::new();
     collect_refs(&doc, &mut |r| {
-        if let Some(name) = r.strip_prefix("#/components/schemas/") {
-            if !names.contains(name) {
-                dangling.insert(name.to_string());
-            }
+        if let Some(name) = r.strip_prefix("#/components/schemas/")
+            && !names.contains(name)
+        {
+            dangling.insert(name.to_string());
         }
     });
     assert!(
@@ -375,10 +375,10 @@ fn collect_refs(value: &serde_json::Value, found: &mut impl FnMut(&str)) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
-                if key == "$ref" {
-                    if let Some(r) = child.as_str() {
-                        found(r);
-                    }
+                if key == "$ref"
+                    && let Some(r) = child.as_str()
+                {
+                    found(r);
                 }
                 collect_refs(child, found);
             }

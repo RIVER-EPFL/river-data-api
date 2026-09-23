@@ -301,7 +301,7 @@ async fn test_aggregates_hourly() {
 
         let first_count = count[0].as_i64().unwrap();
         assert!(
-            first_count >= 5 && first_count <= 7,
+            (5..=7).contains(&first_count),
             "should be ~6 readings per hour, got {first_count}"
         );
     }
@@ -338,7 +338,7 @@ async fn test_aggregates_daily() {
 
         let day1_count = count[0].as_i64().unwrap();
         assert!(
-            day1_count >= 140 && day1_count <= 148,
+            (140..=148).contains(&day1_count),
             "should be ~144 readings per day, got {day1_count}"
         );
     }

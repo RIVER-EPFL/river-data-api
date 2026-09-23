@@ -2,8 +2,10 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use sea_orm::sea_query::extension::postgres::PgBinOper;
-use sea_orm::sea_query::{Alias, Condition, Expr, ExprTrait as _, Query as SeaQuery};
+use sea_orm::sea_query::extension::postgres::{PgBinOper, PgFunc};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, ExprTrait as _, InsertStatement, Query as SeaQuery,
+};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
@@ -25,6 +27,7 @@ pub(super) fn days_ago(days: u32) -> sea_orm::prelude::DateTimeWithTimeZone {
 /// What the sweeper writes into a closed row's `errors`, so the sweep and anything reading the
 /// reason cannot drift apart.
 pub(super) const SWEPT_REASON: &str = "Closed by sweeper: service stopped reporting";
+const FULL_SYNC_COMMAND: &str = "trigger_full_sync";
 
 /// A cycle still reporting `running` whose start is older than the threshold. The cut-off is
 /// computed here rather than left to the statement, so the window is a typed instant.
@@ -223,26 +226,7 @@ impl Job for SyncFullReassert {
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let rows = ctx
             .db()
-            .query_all_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO sync_commands
-                     (id, service_id, command, status, created_at, expires_at)
-                 SELECT gen_random_uuid(), s.id, 'trigger_full_sync', 'pending', NOW(),
-                        NOW() + ($1 || ' seconds')::interval
-                 FROM sync_services s
-                 WHERE s.paused IS NOT TRUE
-                   AND s.full_reassert_enabled
-                   AND s.last_heartbeat > NOW() - INTERVAL '1 hour'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM sync_commands c
-                       WHERE c.service_id = s.id
-                         AND c.command = 'trigger_full_sync'
-                         AND c.status = 'pending'
-                         AND c.expires_at > NOW()
-                   )
-                 RETURNING service_id",
-                [self.command_expiry_secs.to_string().into()],
-            ))
+            .query_all(&full_reassert_insert(Utc::now(), self.command_expiry_secs)?)
             .await?;
         let services: Vec<String> = rows
             .iter()
@@ -260,6 +244,55 @@ impl Job for SyncFullReassert {
         .await;
         Ok(i64::try_from(queued).unwrap_or(i64::MAX))
     }
+}
+
+/// Queue a pending `trigger_full_sync` for every live, unpaused service with
+/// `full_reassert_enabled` that does not already hold one, returning each queued `service_id`.
+fn full_reassert_insert(now: DateTime<Utc>, expiry_secs: u64) -> Result<InsertStatement, DbErr> {
+    let s = Alias::new("s");
+    let c = Alias::new("c");
+    let expires_at = now + Duration::seconds(i64::try_from(expiry_secs).unwrap_or(i64::MAX));
+    let already_queued = SeaQuery::select()
+        .expr(Expr::val(1))
+        .from_as(commands::Entity, c.clone())
+        .and_where(
+            Expr::col((c.clone(), commands::Column::ServiceId))
+                .equals((s.clone(), services::Column::Id)),
+        )
+        .and_where(Expr::col((c.clone(), commands::Column::Command)).eq(FULL_SYNC_COMMAND))
+        .and_where(Expr::col((c.clone(), commands::Column::Status)).eq("pending"))
+        .and_where(Expr::col((c, commands::Column::ExpiresAt)).gt(now))
+        .to_owned();
+    let due = SeaQuery::select()
+        .expr(PgFunc::gen_random_uuid())
+        .column((s.clone(), services::Column::Id))
+        .expr(Expr::val(FULL_SYNC_COMMAND))
+        .expr(Expr::val("pending"))
+        .expr(Expr::val(now))
+        .expr(Expr::val(expires_at))
+        .from_as(services::Entity, s.clone())
+        .and_where(Expr::col((s.clone(), services::Column::Paused)).eq(false))
+        .and_where(Expr::col((
+            s.clone(),
+            services::Column::FullReassertEnabled,
+        )))
+        .and_where(Expr::col((s, services::Column::LastHeartbeat)).gt(now - Duration::hours(1)))
+        .and_where(Expr::exists(already_queued).not())
+        .to_owned();
+    Ok(SeaQuery::insert()
+        .into_table(commands::Entity)
+        .columns([
+            commands::Column::Id,
+            commands::Column::ServiceId,
+            commands::Column::Command,
+            commands::Column::Status,
+            commands::Column::CreatedAt,
+            commands::Column::ExpiresAt,
+        ])
+        .select_from(due)
+        .map_err(|e| DbErr::Custom(format!("queueing full syncs: {e}")))?
+        .returning_col(commands::Column::ServiceId)
+        .to_owned())
 }
 
 #[cfg(test)]

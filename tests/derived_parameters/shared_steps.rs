@@ -544,7 +544,10 @@ async fn a_shared_step_read_by_one_calculation_is_taken_back_into_its_set() {
         ),
     )
     .await;
-    assert_eq!(owner, first, "the step is the calculation's own again, under its id");
+    assert_eq!(
+        owner, first,
+        "the step is the calculation's own again, under its id"
+    );
     let declared = crate::common::e2e::scalar(
         &db,
         &format!(

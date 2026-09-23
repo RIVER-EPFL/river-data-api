@@ -247,5 +247,8 @@ fn test_a_step_another_calculation_still_reads_is_not_taken_back() {
         (id(5), "other_set".to_string()),
     ];
     let err = steps_taken_back("this_set", &[id(5)], &declared).expect_err("refused");
-    assert!(err.contains("other_set"), "the error names the reader: {err}");
+    assert!(
+        err.contains("other_set"),
+        "the error names the reader: {err}"
+    );
 }

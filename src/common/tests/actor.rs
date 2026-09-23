@@ -60,11 +60,7 @@ fn a_caller_says_what_its_writes_are_recorded_as() {
 #[tokio::test]
 async fn the_actor_is_readable_below_the_handler_and_nowhere_else() {
     assert_eq!(current(), None, "outside a request nobody is writing");
-    let seen = scoped("evan@epfl.ch".to_string(), async {
-        // Anything the request calls, however deep, reads the same answer.
-        async { current() }.await
-    })
-    .await;
+    let seen = scoped("evan@epfl.ch".to_string(), async { current() }).await;
     assert_eq!(seen.as_deref(), Some("evan@epfl.ch"));
     assert_eq!(current(), None, "and the scope ends with the request");
 }

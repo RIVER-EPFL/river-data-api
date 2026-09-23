@@ -601,3 +601,348 @@ fn test_coverage_query_keeps_the_two_sides_lateral() {
     assert!(scoped.contains(r#""sp"."site_id" = $"#), "{scoped}");
     assert!(scoped.contains(r#""r"."site_id" = $"#), "{scoped}");
 }
+
+/// The manifest's aggregate outputs, recomputed server-side over the curve-applied replicates.
+mod manifest_aggregates {
+    use crate::routes::private::tools::models::{CurveSnapshot, Manifest, ResolvedCurve};
+    use crate::routes::private::tools::service::apply_manifest_aggregates;
+
+    fn manifest() -> Manifest {
+        serde_json::from_value(serde_json::json!({
+            "label": "DOC",
+            "params": [{ "name": "reps", "label": "Reps", "kind": "replicates",
+                         "parameter_code": "DOC", "curve": "std_curve" }],
+            "curves": [{ "name": "std_curve", "label": "Standard curve" }],
+            "outputs": [
+                { "key": "avg", "label": "Avg", "aggregate_of": "reps", "aggregate": "mean" },
+                { "key": "sd", "label": "Sd", "aggregate_of": "reps", "aggregate": "sd" },
+                { "key": "other", "label": "Other" },
+            ],
+        }))
+        .unwrap()
+    }
+
+    fn inputs(reps: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({ "reps": reps })
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn snapshot(slope: f64, intercept: f64) -> CurveSnapshot {
+        CurveSnapshot {
+            name: "std_curve".to_string(),
+            curve: ResolvedCurve {
+                slope,
+                intercept,
+                standard_curve_id: None,
+                label: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_apply_manifest_aggregates_replaces_script_values_over_curved_replicates() {
+        let mut results = serde_json::json!({ "avg": 999.0, "sd": 999.0, "other": 7.0 })
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_manifest_aggregates(
+            &manifest(),
+            &inputs(serde_json::json!([1.0, null, 3.0])),
+            &[snapshot(2.0, 1.0)],
+            &mut results,
+        );
+        // Curved: 3.0 and 7.0; the null is a repeat not measured.
+        assert_eq!(results["avg"], serde_json::json!(5.0));
+        // Sample sd of 3 and 7: sqrt(8).
+        let sd = results["sd"].as_f64().unwrap();
+        assert!((sd - 8.0_f64.sqrt()).abs() < 1e-12, "{sd}");
+        assert_eq!(
+            results["other"],
+            serde_json::json!(7.0),
+            "a plain output is left alone"
+        );
+    }
+
+    #[test]
+    fn test_apply_manifest_aggregates_without_a_curve_uses_the_raw_values() {
+        let mut results = serde_json::Map::new();
+        apply_manifest_aggregates(
+            &manifest(),
+            &inputs(serde_json::json!([2.0, 4.0])),
+            &[],
+            &mut results,
+        );
+        assert_eq!(results["avg"], serde_json::json!(3.0));
+    }
+
+    #[test]
+    fn test_apply_manifest_aggregates_removes_what_cannot_be_computed() {
+        let mut results = serde_json::json!({ "avg": 1.0, "sd": 1.0 })
+            .as_object()
+            .unwrap()
+            .clone();
+        // One value has a mean and no sample sd.
+        apply_manifest_aggregates(
+            &manifest(),
+            &inputs(serde_json::json!([2.0])),
+            &[],
+            &mut results,
+        );
+        assert_eq!(results.get("avg"), Some(&serde_json::json!(2.0)));
+        assert!(!results.contains_key("sd"), "{results:?}");
+
+        let mut results = serde_json::json!({ "avg": 1.0, "sd": 1.0 })
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_manifest_aggregates(&manifest(), &serde_json::Map::new(), &[], &mut results);
+        assert!(
+            results.is_empty(),
+            "no replicates sent, no aggregate: {results:?}"
+        );
+    }
+}
+
+/// How a stored golden case is judged against what a run returned.
+mod golden_matching {
+    use crate::routes::private::tools::service::matches_expected;
+    use serde_json::json;
+
+    #[test]
+    fn test_matches_expected_numbers_within_relative_tolerance() {
+        assert!(matches_expected(&json!(100.05), &json!(100.0), 1e-3));
+        assert!(!matches_expected(&json!(100.2), &json!(100.0), 1e-3));
+        // Below one the bound is absolute: tol * max(|expected|, 1).
+        assert!(matches_expected(&json!(0.0005), &json!(0.0), 1e-3));
+        assert!(!matches_expected(&json!(0.002), &json!(0.0), 1e-3));
+    }
+
+    #[test]
+    fn test_matches_expected_null_and_type_mismatches() {
+        assert!(matches_expected(&json!(null), &json!(null), 1e-6));
+        assert!(!matches_expected(&json!(1.0), &json!(null), 1e-6));
+        assert!(!matches_expected(&json!(null), &json!(1.0), 1e-6));
+        assert!(matches_expected(&json!("ok"), &json!("ok"), 1e-6));
+        assert!(!matches_expected(&json!("ok"), &json!("no"), 1e-6));
+    }
+
+    #[test]
+    fn test_matches_expected_objects_allow_extra_keys_and_arrays_do_not() {
+        assert!(matches_expected(
+            &json!({ "a": 1.0, "extra": 2.0 }),
+            &json!({ "a": 1.0 }),
+            1e-6
+        ));
+        assert!(!matches_expected(
+            &json!({ "a": 1.0 }),
+            &json!({ "a": 1.0, "b": 2.0 }),
+            1e-6
+        ));
+        assert!(matches_expected(
+            &json!([1.0, null]),
+            &json!([1.0, null]),
+            1e-6
+        ));
+        assert!(!matches_expected(&json!([1.0]), &json!([1.0, 2.0]), 1e-6));
+        assert!(!matches_expected(&json!({ "0": 1.0 }), &json!([1.0]), 1e-6));
+    }
+}
+
+/// What a request body and a stored run are read into before a formula set runs.
+mod run_bindings {
+    use crate::routes::private::tools::service::{
+        formula_bindings, read_curve, stored_curves, take_context,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn test_take_context_pops_the_reserved_fields_and_leaves_inputs() {
+        let site = uuid::Uuid::new_v4();
+        let mut body =
+            json!({ "site_id": site, "collected_at": "2025-06-01T10:00:00+02:00", "x": 1 })
+                .as_object()
+                .unwrap()
+                .clone();
+        let (site_id, at) = take_context(&mut body).unwrap();
+        assert_eq!(site_id, Some(site));
+        assert_eq!(at.unwrap().to_rfc3339(), "2025-06-01T08:00:00+00:00");
+        assert_eq!(body.keys().collect::<Vec<_>>(), vec!["x"]);
+
+        let mut body = json!({ "site_id": null }).as_object().unwrap().clone();
+        assert_eq!(take_context(&mut body).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn test_take_context_refuses_malformed_context() {
+        let mut body = json!({ "site_id": "not-a-uuid" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(take_context(&mut body).is_err());
+        let mut body = json!({ "collected_at": "yesterday" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(take_context(&mut body).is_err());
+    }
+
+    #[test]
+    fn test_formula_bindings_splits_scalars_from_families() {
+        let inputs = json!({ "temp": 12.5, "reps": [1.0, null, 3.0], "note": "x" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let (scalars, families) = formula_bindings(&inputs);
+        assert_eq!(scalars.len(), 1);
+        assert_eq!(scalars["temp"], 12.5);
+        assert_eq!(families.len(), 1);
+        assert_eq!(families["reps"], vec![Some(1.0), None, Some(3.0)]);
+    }
+
+    #[test]
+    fn test_stored_curves_reads_each_complete_snapshot() {
+        let stored = json!([
+            { "name": "std_curve", "curve": { "slope": 2.0, "intercept": 0.5 } },
+            { "name": "partial", "curve": { "slope": 2.0 } },
+            { "curve": { "slope": 1.0, "intercept": 0.0 } },
+        ]);
+        let curves = stored_curves(&stored);
+        assert_eq!(curves.len(), 1);
+        assert_eq!(curves["std_curve"].slope, 2.0);
+        assert_eq!(curves["std_curve"].intercept, 0.5);
+        assert!(stored_curves(&json!(null)).is_empty());
+        assert!(read_curve(&json!({ "slope": "2", "intercept": 0.0 })).is_none());
+    }
+}
+
+/// The catalog codes a stored manifest reads and writes.
+mod manifest_catalog_codes {
+    use crate::routes::private::tools::service::{codes_of_event_inputs, manifest_codes};
+    use serde_json::json;
+
+    #[test]
+    fn test_manifest_codes_lowercases_and_merges_event_inputs() {
+        let manifest = json!({
+            "params": [
+                { "name": "a", "parameter_code": "DOC" },
+                { "name": "b" },
+                { "name": "c", "parameter_code": "doc" },
+            ],
+            "event_inputs": [{ "name": "t", "parameter_code": "Water_Temp" }],
+            "outputs": [{ "key": "o", "suggested_parameter_code": "DOC_ppb" }],
+        });
+        let (inputs, outputs) = manifest_codes(&manifest);
+        assert_eq!(inputs, vec!["doc".to_string(), "water_temp".to_string()]);
+        assert_eq!(outputs, vec!["doc_ppb".to_string()]);
+        assert_eq!(
+            codes_of_event_inputs(&manifest),
+            vec!["water_temp".to_string()]
+        );
+        assert_eq!(manifest_codes(&json!({})), (Vec::new(), Vec::new()));
+    }
+}
+
+/// The `doc` script the suites carry, judged by its stored manifest rather than a stand-in: a
+/// change to that manifest that loosens what `doc` refuses fails here.
+mod stored_doc {
+    use crate::routes::private::tools::models::{Manifest, parse_manifest};
+    use crate::routes::private::tools::service::{account_inputs, check_body_shape};
+
+    /// The manifest literal of the `doc` version in the reference rows the suites load.
+    fn doc_manifest() -> Manifest {
+        let path = crate::test_crate_root().join("tests/fixtures/reference_rows.sql");
+        let sql = std::fs::read_to_string(&path).expect("the reference rows");
+        let start = sql
+            .find(r#"'{"label": "DOC""#)
+            .expect("the doc manifest literal")
+            + 1;
+        let mut depth = 0usize;
+        let mut end = start;
+        for (i, c) in sql[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let raw: serde_json::Value =
+            serde_json::from_str(&sql[start..end].replace("''", "'")).expect("the manifest JSON");
+        parse_manifest(&raw).expect("the stored manifest parses")
+    }
+
+    fn check(body: serde_json::Value) -> Result<(), String> {
+        let serde_json::Value::Object(map) = body else {
+            panic!("the body is an object");
+        };
+        check_body_shape("doc", &doc_manifest(), &map).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_a_well_formed_doc_body_is_accepted() {
+        check(serde_json::json!({ "DOC": [101.5, null, 99.0], "std_curve": "c-1" }))
+            .expect("replicates with a gap and a curve");
+    }
+
+    #[test]
+    fn test_a_text_replicate_is_refused_naming_the_field() {
+        let err = check(serde_json::json!({ "DOC": [101.5, "high"] })).expect_err("refused");
+        assert!(err.contains("'DOC'") && err.contains("replicates"), "{err}");
+    }
+
+    #[test]
+    fn test_a_scalar_where_the_replicates_go_is_refused() {
+        assert!(check(serde_json::json!({ "DOC": 101.5 })).is_err());
+    }
+
+    #[test]
+    fn test_a_key_doc_does_not_declare_is_refused_by_name() {
+        let err = check(serde_json::json!({ "DOC": [1.0], "DOC_avg_ppb": 1.0 }))
+            .expect_err("an output is not an input");
+        assert!(err.contains("unknown field 'DOC_avg_ppb'"), "{err}");
+    }
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn test_every_key_a_doc_run_was_sent_is_used_or_ignored() {
+        let provided = keys(&["DOC", "std_curve"]);
+        let (used, ignored) = account_inputs(&provided, &["DOC"], Vec::new(), keys(&["std_curve"]));
+        assert_eq!(used, keys(&["DOC", "std_curve"]));
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn test_a_script_naming_what_it_used_leaves_the_rest_ignored() {
+        let provided = keys(&["DOC", "operator"]);
+        let (used, ignored) = account_inputs(
+            &provided,
+            &["DOC", "operator"],
+            keys(&["DOC", "absent"]),
+            Vec::new(),
+        );
+        assert_eq!(
+            used,
+            keys(&["DOC"]),
+            "a key the request never sent is not used"
+        );
+        assert_eq!(ignored, keys(&["operator"]));
+    }
+
+    #[test]
+    fn test_a_sent_key_no_param_declares_is_ignored_rather_than_dropped() {
+        let provided = keys(&["DOC", "site_id"]);
+        let (used, ignored) = account_inputs(&provided, &["DOC"], Vec::new(), Vec::new());
+        assert_eq!(used, keys(&["DOC"]));
+        assert_eq!(ignored, keys(&["site_id"]));
+    }
+}

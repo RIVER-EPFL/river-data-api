@@ -364,7 +364,7 @@ async fn test_full_public_data_workflow() {
         .collect();
     let expected_mean = hour0.iter().sum::<f64>() / hour0.len() as f64;
     let agg_uri = "/api/public/e2e_river/sites/e2e_station/aggregates/hourly?start=2026-03-01T00:00:00Z&end=2026-03-01T00:59:00Z";
-    let (status, agg) = crate::common::get_json(&app, &agg_uri).await;
+    let (status, agg) = crate::common::get_json(&app, agg_uri).await;
     assert_eq!(status, 200, "public aggregates ({status}): {agg}");
     let do_avg = field_for(&agg, "dissolved_oxygen", "avg");
     assert!(

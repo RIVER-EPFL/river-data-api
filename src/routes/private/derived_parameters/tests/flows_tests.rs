@@ -49,3 +49,36 @@ fn test_the_gap_scan_counts_only_sources_read_at_the_instant() {
     let sql = sql(None);
     assert!(sql.contains(r#""dps"."alignment" = 'exact'"#), "{sql}");
 }
+
+#[test]
+fn test_gap_fill_report_into_keeps_the_callers_entries() {
+    use crate::routes::private::reprocessing_jobs::service::JobReport;
+    let at: chrono::DateTime<chrono::Utc> = "2025-06-01T10:00:00Z".parse().unwrap();
+    let gaps = super::GapFill {
+        found: 5,
+        filled: 4,
+        refused_slots: 1,
+        earliest_filled: Some(at),
+        capped: false,
+    };
+    let report = gaps
+        .report_into(JobReport::new().count("pruned", 3).scope("full_scan", true))
+        .to_value();
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "scope": {
+                "full_scan": true,
+                "capped_at_limit": false,
+                "earliest_filled": "2025-06-01T10:00:00+00:00",
+            },
+            "counts": { "pruned": 3, "gaps_found": 5, "filled": 4, "refused_slots": 1 },
+        })
+    );
+    // A pass that found nothing still reports its zeros, so a tick with no gaps reads as one.
+    let empty = super::GapFill::default()
+        .report_into(JobReport::new())
+        .to_value();
+    assert_eq!(empty["counts"]["gaps_found"], 0);
+    assert!(empty["scope"].get("earliest_filled").is_none());
+}

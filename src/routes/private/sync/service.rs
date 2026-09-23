@@ -2403,7 +2403,7 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
     let parameter = stream
         .source_name
         .as_deref()
-        .and_then(|n| n.splitn(2, " - ").nth(1))
+        .and_then(|n| n.split_once(" - ").map(|x| x.1))
         .unwrap_or("")
         .to_string();
     let units = meta
@@ -2545,7 +2545,8 @@ impl PlanWarning {
         Self {
             kind: "near_duplicate".to_string(),
             message: format!(
-                "This plan would create the {kind} '{proposed}', and '{existing}' already exists.                  They differ only in case, spacing or punctuation."
+                "This plan would create the {kind} '{proposed}', and '{existing}' already exists. \
+                 They differ only in case, spacing or punctuation."
             ),
             parameter: None,
             existing: None,
@@ -4546,7 +4547,7 @@ pub async fn apply_plan(
     for entry in entries.iter().filter(|e| e.action == "pair") {
         entries_seen += 1;
         if let Some(ctx) = progress
-            && (entries_seen % PROGRESS_BATCH == 0 || entries_seen == pairing_total)
+            && (entries_seen.is_multiple_of(PROGRESS_BATCH) || entries_seen == pairing_total)
         {
             ctx.set_progress(i32::try_from(entries_seen).unwrap_or(i32::MAX), None)
                 .await;

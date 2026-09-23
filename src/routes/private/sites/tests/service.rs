@@ -150,7 +150,7 @@ fn a_marker_belongs_to_an_instrument_deployed_here_and_names_its_parameter() {
 #[test]
 fn test_every_rollup_is_reachable_by_a_resolution_keyword() {
     use crate::common::aggregates::Resolution;
-    use crate::routes::private::sites::service::{bucket_interval, resolution_of};
+    use crate::routes::private::sites::service::resolution_of;
 
     let keywords = [
         "hourly", "6hourly", "12hourly", "daily", "weekly", "monthly",

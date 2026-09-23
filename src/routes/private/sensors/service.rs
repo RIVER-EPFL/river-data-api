@@ -1251,6 +1251,14 @@ pub async fn close_sensor_deployment(
     Ok(())
 }
 
+/// A deployment as `(id, site_id, deployed_from, deployed_until)`.
+type DeploymentSpan = (
+    Uuid,
+    Uuid,
+    chrono::DateTime<Utc>,
+    Option<chrono::DateTime<Utc>>,
+);
+
 /// Resolve attribution for a batch of reading times for one sensor, by window, the same half-open
 /// `[from, COALESCE(until,'infinity'))` semantics `reprocess_sensor_readings` uses, so every write
 /// path agrees with reprocess. Two indexed range scans regardless of batch size.
@@ -1296,12 +1304,7 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
     if let Some(parameter_id) = parameter_id {
         dep_query = dep_query.filter(deployments::Column::ParameterId.eq(parameter_id));
     }
-    let deps: Vec<(
-        Uuid,
-        Uuid,
-        chrono::DateTime<Utc>,
-        Option<chrono::DateTime<Utc>>,
-    )> = dep_query
+    let deps: Vec<DeploymentSpan> = dep_query
         .select_only()
         .column(deployments::Column::Id)
         .column(deployments::Column::SiteId)

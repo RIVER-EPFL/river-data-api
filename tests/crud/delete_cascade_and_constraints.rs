@@ -266,10 +266,8 @@ async fn delete_sensor_with_referenced_standard_curve_is_refused() {
     .await;
     crate::common::exec(
         &db,
-        &format!(
-            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
-             VALUES ('00000000-0000-4000-d000-000000000096', 'test', 'del-curve', 'x', true)"
-        ),
+        "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('00000000-0000-4000-d000-000000000096', 'test', 'del-curve', 'x', true)",
     )
     .await;
     crate::common::exec(

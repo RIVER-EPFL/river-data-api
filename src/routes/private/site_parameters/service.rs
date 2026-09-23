@@ -615,7 +615,7 @@ pub(crate) async fn row_snapshot<C: ConnectionTrait>(
     let row = txn
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!("SELECT to_jsonb(t) AS row FROM {table} t WHERE t.id = $1"),
+            format!("SELECT to_jsonb(t) AS row FROM {table} t WHERE t.id = $1"),
             vec![id.into()],
         ))
         .await

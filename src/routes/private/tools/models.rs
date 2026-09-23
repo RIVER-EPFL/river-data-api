@@ -2440,60 +2440,94 @@ impl RecomputeScope {
     /// in scope (Q41); `only_findings` holds the set to visits with an open event finding, and a
     /// `calculation` beside it to the findings that calculation raised.
     #[must_use]
-    pub fn events_sql(&self) -> (String, Vec<sea_orm::Value>) {
-        let mut sql = format!(
-            "SELECT ce.id FROM collection_events ce WHERE ce.source <> '{portal_sync}'",
-            portal_sync = crate::routes::private::collection_events::service::PORTAL_SYNC
-        );
-        let mut binds: Vec<sea_orm::Value> = Vec::new();
+    pub fn events_query(&self) -> sea_orm::sea_query::SelectStatement {
+        use crate::routes::private::collection_events::models as collection_events;
+        use crate::routes::private::readings::models as readings;
+        use crate::routes::private::sync::hold_model as holds;
+        use sea_orm::sea_query::extension::postgres::PgExpr as _;
+        use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query};
+
+        let ce = Alias::new("ce");
+        let r = Alias::new("r");
+        let h = Alias::new("h");
+        let event = |column: collection_events::Column| Expr::col((ce.clone(), column));
+        let named_in_provenance = |predicate: Expr| {
+            Expr::exists(
+                Query::select()
+                    .expr(Expr::val(1))
+                    .from_as(readings::Entity, r.clone())
+                    .and_where(
+                        Expr::col((r.clone(), readings::Column::CollectionEventId))
+                            .equals((ce.clone(), collection_events::Column::Id)),
+                    )
+                    .and_where(predicate)
+                    .to_owned(),
+            )
+        };
+        let provenance = || Expr::col((r.clone(), readings::Column::Provenance));
+
+        let mut query = Query::select();
+        query
+            .column((ce.clone(), collection_events::Column::Id))
+            .from_as(collection_events::Entity, ce.clone())
+            .and_where(
+                event(collection_events::Column::Source)
+                    .ne(crate::routes::private::collection_events::service::PORTAL_SYNC),
+            );
         if let Some(site_id) = self.site_id {
-            binds.push(site_id.into());
-            sql.push_str(&format!(" AND ce.site_id = ${}", binds.len()));
+            query.and_where(event(collection_events::Column::SiteId).eq(site_id));
         }
         if let Some(start) = self.start {
-            binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(start).into());
-            sql.push_str(&format!(" AND ce.collected_at >= ${}", binds.len()));
+            query.and_where(event(collection_events::Column::CollectedAt).gte(start));
         }
         if let Some(end) = self.end {
-            binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(end).into());
-            sql.push_str(&format!(" AND ce.collected_at <= ${}", binds.len()));
+            query.and_where(event(collection_events::Column::CollectedAt).lte(end));
         }
         if let Some(version) = self.version {
-            binds.push(version.to_string().into());
-            sql.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM readings r \
-                      WHERE r.collection_event_id = ce.id \
-                        AND r.provenance -> 'tool_version' ->> 'script_version_id' = ${})",
-                binds.len()
+            query.and_where(named_in_provenance(
+                provenance()
+                    .get_json_field("tool_version")
+                    .cast_json_field("script_version_id")
+                    .eq(version.to_string()),
             ));
         }
         if let Some(name) = &self.constant {
-            binds.push(name.clone().into());
-            sql.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM readings r \
-                      WHERE r.collection_event_id = ce.id \
-                        AND jsonb_exists(r.provenance -> 'constants', ${}))",
-                binds.len()
-            ));
+            query.and_where(named_in_provenance(Expr::expr(
+                Func::cust("jsonb_exists")
+                    .arg(provenance().get_json_field("constants"))
+                    .arg(name.clone()),
+            )));
         }
         if self.only_findings {
-            sql.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM replicate_audit_holds h \
-                      WHERE h.stream_id IS NULL AND h.status = '{pending}' \
-                        AND h.kind IN {kinds} \
-                        AND h.site_id = ce.site_id AND h.group_time = ce.collected_at{tool})",
-                pending = HoldStatus::Pending.as_str(),
-                kinds = HoldKind::sql_list(&HoldKind::EVENT_AUDIT),
-                tool = if let Some(name) = &self.calculation {
-                    binds.push(name.clone().into());
-                    format!(" AND h.tool = ${}", binds.len())
-                } else {
-                    String::new()
-                }
-            ));
+            let hold = |column: holds::Column| Expr::col((h.clone(), column));
+            let mut findings = Query::select();
+            findings
+                .expr(Expr::val(1))
+                .from_as(holds::Entity, h.clone())
+                .and_where(hold(holds::Column::StreamId).is_null())
+                .and_where(hold(holds::Column::Status).eq(HoldStatus::Pending.as_str()))
+                .and_where(
+                    hold(holds::Column::Kind).is_in(HoldKind::EVENT_AUDIT.map(|k| k.as_str())),
+                )
+                .and_where(
+                    hold(holds::Column::SiteId)
+                        .equals((ce.clone(), collection_events::Column::SiteId)),
+                )
+                .and_where(
+                    hold(holds::Column::GroupTime)
+                        .equals((ce.clone(), collection_events::Column::CollectedAt)),
+                );
+            if let Some(name) = &self.calculation {
+                findings.and_where(hold(holds::Column::Tool).eq(name.clone()));
+            }
+            query.and_where(Expr::exists(findings.to_owned()));
         }
-        sql.push_str(" ORDER BY ce.collected_at");
-        (sql, binds)
+        query
+            .order_by(
+                (ce, collection_events::Column::CollectedAt),
+                sea_orm::Order::Asc,
+            )
+            .to_owned()
     }
 }
 

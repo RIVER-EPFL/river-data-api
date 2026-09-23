@@ -1,4 +1,4 @@
-use super::{SWEPT_REASON, stale_running};
+use super::{SWEPT_REASON, full_reassert_insert, stale_running};
 use chrono::{TimeZone, Utc};
 use sea_orm::{EntityTrait, QueryFilter, QueryTrait};
 
@@ -38,4 +38,29 @@ fn test_stale_running_selects_on_status_and_start() {
 #[test]
 fn test_the_swept_reason_names_the_sweeper() {
     assert_eq!(SWEPT_REASON, "Closed by sweeper: service stopped reporting");
+}
+
+/// Scenario: the weekly re-assert queues a full sync for each live service that opted in.
+/// Expected behaviour: one built statement whose cut-off and expiry are bound instants, and
+/// which skips a service already holding a pending full sync.
+#[test]
+fn test_full_reassert_insert_binds_its_instants() {
+    let now = Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap();
+    let sql = full_reassert_insert(now, 600)
+        .unwrap()
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(sql.starts_with("INSERT INTO \"sync_commands\""), "{sql}");
+    assert!(sql.contains("GEN_RANDOM_UUID()"), "{sql}");
+    assert!(sql.contains("\"full_reassert_enabled\""), "{sql}");
+    assert!(
+        sql.contains("\"last_heartbeat\" > '2026-09-23 11:00:00"),
+        "an hour-old heartbeat is the live cut-off: {sql}"
+    );
+    assert!(
+        sql.contains("'2026-09-23 12:10:00"),
+        "the expiry is the instant, not an interval: {sql}"
+    );
+    assert!(sql.contains("NOT EXISTS"), "{sql}");
+    assert!(sql.contains("RETURNING \"service_id\""), "{sql}");
+    assert!(!sql.contains("seconds"), "{sql}");
 }

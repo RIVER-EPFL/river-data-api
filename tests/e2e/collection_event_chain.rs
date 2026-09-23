@@ -433,10 +433,8 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     // in it; the version is minted from the formula set rather than posted as a body.
     crate::common::exec(
         &db,
-        &format!(
-            "INSERT INTO tool_scripts (name, label, engine, created_by) \
-             VALUES ('chain_f', 'Chain F', 'formula', 'test')"
-        ),
+        "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('chain_f', 'Chain F', 'formula', 'test')",
     )
     .await;
     let (status, scripts) =

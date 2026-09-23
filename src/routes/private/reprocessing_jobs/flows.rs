@@ -344,7 +344,7 @@ impl Job for JanitorRun {
         //    configured interval.
         let since = (!do_full)
             .then(|| chrono::Utc::now() - chrono::Duration::seconds((cadence_seconds * 2) as i64));
-        janitor::run_once(db, Some(&ctx), since).await?;
+        let gaps = janitor::run_once(db, Some(&ctx), since).await?;
 
         // 2. Repair corrected readings whose stored value is no longer what their own curves
         //    produce, whichever route moved them apart. Hooks make that repair immediate; this makes
@@ -438,7 +438,7 @@ impl Job for JanitorRun {
         // What this tick actually changed, so a run's effect is readable per job rather than only
         // in its logs.
         ctx.report(
-            JobReport::new()
+            gaps.report_into(JobReport::new())
                 .scope("full_scan", do_full)
                 .count("recomposed", recomposed)
                 .count("import_sessions_pruned", sessions_pruned)

@@ -1277,7 +1277,7 @@ pub(crate) fn episodes_query(sev_case: &str, spot: bool) -> WithQuery {
             .take(),
     );
 
-    let episodes_query = SeaQuery::select()
+    SeaQuery::select()
         .expr_as(Func::min(Expr::col(t.clone())), Alias::new("started_at"))
         .expr_as(
             Expr::cust("(ARRAY_AGG(v ORDER BY t ASC))[1]"),
@@ -1316,8 +1316,7 @@ pub(crate) fn episodes_query(sev_case: &str, spot: bool) -> WithQuery {
                 .cte(marked_cte)
                 .cte(runs_cte)
                 .to_owned(),
-        );
-    episodes_query
+        )
 }
 
 #[allow(clippy::too_many_arguments)]

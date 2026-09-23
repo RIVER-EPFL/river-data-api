@@ -201,9 +201,7 @@ pub async fn validate_bearer_token(
     // Fast-fail on anything that isn't a well-formed `rvd_<prefix>_<secret>` API token (a Keycloak
     // JWT or sync session token). This bails before touching the cache, the DB, or argon2, so a
     // flood of malformed bearer values can't drive any work on this path.
-    if split_api_token(raw_token).is_none() {
-        return None;
-    }
+    split_api_token(raw_token)?;
 
     let cache_key = hash_token(raw_token);
 

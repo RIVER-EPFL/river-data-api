@@ -8,8 +8,8 @@ use axum::{Extension, Json, Router, middleware};
 use crudcrate::CRUDResource;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -33,10 +33,11 @@ use super::service::{
     FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
     calculations_fed_by_subject, canonical_hash, check_engine, check_manifest_against_catalog,
     check_manifest_codes_resolve, closure_subject, codes_held_elsewhere, coverage_for,
-    find_active_tool, formula_codes_held_elsewhere, lint_script, list_active_tools,
+    find_active_tool, formula_codes_held_elsewhere, insert_version, lint_script, list_active_tools,
     load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
-    mint_formula_version, normalise_name, plan_formula_set, render, replicated_for,
-    run_stored_cases, run_tool_body, runner_runtime, stored_version_content, take_back_steps,
+    mint_formula_version, normalise_name, normalised_json, plan_formula_set, render,
+    replicated_for, run_stored_cases, run_tool_body, runner_runtime, stored_version_content,
+    take_back_steps,
 };
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
@@ -375,39 +376,23 @@ pub async fn create_version(
         &test_cases,
     )
     .await?;
-    let row = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO tool_script_versions
-                  (tool_script_id, version_no, script, entry_function, manifest, test_cases,
-                   content_hash, note, created_by)
-              SELECT $1,
-                     COALESCE((SELECT max(version_no) FROM tool_script_versions
-                               WHERE tool_script_id = $1), 0) + 1,
-                     $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8
-              RETURNING id",
-            [
-                id.into(),
-                payload.script.into(),
-                entry.into(),
-                stored.manifest.into(),
-                stored.test_cases.into(),
-                stored.content_hash.into(),
-                payload.note.into(),
-                crate::common::actor::label(&auth).into(),
-            ],
-        ))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("content_hash") {
-                AppError::Conflict("an identical version of this script already exists".to_string())
-            } else {
-                AppError::Database(e)
-            }
-        })?
-        .ok_or_else(|| AppError::Internal("insert returned no row".to_string()))?;
-    let vid: Uuid = row.try_get("", "id")?;
+    let txn = state.db.begin().await?;
+    let vid = insert_version(
+        &txn,
+        super::models::version::ActiveModel {
+            tool_script_id: Set(id),
+            script: Set(payload.script),
+            entry_function: Set(entry),
+            manifest: Set(normalised_json(&stored.manifest)?),
+            test_cases: Set(normalised_json(&stored.test_cases)?),
+            content_hash: Set(stored.content_hash),
+            note: Set(payload.note),
+            created_by: Set(Some(crate::common::actor::label(&auth))),
+            ..Default::default()
+        },
+    )
+    .await?;
+    txn.commit().await?;
 
     let mut version = load_version(&state, id, vid).await?;
     version.active = false;

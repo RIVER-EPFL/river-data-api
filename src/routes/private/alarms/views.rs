@@ -811,9 +811,7 @@ fn alarm_events_page(matching: Condition, limit: u64, offset: u64) -> Statement 
                 ),
         )
         .order_by_expr(
-            Expr::col((ae.clone(), alarm_event::Column::ResolvedAt))
-                .is_null()
-                .into(),
+            Expr::col((ae.clone(), alarm_event::Column::ResolvedAt)).is_null(),
             Order::Desc,
         )
         .order_by((ae, alarm_event::Column::LastSeenAt), Order::Desc)

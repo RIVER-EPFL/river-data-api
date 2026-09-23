@@ -1540,13 +1540,12 @@ async fn a_reprocess_records_the_readings_it_moved_against_its_job() {
     let recalled = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT d.old ->> 'site_id' AS was, d.new ->> 'site_id' AS became, \
+            "SELECT d.old ->> 'site_id' AS was, d.new ->> 'site_id' AS became, \
                         d.actor, d.origin, d.job_id \
                    FROM reading_decisions d \
                   WHERE d.kind = 'reprocess' AND d.time = '2025-07-15T00:00:00Z' \
                     AND d.old ? 'site_id'"
-            ),
+                .to_string(),
         ))
         .await
         .unwrap()

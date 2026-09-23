@@ -111,7 +111,7 @@ async fn patch_entry(
 ) -> (u16, String) {
     crate::common::patch_plan_with_token(
         app,
-        &plan_id.to_string(),
+        plan_id,
         &serde_json::json!({ "updates": [update] }),
         token,
     )
@@ -149,7 +149,7 @@ async fn apply_and_wait(
     // The review gate wants every row ticked; these tests are about the instruments the apply binds.
     crate::common::plans::acknowledge_plan(app, token, plan_id).await;
     let (status, text) =
-        crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
+        crate::common::post_plan_action_with_token(app, plan_id, "apply", token).await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");
     assert_eq!(
         crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await,

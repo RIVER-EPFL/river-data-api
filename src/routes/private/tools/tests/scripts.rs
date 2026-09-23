@@ -192,3 +192,42 @@ fn a_package_outside_the_script_set_is_refused_as_not_allowed() {
         "{loaded:?}"
     );
 }
+
+/// Scenario: a script reads an input, a constant and a curve the manifest does not declare, and
+/// the manifest declares one of each the script never reads.
+#[test]
+fn test_reconcile_manifest_reports_both_directions() {
+    use crate::routes::private::tools::models::{
+        Manifest, ScriptInspection, missing_from, reconcile_manifest,
+    };
+    let inspection: ScriptInspection = serde_json::from_value(serde_json::json!({
+        "parse_ok": true, "entry": "tool", "entry_found": true, "entry_args": [],
+        "inputs": ["absorbance", "dilution"], "constants": ["R"], "curves": ["std_curve"],
+        "outputs": ["doc"], "dynamic_outputs": { "any": true, "expressions": [] },
+        "dynamic_reads": { "any": false, "expressions": [] },
+        "functions_defined": [], "functions_called": [], "script_functions_used": [],
+        "libraries": [], "namespaces": [],
+    }))
+    .unwrap();
+    let manifest: Manifest = serde_json::from_value(serde_json::json!({
+        "label": "DOC",
+        "params": [
+            { "name": "absorbance", "label": "A", "kind": "number" },
+            { "name": "blank", "label": "B", "kind": "number" },
+        ],
+        "constants": ["K"],
+        "curves": [{ "name": "other_curve", "label": "Other" }],
+        "outputs": [{ "key": "doc", "label": "DOC" }],
+    }))
+    .unwrap();
+    let r = reconcile_manifest(&inspection, &manifest);
+    assert_eq!(r.undeclared_inputs, vec!["dilution".to_string()]);
+    assert_eq!(r.undeclared_constants, vec!["R".to_string()]);
+    assert_eq!(r.undeclared_curves, vec!["std_curve".to_string()]);
+    assert_eq!(r.unread_params, vec!["blank".to_string()]);
+    assert_eq!(r.unread_constants, vec!["K".to_string()]);
+    assert_eq!(r.unread_curves, vec!["other_curve".to_string()]);
+    assert!(r.reads_complete);
+    assert!(!r.outputs_complete);
+    assert!(missing_from(&[], &["a"]).is_empty());
+}

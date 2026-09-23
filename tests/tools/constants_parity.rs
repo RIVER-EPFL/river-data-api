@@ -76,7 +76,10 @@ async fn seeded_constants_match_the_portal_dump() {
     seeded.sort();
     let mut expected: Vec<&str> = PORTAL_CONSTANTS.iter().map(|(name, _, _)| *name).collect();
     expected.sort_unstable();
-    assert_eq!(seeded, expected, "the seed holds the portal's twelve and nothing else");
+    assert_eq!(
+        seeded, expected,
+        "the seed holds the portal's twelve and nothing else"
+    );
 
     for retired in ["kh_co2", "kh_ch4", "ch4_temp_const"] {
         assert!(

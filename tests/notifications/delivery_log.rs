@@ -47,6 +47,7 @@ async fn open_event(db: &DatabaseConnection) -> String {
     .unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_row(
     db: &DatabaseConnection,
     event: Option<&str>,

@@ -279,8 +279,8 @@ pub async fn stream_receipts(
     let rows = receipts::Entity::find()
         .filter(receipts::Column::StreamId.eq(id))
         .order_by_desc(receipts::Column::At)
-        .limit(window.limit as u64)
-        .offset(window.offset as u64)
+        .limit(window.limit)
+        .offset(window.offset)
         .all(&state.db)
         .await?;
     let receipts: Vec<ReceiptRow> = rows

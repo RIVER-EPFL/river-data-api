@@ -172,7 +172,8 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
 ///
 /// Reports progress into the caller's job rather than opening one of its own: the janitor always
 /// runs as a step of the worker-pool `janitor_service` job, and a second row opened from inside that
-/// job would carry no lease, so nothing could ever reclaim it.
+/// job would carry no lease, so nothing could ever reclaim it. What the pass counted is returned for
+/// the caller's one report, which replaces the job's detail whole.
 /// One instant of a derived slot the sweep found stale.
 #[derive(FromQueryResult)]
 struct StaleSlot {
@@ -180,11 +181,38 @@ struct StaleSlot {
     time: chrono::DateTime<chrono::FixedOffset>,
 }
 
+/// What one gap-fill pass found and did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GapFill {
+    pub found: usize,
+    pub filled: usize,
+    pub refused_slots: usize,
+    pub earliest_filled: Option<chrono::DateTime<chrono::Utc>>,
+    /// The scan returned `MAX_GAPS_PER_RUN` rows, so gaps may remain past what this pass saw.
+    pub capped: bool,
+}
+
+impl GapFill {
+    /// The pass's counts and scope added to the report of the job it ran in.
+    #[must_use]
+    pub fn report_into(&self, report: JobReport) -> JobReport {
+        report
+            .scope_opt(
+                "earliest_filled",
+                self.earliest_filled.map(|t| t.to_rfc3339()),
+            )
+            .scope("capped_at_limit", self.capped)
+            .count("gaps_found", self.found)
+            .count("filled", self.filled)
+            .count("refused_slots", self.refused_slots)
+    }
+}
+
 pub async fn run_once(
     db: &DatabaseConnection,
     ctx: Option<&JobContext>,
     since: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<usize, sea_orm::DbErr> {
+) -> Result<GapFill, sea_orm::DbErr> {
     let started = std::time::Instant::now();
 
     let (sql, values) = gap_scan(since).build(PostgresQueryBuilder);
@@ -202,7 +230,7 @@ pub async fn run_once(
     }
     if rows.is_empty() {
         tracing::info!("Derived janitor: no gaps found");
-        return Ok(0);
+        return Ok(GapFill::default());
     }
     tracing::info!(gaps = total, "Derived janitor: filling gaps");
 
@@ -244,15 +272,6 @@ pub async fn run_once(
     let refused_slots = refused.report(db).await?;
     if let Some(ctx) = ctx {
         ctx.set_progress(total, Some(total)).await;
-        ctx.report(
-            JobReport::new()
-                .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
-                .scope("capped_at_limit", total as usize >= MAX_GAPS_PER_RUN)
-                .count("gaps_found", total)
-                .count("filled", filled)
-                .count("refused_slots", refused_slots),
-        )
-        .await;
         ctx.info(&format!("Filled {filled} of {total} derived gaps"))
             .await;
     }
@@ -263,7 +282,13 @@ pub async fn run_once(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Derived janitor: gap fill complete"
     );
-    Ok(usize::try_from(filled).unwrap_or(0))
+    Ok(GapFill {
+        found: rows.len(),
+        filled: usize::try_from(filled).unwrap_or(0),
+        refused_slots,
+        earliest_filled: min_filled,
+        capped: rows.len() >= MAX_GAPS_PER_RUN,
+    })
 }
 
 /// Tiered retention for `reprocessing_jobs` (logs cascade-delete with their job). Three layers:

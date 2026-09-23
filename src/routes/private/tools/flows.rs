@@ -4,8 +4,8 @@
 use async_trait::async_trait;
 use sea_orm::sea_query::{Alias, Expr, Order, Query};
 use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
-    QueryFilter, Set, Statement,
+    ActiveModelTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set,
+    Statement,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -1024,13 +1024,8 @@ pub(super) async fn events_in_scope(
     db: &DatabaseConnection,
     scope: &RecomputeScope,
 ) -> Result<Vec<Uuid>, DbErr> {
-    let (sql, binds) = scope.events_sql();
     let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            binds,
-        ))
+        .query_all_raw(super::service::build(&scope.events_query()))
         .await?;
     rows.iter().map(|r| r.try_get("", "id")).collect()
 }
@@ -1224,25 +1219,17 @@ pub(super) async fn pinned_tool(
     else {
         return Ok(None);
     };
-    let Some(row) = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT v.tool_script_id, v.version_no, v.script, v.entry_function, v.manifest,
-                    v.content_hash, s.engine
-             FROM tool_script_versions v
-             JOIN tool_scripts s ON s.id = v.tool_script_id
-             WHERE v.id = $1",
-            [version_id.into()],
-        ))
+    let Some((row, Some(calculation))) = super::models::version::Entity::find_by_id(version_id)
+        .find_also_related(super::models::script::Entity)
+        .one(db)
         .await?
     else {
         return Ok(None);
     };
-    let row = PinnedVersionRow::from_query_result(&row, "")?;
     let Ok(manifest) = parse_manifest(&row.manifest) else {
         return Ok(None);
     };
-    let engine = Engine::parse(&row.engine).unwrap_or(Engine::Script);
+    let engine = Engine::parse(&calculation.engine).unwrap_or(Engine::Script);
     let formulas = if engine == Engine::Formula {
         match parse_pinned(&row.script) {
             Ok(formulas) => formulas,
@@ -1334,20 +1321,6 @@ pub async fn replay_trace(db: &DatabaseConnection, run: &run::Model) -> AppResul
         curves: run.curves.clone(),
         manifest: serde_json::to_value(&tool.manifest).unwrap_or(serde_json::Value::Null),
     })
-}
-
-/// A pinned tool version as the chain reads it back. The manifest and the formula body are parsed
-/// from the derived row rather than decoded here: a stored version outside either vocabulary is a
-/// version this executor cannot run, not a decode failure.
-#[derive(FromQueryResult)]
-pub(super) struct PinnedVersionRow {
-    tool_script_id: Uuid,
-    version_no: i32,
-    script: String,
-    entry_function: String,
-    content_hash: String,
-    manifest: serde_json::Value,
-    engine: String,
 }
 
 /// Whether every required param of a tool is answerable at the event without a person: a manifest
