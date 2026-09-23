@@ -1219,3 +1219,56 @@ async fn naming_an_instrument_after_another_proposal_joins_the_two() {
         "both streams name the one instrument the apply created"
     );
 }
+
+/// Scenario: a logger channel that already names its own instrument (a re-pair after an unpair)
+/// reaches a plan with no device block, because the discovery that registered it last could not
+/// read the device status.
+///
+/// Expected behaviour: the channel is stationed at its site whatever the metadata carries, so the
+/// apply opens the slot's deployment, as pairing it by hand would.
+#[tokio::test]
+#[serial]
+async fn a_station_feed_without_a_serial_still_opens_its_deployment() {
+    let (app, token, db) = setup().await;
+    let stream_id = Uuid::new_v4();
+    let sensor_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, source_system, source_key) \
+             VALUES ('{sensor_id}', 'Upstream Station Water Temperature', true, '{SOURCE}', 'nodev-temp')"
+        ),
+    )
+    .await;
+    let metadata = "{\"hierarchy\": {\"project\": \"Test River Project\", \"site\": \"Upstream Station\", \
+                    \"parameter\": \"water temperature\"}, \"units\": \"°C\", \
+                    \"instrument_granularity\": \"per_site_parameter\"}";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams \
+             (id, source_system, source_key, source_name, metadata, is_active, sensor_id) \
+             VALUES ('{stream_id}', '{SOURCE}', 'nodev-temp', 'nodev-temp', \
+                     '{metadata}'::jsonb, true, '{sensor_id}')"
+        ),
+    )
+    .await;
+
+    let plan = create_plan(&app, &token).await;
+    assert_eq!(
+        entry_for(&plan, stream_id)["is_device"],
+        serde_json::json!(true),
+        "the source declares one instrument per site and parameter: {plan}"
+    );
+    apply_and_wait(&app, &db, &token, plan["id"].as_str().expect("plan id")).await;
+
+    let open = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS v FROM sensor_deployments \
+             WHERE sensor_id = '{sensor_id}' AND deployed_until IS NULL"
+        ),
+    )
+    .await;
+    assert_eq!(open, 1, "the apply opens the station feed's deployment");
+}

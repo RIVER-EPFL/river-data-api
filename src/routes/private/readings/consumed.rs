@@ -463,6 +463,25 @@ pub fn follow_ruling(
     followed
 }
 
+/// The pending inputs of whichever of `held` were computed: what has to be verified before they
+/// can be (Q257). Empty for an entered value, and for an output whose inputs are all verified.
+pub fn inputs_pending(
+    outputs: &HashMap<ReadingKey, Vec<ReadingKey>>,
+    pending: &HashSet<ReadingKey>,
+    held: &[ReadingKey],
+) -> Vec<ReadingKey> {
+    let mut waiting: Vec<ReadingKey> = held
+        .iter()
+        .filter_map(|key| outputs.get(key))
+        .flatten()
+        .filter(|input| pending.contains(*input))
+        .copied()
+        .collect();
+    waiting.sort();
+    waiting.dedup();
+    waiting
+}
+
 /// The readings a run consumed, by key.
 fn member_keys(inputs: &[ConsumedInput]) -> Vec<ReadingKey> {
     inputs

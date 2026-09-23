@@ -789,6 +789,7 @@ pub struct JobContext {
     seq: Arc<AtomicI64>,
     cancel: Arc<AtomicBool>,
     params: serde_json::Value,
+    final_attempt: bool,
 }
 
 /// A count as the progress columns carry it. Saturating: a walk longer than the column can hold
@@ -814,6 +815,7 @@ impl JobContext {
         events: crate::common::EventSender,
         params: serde_json::Value,
         first_seq: i64,
+        final_attempt: bool,
     ) -> (Self, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let ctx = Self {
@@ -823,8 +825,15 @@ impl JobContext {
             seq: Arc::new(AtomicI64::new(first_seq)),
             cancel: cancel.clone(),
             params,
+            final_attempt,
         };
         (ctx, cancel)
+    }
+
+    /// Whether this run failing fails the job, with no retry to follow.
+    #[must_use]
+    pub fn is_final_attempt(&self) -> bool {
+        self.final_attempt
     }
 
     /// The job's persisted inputs, what a worker-run job reads to do its work.
@@ -1822,12 +1831,14 @@ async fn execute(
     };
 
     let first_seq = next_log_seq(db, claimed.id).await?;
+    let final_attempt = is_retry_budget_spent(claimed.retry_count, policy.max_retries);
     let (ctx, cancel) = JobContext::for_worker(
         db.clone(),
         claimed.id,
         events.clone(),
         claimed.params.clone(),
         first_seq,
+        final_attempt,
     );
     // The two lines every run owes its timeline. A job body says what only it knows; that a run
     // started and how it ended is the worker's to say, so a silent job is impossible.
@@ -1908,11 +1919,7 @@ async fn execute(
         }
         Err(e) => {
             let message = e.to_string();
-            let outcome = if policy.max_retries > u32::try_from(claimed.retry_count).unwrap_or(0) {
-                "retrying"
-            } else {
-                "failed"
-            };
+            let outcome = if final_attempt { "failed" } else { "retrying" };
             timeline
                 .log(
                     if outcome == "failed" { "error" } else { "warn" },

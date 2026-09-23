@@ -80,7 +80,7 @@ fn a_first_write_carries_only_what_the_request_says() {
 }
 
 mod moved {
-    use super::super::{ExistingGroup, ExistingReplicate, stored_values_moved};
+    use super::super::{ExistingGroup, ExistingReplicate, entered_rows, stored_values_moved};
     use chrono::{DateTime, TimeZone, Utc};
     use uuid::Uuid;
 
@@ -103,6 +103,27 @@ mod moved {
             time: at(),
             replicates,
         }
+    }
+
+    #[test]
+    fn only_a_new_or_changed_replicate_is_the_save_s_entry() {
+        let doc = Uuid::new_v4();
+        let ph = Uuid::new_v4();
+        let carried = [
+            (doc, at(), 0, 12.0),
+            (doc, at(), 1, 13.0),
+            (doc, at(), 2, 12.8),
+            (ph, at(), 0, 7.1),
+        ];
+        let existing = [
+            group(doc, vec![replicate(0, 12.0), replicate(1, 13.5)]),
+            group(ph, vec![replicate(0, 7.1)]),
+        ];
+        // repeat 0 and pH carried as stored; repeat 1 changed; repeat 2 new
+        assert_eq!(
+            entered_rows(&carried, &existing),
+            [false, true, true, false]
+        );
     }
 
     #[test]

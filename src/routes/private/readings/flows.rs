@@ -30,8 +30,14 @@ use crate::routes::private::sensor_calibrations::service::apply_curves;
 use crate::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp;
 use crate::routes::private::sync::models::HoldStatus;
 
-/// Take an import's staged rows out of the way, whether it finished or failed. There is no
-/// janitor for this table, so every exit from the job goes through here.
+/// Whether a run's exit takes the import's staged rows with it: a success has used them, and a
+/// failure no retry follows leaves nobody to read them. A failure the worker retries keeps them.
+pub(super) fn should_drop_staged(succeeded: bool, final_attempt: bool) -> bool {
+    succeeded || final_attempt
+}
+
+/// Take an import's staged rows out of the way, once it finished or failed for the last time.
+/// There is no janitor for this table, so every such exit from the job goes through here.
 pub(super) async fn drop_staged<C: sea_orm::ConnectionTrait>(
     db: &C,
     import_token: Uuid,
@@ -197,9 +203,8 @@ impl Job for CsvImport {
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let import_token = required_uuid(ctx.params(), "import_token")?;
         let outcome = Self::run_import(&ctx, import_token).await;
-        if outcome.is_err() {
-            // Success deletes the staging rows below; a mid-run error would otherwise orphan them
-            // (there is no janitor for csv_import_staging), so drop them on the failure path too.
+        // Success drops the staged rows itself; a failure keeps them for the retry that reads them.
+        if outcome.is_err() && should_drop_staged(false, ctx.is_final_attempt()) {
             let _ = drop_staged(ctx.db(), import_token).await;
         }
         outcome
@@ -246,6 +251,13 @@ impl CsvImport {
             .into_iter()
             .map(StagedRow::from)
             .collect();
+        // The handler stages at least one row with the enqueue, so a token naming none is a run
+        // whose rows were taken already, and reporting it completed would say nothing was lost.
+        if staged.is_empty() {
+            return Err(DbErr::Custom(format!(
+                "csv_import {import_token} has no staged rows to import"
+            )));
+        }
 
         // The import handler refuses rows targeting a replicate-family stream before staging, and
         // the same rule holds here so no staging row, however it got there, mints replicate
@@ -904,3 +916,7 @@ impl Job for MeasurementRetag {
 #[cfg(test)]
 #[path = "tests/retag_rewrite.rs"]
 mod retag_rewrite_tests;
+
+#[cfg(test)]
+#[path = "tests/csv_import_job.rs"]
+mod csv_import_job_tests;

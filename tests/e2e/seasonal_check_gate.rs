@@ -159,6 +159,82 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
         "both repeats are the intern's, so both are unverified"
     );
 
+    // A repeat an intern adds to a group a member already stored is the intern's entry alone: the
+    // stored repeat travels with the grid's post at its own number and stays verified, and a
+    // reject of the entry withdraws only what the intern typed.
+    let verified_at = "2025-06-20T11:30:00Z";
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": track.site_id,
+            "readings": [{ "parameter_id": parameter_id, "value": 101.0, "time": verified_at }],
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "a member stores a verified repeat: {body}");
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": track.site_id,
+            "mode": "replace",
+            "readings": [
+                { "parameter_id": parameter_id, "value": 101.0, "time": verified_at },
+                { "parameter_id": parameter_id, "value": 102.0, "time": verified_at },
+            ],
+        }),
+        &intern,
+    )
+    .await;
+    assert_eq!(status, 200, "an intern adds a repeat beside it: {body}");
+    let pending = |state: &'static str| {
+        format!(
+            "SELECT COUNT(*)::bigint AS n FROM readings \
+             WHERE site_id = '{}' AND time = '{verified_at}' AND {state}",
+            track.site_id
+        )
+    };
+    assert_eq!(
+        e2e::count(&db, &pending("unverified")).await,
+        1,
+        "only the intern's repeat is pending; the member's stays verified"
+    );
+    let hold = e2e::count(
+        &db,
+        &format!(
+            "SELECT COUNT(*)::bigint AS n FROM replicate_audit_holds \
+             WHERE kind = 'unverified_entry' AND status = 'pending' AND site_id = '{}' \
+               AND group_time = '{verified_at}'",
+            track.site_id
+        ),
+    )
+    .await;
+    assert_eq!(hold, 1, "the entry is in the review queue");
+    let hold_id = e2e::scalar(
+        &db,
+        &format!(
+            "SELECT id::text AS v FROM replicate_audit_holds \
+             WHERE kind = 'unverified_entry' AND site_id = '{}' AND group_time = '{verified_at}'",
+            track.site_id
+        ),
+    )
+    .await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
+        &json!({ "mode": "reject" }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "a manager rejects the entry: {body}");
+    assert_eq!(
+        e2e::count(&db, &pending("withdrawn_at IS NULL")).await,
+        1,
+        "the reject withdraws the intern's repeat and leaves the member's standing"
+    );
+
     // An edit after the check must re-check: the gate.
     let mut edited = save.clone();
     edited["readings"][0]["value"] = json!(260.0);

@@ -2261,6 +2261,9 @@ pub(super) async fn rule_on_entry(
     let recorded = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let at = group_time.with_timezone(&chrono::Utc);
         let ruled = pending_entry_keys(txn, site_id, parameter_id, at).await?;
+        if mode == "verify" {
+            refuse_before_inputs(txn, site_id, at, &ruled).await?;
+        }
         let mut recorded = record_many(
             txn,
             kind,
@@ -2358,21 +2361,144 @@ async fn ruling_follows<C: ConnectionTrait>(
     Vec<crate::routes::private::readings::consumed::ReadingKey>,
     crate::routes::private::readings::consumed::VisitComputed,
 )> {
-    use crate::routes::private::readings::consumed::{
-        computed_at, continuous_pending, follow_ruling,
-    };
+    use crate::routes::private::readings::consumed::{computed_at, follow_ruling};
     let computed = computed_at(conn, site_id, at).await?;
-    let mut outputs = computed.outputs.clone();
-    let mut pending = computed.pending.clone();
-    // A verify also releases what the continuous engine computed from the entry. Only the visit's
-    // own outputs follow a reject, because a withdrawal is confined to spot rows.
-    if verify {
-        let continuous = continuous_pending(conn, site_id).await?;
-        outputs.extend(continuous.outputs);
-        pending.extend(continuous.pending);
-    }
+    // Only the visit's own outputs follow a reject, because a withdrawal is confined to spot rows.
+    let (outputs, pending) = if verify {
+        verify_graph(conn, site_id, &computed).await?
+    } else {
+        (computed.outputs.clone(), computed.pending.clone())
+    };
     let followed = follow_ruling(&outputs, &pending, ruled, verify);
     Ok((followed, computed))
+}
+
+/// What a verify reads: the visit's computed readings and what the continuous engine computed at
+/// the site, each with what it consumed, and the pending among them.
+async fn verify_graph<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    computed: &crate::routes::private::readings::consumed::VisitComputed,
+) -> AppResult<(
+    HashMap<
+        crate::routes::private::readings::consumed::ReadingKey,
+        Vec<crate::routes::private::readings::consumed::ReadingKey>,
+    >,
+    HashSet<crate::routes::private::readings::consumed::ReadingKey>,
+)> {
+    let continuous =
+        crate::routes::private::readings::consumed::continuous_pending(conn, site_id).await?;
+    let mut outputs = computed.outputs.clone();
+    let mut pending = computed.pending.clone();
+    outputs.extend(continuous.outputs);
+    pending.extend(continuous.pending);
+    Ok((outputs, pending))
+}
+
+/// The pending inputs the pending readings `held` were computed from, by parameter. Empty when
+/// `held` was entered rather than computed.
+pub(super) async fn awaited_inputs<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+    held: &[crate::routes::private::readings::consumed::ReadingKey],
+) -> AppResult<Vec<super::models::AwaitedInput>> {
+    use crate::routes::private::readings::consumed::{computed_at, inputs_pending};
+    if held.is_empty() {
+        return Ok(Vec::new());
+    }
+    let computed = computed_at(conn, site_id, at).await?;
+    let (outputs, pending) = verify_graph(conn, site_id, &computed).await?;
+    let waiting = inputs_pending(&outputs, &pending, held);
+    parameters_of_keys(conn, &waiting).await
+}
+
+/// The parameters the readings at `keys` are values of, each once, by code.
+async fn parameters_of_keys<C: ConnectionTrait>(
+    conn: &C,
+    keys: &[crate::routes::private::readings::consumed::ReadingKey],
+) -> AppResult<Vec<super::models::AwaitedInput>> {
+    use crate::routes::private::{parameters, readings};
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: HashSet<_> = keys.iter().copied().collect();
+    let parameter_ids: HashSet<Uuid> = readings::Entity::find()
+        .filter(readings::Column::StreamId.is_in(keys.iter().map(|(s, _, _)| *s)))
+        .filter(readings::Column::Time.is_in(keys.iter().map(|(_, t, _)| *t)))
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter(|r| wanted.contains(&(r.stream_id, r.time.with_timezone(&Utc), r.replicate_index)))
+        .filter_map(|r| r.parameter_id)
+        .collect();
+    let mut awaited: Vec<super::models::AwaitedInput> = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in(parameter_ids))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|p| super::models::AwaitedInput {
+            parameter_id: p.id,
+            code: p.code,
+            name: p.name,
+        })
+        .collect();
+    awaited.sort_by(|a, b| a.code.cmp(&b.code));
+    Ok(awaited)
+}
+
+/// Refuse to verify a computed value while an input it was computed from is pending (Q257): it is
+/// released by the verify of its last input, never ahead of it.
+async fn refuse_before_inputs<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+    held: &[crate::routes::private::readings::consumed::ReadingKey],
+) -> AppResult<()> {
+    let awaited = awaited_inputs(conn, site_id, at, held).await?;
+    if awaited.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = awaited.iter().map(|a| a.name.as_str()).collect();
+    Err(AppError::Conflict(format!(
+        "this value was computed from {} still pending; it is released when {} verified",
+        names.join(", "),
+        if names.len() == 1 {
+            "that is"
+        } else {
+            "they are"
+        }
+    )))
+}
+
+/// Fill in what each pending computed entry on a page waits on.
+pub(super) async fn mark_awaiting_inputs<C: ConnectionTrait>(
+    conn: &C,
+    rows: &mut [super::models::HoldRow],
+) -> AppResult<()> {
+    let entries: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| r.kind == HoldKind::UnverifiedEntry.as_str())
+        .map(|r| r.id)
+        .collect();
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let slots: HashMap<Uuid, (Uuid, Uuid)> = hold_model::Entity::find()
+        .filter(hold_model::Column::Id.is_in(entries))
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter_map(|h| Some((h.id, (h.site_id?, h.parameter_id?))))
+        .collect();
+    for row in rows.iter_mut() {
+        let Some(&(site_id, parameter_id)) = slots.get(&row.id) else {
+            continue;
+        };
+        let held = pending_entry_keys(conn, site_id, parameter_id, row.group_time).await?;
+        row.awaiting_inputs = awaited_inputs(conn, site_id, row.group_time, &held).await?;
+    }
+    Ok(())
 }
 
 /// What rejecting an intern's entry would withdraw beside it: every value computed from it, and
@@ -4682,23 +4808,14 @@ pub async fn apply_plan(
             &accepted_objects,
         )
         .await?;
-        let instrument_id = entry
-            .instrument
-            .as_ref()
-            .and_then(|i| i.id.or_else(|| minted.get(&i.source_key).copied()));
-        let device_name = entry
-            .instrument
-            .as_ref()
-            .filter(|i| entry.is_device && i.create)
-            .map(|i| i.name.as_str());
         pair_entry_stream(
             &txn,
             stream,
             plan_id,
+            entry,
+            &minted,
             site_parameter_id,
             parameter_id,
-            instrument_id,
-            device_name,
         )
         .await?;
         counters.streams_paired += 1;
@@ -5336,11 +5453,21 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
     txn: &C,
     stream: data_streams::Model,
     plan_id: Uuid,
+    entry: &PlanEntry,
+    minted: &HashMap<String, Uuid>,
     site_parameter_id: Uuid,
     parameter_id: Uuid,
-    instrument_id: Option<Uuid>,
-    device_name: Option<&str>,
 ) -> AppResult<()> {
+    let is_device = entry.is_device;
+    let instrument_id = entry
+        .instrument
+        .as_ref()
+        .and_then(|i| i.id.or_else(|| minted.get(&i.source_key).copied()));
+    let device_name = entry
+        .instrument
+        .as_ref()
+        .filter(|i| is_device && i.create)
+        .map(|i| i.name.as_str());
     // The plan's instrument wins over the one the stream carries. Since registration mints an
     // instrument for every stream, a review that only filled the gaps would fill none: the entry's
     // instrument is the operator's answer to the question the review asked, so the apply repoints
@@ -5349,11 +5476,10 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
     // `import_sensor_for_stream` documents.
     let from_plan = instrument_id.filter(|id| stream.sensor_id != Some(*id));
     let needs_sensor = stream.sensor_id.is_none() && from_plan.is_none();
-    let device =
-        crate::routes::private::sensors::service::extract_vaisala_device_serial(&stream.metadata)
-            .is_some();
+    // Whether the feed is stationed at its site is the entry's classification (the source's declared
+    // granularity), not whether this registration happened to carry a serial.
     // Read once, and only for the entries that will use it: an apply runs this per stream.
-    let site_id = if needs_sensor || device {
+    let site_id = if needs_sensor || is_device {
         site_parameters::Entity::find_by_id(site_parameter_id)
             .one(txn)
             .await?
@@ -5368,7 +5494,7 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
     // apply fails rather than pairing a slot whose readings would name nothing that measured them.
     if needs_sensor {
         create_sensor_for_stream(txn, &stream, parameter_id, site_id, device_name).await?;
-    } else if device && let Some(sensor_id) = stream.sensor_id.or(from_plan) {
+    } else if is_device && let Some(sensor_id) = stream.sensor_id.or(from_plan) {
         // A device is stationed at the site whichever route named it, so the slot's deployment is
         // opened here too. Without this the plan's own instrument choice silently costs the
         // deployment that pairing the same stream by hand would have opened.

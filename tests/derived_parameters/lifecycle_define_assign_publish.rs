@@ -250,9 +250,11 @@ async fn an_unrelated_sites_import_does_not_suppress_the_assignment_backfill() {
     );
 }
 
+/// Scenario: the calculation's backfill is running at SITE2 when it is assigned at SITE1.
+/// Expected behaviour: SITE1 gets a backfill of its own; the running one computes only SITE2.
 #[tokio::test]
 #[serial]
-async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
+async fn another_sites_running_backfill_does_not_suppress_this_one() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -266,8 +268,9 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
              (id, trigger_type, trigger_id, status, category, params, owner, lease_epoch, \
               lease_expires_at) \
          VALUES (gen_random_uuid(), 'derived_assignment', $1::uuid, 'running', 'data', \
-                 '{}'::jsonb, 'another-replica', 1, now() + interval '1 hour')",
-        [calculation.clone().into()],
+                 jsonb_build_object('calculation_id', $1::text, 'site_id', $2::text), \
+                 'another-replica', 1, now() + interval '1 hour')",
+        [calculation.clone().into(), crate::common::SITE2_ID.into()],
     ))
     .await
     .unwrap();
@@ -287,13 +290,14 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
     );
     let rows = e2e::count(
         &db,
-        &format!("SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' AND trigger_id = '{calculation}'"),
+        &format!(
+            "SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' \
+             AND trigger_id = '{calculation}' AND params->>'site_id' = '{}'",
+            crate::common::SITE1_ID
+        ),
     )
     .await;
-    assert_eq!(
-        rows, 1,
-        "this calculation's own in-flight backfill is not doubled"
-    );
+    assert_eq!(rows, 1, "SITE1's backfill is enqueued beside SITE2's");
 }
 
 /// Scenario: two sites hold the same output parameter, and only one declares its slot computed.

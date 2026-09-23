@@ -754,6 +754,7 @@ pub async fn list_holds(
             row.classification = classify(&row.expected, &row.computed).to_string();
         }
     }
+    mark_awaiting_inputs(&state.db, &mut rows).await?;
 
     let kind_rows = state
         .db

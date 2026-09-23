@@ -2246,6 +2246,27 @@
         ],
         "type": "object"
       },
+      "AwaitedInput": {
+        "description": "An input a computed value waits on.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "parameter_id",
+          "code",
+          "name"
+        ],
+        "type": "object"
+      },
       "BackfillAttributionRequest": {
         "properties": {
           "all": {
@@ -8286,6 +8307,13 @@
               "null"
             ]
           },
+          "awaiting_inputs": {
+            "description": "On a pending entry that was computed: the inputs it was computed from that are still\npending. It is released when they are verified, and cannot be verified before (Q257).",
+            "items": {
+              "$ref": "#/components/schemas/AwaitedInput"
+            },
+            "type": "array"
+          },
           "classification": {
             "description": "Signature of the disagreement: `n_mismatch` | `source_sd_matches_n_divisor` |\n`stale_subset` | `unexplained`. Computed from the stored expectation and recompute, never\npersisted.",
             "type": "string"
@@ -8435,7 +8463,8 @@
           "acknowledged_at",
           "relative_delta",
           "mean_relative_delta",
-          "sd_relative_delta"
+          "sd_relative_delta",
+          "awaiting_inputs"
         ],
         "type": "object"
       },

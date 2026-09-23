@@ -523,6 +523,18 @@ pub struct HoldRow {
     pub mean_relative_delta: f64,
     /// `|Δsd|` over the same mean-magnitude denominator as `mean_relative_delta`.
     pub sd_relative_delta: f64,
+    /// On a pending entry that was computed: the inputs it was computed from that are still
+    /// pending. It is released when they are verified, and cannot be verified before (Q257).
+    #[sea_orm(skip)]
+    pub awaiting_inputs: Vec<AwaitedInput>,
+}
+
+/// An input a computed value waits on.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AwaitedInput {
+    pub parameter_id: Uuid,
+    pub code: String,
+    pub name: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

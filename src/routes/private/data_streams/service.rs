@@ -513,6 +513,7 @@ pub(super) struct PreviewRow {
     pub(super) value: Option<f64>,
     pub(super) is_flagged: bool,
     pub(super) withdrawn: bool,
+    pub(super) unverified: Option<bool>,
 }
 
 /// A stream with no readings at all returns no row, which is zero of everything.
@@ -573,6 +574,7 @@ pub(super) fn preview_query(stream_id: Uuid, limit: u64) -> SelectStatement {
             "is_flagged",
         )
         .expr_as(Expr::cust("readings.withdrawn_at IS NOT NULL"), "withdrawn")
+        .column((readings::Entity, readings::Column::Unverified))
         .from(readings::Entity)
         .join_subquery(
             sea_orm::JoinType::Join,

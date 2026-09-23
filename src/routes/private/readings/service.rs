@@ -307,7 +307,7 @@ fn sql_true() -> sea_orm::sea_query::Keyword {
 }
 
 /// A readings select narrowed to the columns a [`PreviewRow`] decodes: the slot, the replicate's
-/// served value, and whether it is currently excluded from the statistics.
+/// served value, and each reason it may be excluded from the statistics.
 pub(super) fn preview_rows() -> sea_orm::Select<readings::Entity> {
     readings::Entity::find()
         .select_only()
@@ -322,6 +322,10 @@ pub(super) fn preview_rows() -> sea_orm::Select<readings::Entity> {
         .column_as(
             Expr::col(readings::Column::WithdrawnAt).is_not_null(),
             "withdrawn",
+        )
+        .column_as(
+            Expr::col(readings::Column::Unverified).is(sql_true()),
+            "unverified",
         )
 }
 
@@ -542,6 +546,14 @@ pub struct Replicate {
     pub value: f64,
     pub flagged: bool,
     pub withdrawn: bool,
+    pub unverified: bool,
+}
+
+/// Whether a replicate counts in its sample's statistics: the rule the samples trigger applies,
+/// which leaves out a flagged, a withdrawn and a pending (unverified) replicate.
+#[must_use]
+pub fn counts_in_sample(flagged: bool, withdrawn: bool, unverified: bool) -> bool {
+    !flagged && !withdrawn && !unverified
 }
 
 /// The change being previewed.
@@ -560,9 +572,9 @@ pub(super) fn stats_over(values: &[f64]) -> PreviewStats {
     }
 }
 
-/// The statistics now and after the change, over the same rule the samples trigger applies:
-/// unflagged, unwithdrawn replicates only. A withdrawn replicate is outside every count and no
-/// flag change brings it back.
+/// The statistics now and after the change, over the same rule the samples trigger applies
+/// ([`counts_in_sample`]). A withdrawn or pending replicate is outside every count and no flag
+/// change brings it back.
 #[must_use]
 pub fn preview_statistics(
     replicates: &[Replicate],
@@ -577,10 +589,10 @@ pub fn preview_statistics(
     let mut now = Vec::new();
     let mut after = Vec::new();
     for r in replicates {
-        let included_now = !r.flagged && !r.withdrawn;
-        let included_after = !r.withdrawn
-            && !change.exclude.contains(&r.index)
-            && (!r.flagged || change.include.contains(&r.index));
+        let included_now = counts_in_sample(r.flagged, r.withdrawn, r.unverified);
+        let flagged_after = r.flagged && !change.include.contains(&r.index);
+        let included_after = counts_in_sample(flagged_after, r.withdrawn, r.unverified)
+            && !change.exclude.contains(&r.index);
         if included_now {
             now.push(r.value);
         }
@@ -4035,6 +4047,52 @@ pub(super) async fn selected_sites<C: ConnectionTrait>(
         .to_owned()
         .build(PostgresQueryBuilder);
     sites_of(conn, sql, values).await
+}
+
+/// A curve edit is held to the admission every other curve writer applies: the curve was fitted on
+/// each selected row's own instrument, and the row is a spot measurement.
+pub(super) async fn admit_edit_curve(
+    db: &DatabaseConnection,
+    rows: Condition,
+    kind: Kind,
+    curve_id: Option<Uuid>,
+) -> AppResult<()> {
+    #[derive(FromQueryResult)]
+    struct Claimant {
+        sensor_id: Option<Uuid>,
+        measurement_type: Option<String>,
+    }
+    let (Kind::Curve, Some(curve_id)) = (kind, curve_id) else {
+        return Ok(());
+    };
+    let r = Alias::new("r");
+    let (sql, values) = readings_joined(r.clone())
+        .distinct()
+        .column((r.clone(), readings::Column::SensorId))
+        .column((r, readings::Column::MeasurementType))
+        .cond_where(rows)
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    let claimants = Claimant::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .all(db)
+    .await?;
+    let claims: Vec<CurveClaim<'_>> = claimants
+        .iter()
+        .map(|c| CurveClaim {
+            standard_curve_id: curve_id,
+            sensor_id: c.sensor_id,
+            measurement_type: c
+                .measurement_type
+                .as_deref()
+                .unwrap_or(river_data_core::models::MeasurementType::Continuous.as_str()),
+        })
+        .collect();
+    admit_standard_curves(db, &claims).await?;
+    Ok(())
 }
 
 /// The sites of the readings the decisions whose `column` is `id` stand on (one decision by its
@@ -7809,6 +7867,28 @@ pub(super) fn stored_values_moved(
         .count()
 }
 
+/// Which carried rows a save enters, in the order carried: a replicate the group does not hold, or
+/// one at a number other than the stored one. A stored replicate carried at its own number is the
+/// grid posting the whole group, not an entry, so it keeps its own verification state.
+pub(super) fn entered_rows(
+    carried: &[(Uuid, chrono::DateTime<chrono::Utc>, i16, f64)],
+    existing: &[ExistingGroup],
+) -> Vec<bool> {
+    carried
+        .iter()
+        .map(|(parameter_id, time, index, value)| {
+            !existing.iter().any(|group| {
+                group.parameter_id == *parameter_id
+                    && group.time == *time
+                    && group
+                        .replicates
+                        .iter()
+                        .any(|r| r.replicate_index == *index && r.raw_value == *value)
+            })
+        })
+        .collect()
+}
+
 pub(super) async fn fetch_existing_groups(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -8752,8 +8832,8 @@ pub(super) struct StagedRow {
 /// Bulk-insert the parsed rows into `csv_import_staging` under `import_token`, chunked so the
 /// parameter count per statement stays bounded. `seq` records file order so the worker job can
 /// number replicate groups deterministically. The worker job reads them back by token.
-pub(super) async fn stage_import_rows(
-    db: &sea_orm::DatabaseConnection,
+pub(super) async fn stage_import_rows<C: ConnectionTrait>(
+    db: &C,
     import_token: Uuid,
     rows: &[StagedRow],
 ) -> AppResult<()> {

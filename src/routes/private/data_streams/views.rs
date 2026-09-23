@@ -98,6 +98,8 @@ pub async fn stream_preview(
         .await?;
 
     let mut instants: Vec<PreviewInstant> = Vec::new();
+    // The values each instant's sample would be computed from, beside the replicates it lists.
+    let mut served: Vec<Vec<f64>> = Vec::new();
     for row in &rows {
         let row = PreviewRow::from_query_result(row, "")?;
         let time = row.time.with_timezone(&Utc);
@@ -111,26 +113,31 @@ pub async fn stream_preview(
         };
         match instants.last_mut() {
             Some(last) if last.time == time => last.replicates.push(replicate),
-            _ => instants.push(PreviewInstant {
-                time,
-                replicates: vec![replicate],
-                mean: None,
-                sd: None,
-                n: 0,
-            }),
+            _ => {
+                instants.push(PreviewInstant {
+                    time,
+                    replicates: vec![replicate],
+                    mean: None,
+                    sd: None,
+                    n: 0,
+                });
+                served.push(Vec::new());
+            }
+        }
+        let counts = crate::routes::private::readings::service::counts_in_sample(
+            row.is_flagged,
+            row.withdrawn,
+            row.unverified == Some(true),
+        );
+        if let (true, Some(value), Some(values)) = (counts, row.value, served.last_mut()) {
+            values.push(value);
         }
     }
 
-    // Statistics over the replicates that would be served: flagged and withdrawn rows are excluded
-    // from `samples`, so excluding them here is what makes the preview match the outcome.
-    for instant in &mut instants {
-        let values: Vec<f64> = instant
-            .replicates
-            .iter()
-            .filter(|r| !r.is_flagged && !r.withdrawn)
-            .filter_map(|r| r.value)
-            .collect();
-        let stats = sync_service::group_stats(&values);
+    // Statistics over the replicates that would be served, by the rule the samples trigger
+    // applies, which is what makes the preview match the outcome.
+    for (instant, values) in instants.iter_mut().zip(&served) {
+        let stats = sync_service::group_stats(values);
         instant.n = stats.n;
         instant.mean = stats.mean;
         instant.sd = stats.sd;

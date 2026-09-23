@@ -325,7 +325,7 @@ mod ruling {
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
-    use super::super::{ReadingKey, follow_ruling};
+    use super::super::{ReadingKey, follow_ruling, inputs_pending};
 
     fn key(n: u128) -> ReadingKey {
         (
@@ -361,6 +361,26 @@ mod ruling {
         let pending: HashSet<ReadingKey> = [key(1), key(30)].into();
         // 10 was not pending, so there is nothing to release; 30 read nothing, so no ruling frees it.
         assert!(follow_ruling(&outputs, &pending, &[key(1)], true).is_empty());
+    }
+
+    #[test]
+    fn test_inputs_pending_names_what_a_held_output_still_waits_on() {
+        let pending: HashSet<ReadingKey> = [key(1), key(10), key(20)].into();
+        assert_eq!(inputs_pending(&chain(), &pending, &[key(10)]), vec![key(1)]);
+        // Flux waits on pCO2, which is itself pending.
+        assert_eq!(
+            inputs_pending(&chain(), &pending, &[key(20)]),
+            vec![key(10)]
+        );
+    }
+
+    #[test]
+    fn test_inputs_pending_is_empty_for_an_entry_or_an_output_whose_inputs_are_verified() {
+        let pending: HashSet<ReadingKey> = [key(1), key(10)].into();
+        // DIC was entered, not computed.
+        assert!(inputs_pending(&chain(), &pending, &[key(1)]).is_empty());
+        let pending: HashSet<ReadingKey> = [key(10)].into();
+        assert!(inputs_pending(&chain(), &pending, &[key(10)]).is_empty());
     }
 
     #[test]

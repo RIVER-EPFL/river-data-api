@@ -341,3 +341,73 @@ async fn sse_rejects_unauthenticated() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: a token scoped to one project listens while readings land at a site of another
+/// project, on an unpaired stream, and then at its own site, in that order.
+///
+/// Expected behaviour: the stream forwards the frame for its own site and neither of the two
+/// before it, so a caller granted one project hears nothing of another's data.
+#[tokio::test]
+#[serial]
+async fn a_scoped_token_hears_only_its_own_projects_sites() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(
+        &db,
+        crate::common::full_permissions(),
+        Some(crate::common::PROJECT_ID),
+    )
+    .await;
+    let (app, events) = crate::common::build_test_app_with_events(db.clone());
+
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/events")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "text/event-stream")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let mut body = response.into_body();
+
+    let own: Uuid = crate::common::SITE1_ID.parse().unwrap();
+    let outside = Uuid::new_v4();
+    for site_id in [Some(outside), None, Some(own)] {
+        let _ = events.send(AppEvent::DataIngested {
+            site_id,
+            parameter_id: None,
+            stream_id: Some(Uuid::new_v4()),
+            count: 1,
+        });
+    }
+
+    let mut accumulated = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout_at(deadline, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    accumulated.push_str(&String::from_utf8_lossy(data));
+                }
+                let heard: Vec<serde_json::Value> = parse_sse_frames(&accumulated)
+                    .into_iter()
+                    .filter(|(ev, _)| ev == "data_ingested")
+                    .map(|(_, json)| json)
+                    .collect();
+                if heard.iter().any(|f| f["site_id"] == own.to_string()) {
+                    assert_eq!(
+                        heard.len(),
+                        1,
+                        "only the own site's frame is forwarded: {heard:?}"
+                    );
+                    return;
+                }
+            }
+            Ok(Some(Err(e))) => panic!("frame error: {e}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    panic!("the own site's frame never arrived. accumulated: {accumulated}");
+}

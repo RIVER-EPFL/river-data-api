@@ -290,3 +290,25 @@ fn test_partition_members_of_an_empty_group_is_empty() {
     assert!(create.is_empty());
     assert!(existing.is_empty());
 }
+
+#[test]
+fn test_another_sites_assignment_does_not_suppress_this_one() {
+    use super::assignment_dedupe_key;
+
+    let calculation = Uuid::from_u128(10);
+    let martigny = Uuid::from_u128(20);
+    let saxon = Uuid::from_u128(21);
+    assert_ne!(
+        assignment_dedupe_key(calculation, martigny),
+        assignment_dedupe_key(calculation, saxon),
+    );
+    assert_eq!(
+        assignment_dedupe_key(calculation, martigny),
+        assignment_dedupe_key(calculation, martigny),
+        "a second assignment at one site coalesces while the first waits"
+    );
+    assert_ne!(
+        assignment_dedupe_key(calculation, martigny),
+        assignment_dedupe_key(Uuid::from_u128(11), martigny),
+    );
+}

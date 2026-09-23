@@ -996,3 +996,90 @@ async fn csv_overwrite_replaces_the_whole_replicate_set() {
         "(200 + 300) / 2 over the replacement set: got {mean}"
     );
 }
+
+/// Scenario: the import's first run fails on a transient error inserting its readings.
+/// Expected behaviour: the staged rows wait for the retry, which lands every reading; the job does
+/// not read as completed with nothing imported.
+#[tokio::test]
+#[serial]
+async fn a_csv_import_that_fails_once_lands_its_rows_on_the_retry() {
+    use river_db::routes::private::reprocessing_jobs::service as jobs;
+    let (db, app, token) = setup().await;
+    // This test is the worker, under a policy with a retry to spend and no backoff to wait out.
+    crate::common::stop_test_workers().await;
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    let job_id = resp["derived_job_id"]
+        .as_str()
+        .expect("a worker job id is returned")
+        .to_string();
+
+    for sql in [
+        "CREATE SEQUENCE test_csv_fail_once",
+        "CREATE OR REPLACE FUNCTION test_csv_fail_once() RETURNS trigger AS \
+         $$ BEGIN IF nextval('test_csv_fail_once') = 1 THEN RAISE EXCEPTION 'transient'; END IF; \
+         RETURN NEW; END; $$ LANGUAGE plpgsql",
+        "CREATE TRIGGER test_csv_fail_once BEFORE INSERT ON readings \
+         FOR EACH ROW EXECUTE FUNCTION test_csv_fail_once()",
+    ] {
+        crate::common::exec(&db, sql).await;
+    }
+
+    let registry = jobs::build_registry();
+    let events = tokio::sync::broadcast::channel::<river_db::common::AppEvent>(16).0;
+    let worker = jobs::worker_id();
+    let policy = jobs::RetryPolicy {
+        max_retries: 1,
+        backoff_base: std::time::Duration::ZERO,
+    };
+    while jobs::run_one_with_policy(&db, &events, &registry, &worker, policy)
+        .await
+        .unwrap()
+    {}
+
+    for sql in [
+        "DROP TRIGGER test_csv_fail_once ON readings",
+        "DROP FUNCTION test_csv_fail_once()",
+        "DROP SEQUENCE test_csv_fail_once",
+    ] {
+        crate::common::exec(&db, sql).await;
+    }
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM reprocessing_jobs \
+                 WHERE id = '{job_id}' AND status = 'completed' AND retry_count = 1"
+            )
+        )
+        .await,
+        1,
+        "the import completes on its second attempt"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM readings WHERE site_id = '{}' \
+                 AND time >= '2025-06-01T00:00:00Z'",
+                crate::common::SITE1_ID
+            )
+        )
+        .await,
+        4,
+        "the retry lands every staged reading"
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT count(*) AS n FROM csv_import_staging").await,
+        0,
+        "and then drops the staged rows"
+    );
+}

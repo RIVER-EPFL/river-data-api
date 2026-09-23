@@ -335,6 +335,7 @@ pub(super) struct PreviewRow {
     pub(super) value: f64,
     pub(super) flagged: bool,
     pub(super) withdrawn: bool,
+    pub(super) unverified: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

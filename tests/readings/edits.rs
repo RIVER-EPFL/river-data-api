@@ -488,3 +488,72 @@ async fn a_set_rollback_skips_a_decision_already_rolled_back() {
     assert_eq!(stored(&f, 0).await.0, 10.0, "both cells are back");
     assert_eq!(stored(&f, 2).await.0, 14.0);
 }
+
+/// Scenario: a spot reading corrected by its instrument's curve is moved to another curve by id.
+///
+/// Expected behaviour: the edit is held to the admission every other curve writer applies. A curve
+/// fitted on another instrument is refused at the preview and at the commit, and a second curve of
+/// the reading's own instrument is accepted.
+#[tokio::test]
+#[serial]
+async fn a_curve_edit_is_refused_a_curve_another_instrument_fitted() {
+    let f = setup(&[10.0]).await;
+    let own: Uuid =
+        f.db.query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT sensor_id FROM readings WHERE stream_id = '{}' AND time = '{AT}'",
+                f.stream
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the seeded reading")
+        .try_get::<Option<Uuid>>("", "sensor_id")
+        .unwrap()
+        .expect("the reading names its instrument");
+    let other = Uuid::new_v4();
+    let (current, own_curve, foreign_curve) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for sql in [
+        format!(
+            "INSERT INTO sensors (id, name, is_active) VALUES ('{other}', 'other analyser', true)"
+        ),
+        format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept) VALUES \
+             ('{current}', '{own}', 1.5, 0.0), ('{own_curve}', '{own}', 2.0, 0.0), \
+             ('{foreign_curve}', '{other}', 3.0, 0.0)"
+        ),
+        format!(
+            "UPDATE readings SET standard_curve_id = '{current}' \
+             WHERE stream_id = '{}' AND time = '{AT}'",
+            f.stream
+        ),
+    ] {
+        crate::common::exec(&f.db, &sql).await;
+    }
+    let edit = |curve: Uuid| {
+        json!({
+            "selection": one_key(f.stream, 0),
+            "decision": { "kind": "curve", "target_id": curve }
+        })
+    };
+
+    let (status, body) = post(&f, "/api/readings/edits/preview", &edit(foreign_curve)).await;
+    assert_eq!(
+        status, 400,
+        "another instrument's curve is refused at the preview: {body}"
+    );
+    let mut committed = edit(foreign_curve);
+    committed["preview_id"] = json!(Uuid::new_v4());
+    let (status, body) = post(&f, "/api/readings/edits", &committed).await;
+    assert_eq!(
+        status, 400,
+        "and at the commit, whatever preview it cites: {body}"
+    );
+
+    let (status, body) = post(&f, "/api/readings/edits/preview", &edit(own_curve)).await;
+    assert_eq!(
+        status, 200,
+        "the reading's own instrument's curve is accepted: {body}"
+    );
+}

@@ -515,6 +515,81 @@ async fn verifying_the_last_pending_input_releases_the_output() {
     assert_eq!(verified, 1, "the release is a decision on the record");
 }
 
+/// The open review-queue row for the pending output.
+async fn output_hold(db: &DatabaseConnection, output_id: &str) -> Uuid {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT id FROM replicate_audit_holds \
+              WHERE kind = 'unverified_entry' AND status = 'pending' AND site_id = '{SITE1_ID}' \
+                AND parameter_id = '{output_id}' AND group_time = '{EVENT_TIME}'"
+        ),
+    ))
+    .await
+    .expect("query")
+    .expect("the output is in the queue")
+    .try_get("", "id")
+    .expect("id")
+}
+
+/// Scenario: a manager opens the pending output itself, while the intern's entry it was computed
+/// from is still pending, and presses Verify on it.
+///
+/// Expected behaviour: the queue says what the output waits on, the verify is refused naming that
+/// input, and the output stays pending.
+#[tokio::test]
+#[serial]
+async fn an_output_cannot_be_verified_ahead_of_its_pending_input() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let (app, state) = crate::common::build_test_app_with_state(db.clone());
+    let (output_id, _) = install_calculation(&db, &app, &token, false).await;
+    let event_id = seed_pending_visit(&db).await;
+    river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+        .await
+        .expect("the recompute runs");
+    input_hold(&db).await;
+    let hold = output_hold(&db, &output_id).await;
+
+    let (status, list) = crate::common::get_json_with_token(
+        &app,
+        "/api/sync/replicate_audit_holds?kind=unverified_entry&page_size=500",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{list}");
+    let rows = list["holds"].as_array().expect("holds");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("hold {id} listed: {list}"))
+    };
+    let awaited: Vec<&str> = row(&hold.to_string())["awaiting_inputs"]
+        .as_array()
+        .expect("awaiting_inputs")
+        .iter()
+        .filter_map(|a| a["parameter_id"].as_str())
+        .collect();
+    assert_eq!(awaited, vec![GLOBAL_PARAM_TEMP_ID], "{list}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/resolve"),
+        &json!({ "mode": "verify" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        output_state(&db, &output_id).await,
+        vec![(8.0, true, false)],
+        "the output stays pending until its input is ruled on"
+    );
+    assert_eq!(pending_entry_holds(&db, &output_id).await, 1);
+}
+
 /// Scenario: a manager asks what rejecting the intern's entry would take, then rejects it.
 ///
 /// Expected behaviour: the preview names the output computed from the entry, and the reject

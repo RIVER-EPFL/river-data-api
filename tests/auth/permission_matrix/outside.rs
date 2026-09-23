@@ -37,6 +37,12 @@ const OTHER_THRESHOLD_ID: &str = "00000000-0000-4000-a000-000000000089";
 const OTHER_PROPOSAL_ID: &str = "00000000-0000-4000-a000-000000000088";
 const OTHER_ENTRY_HOLD_ID: &str = "00000000-0000-4000-a000-000000000087";
 const OTHER_DECIDED_HOLD_ID: &str = "00000000-0000-4000-a000-000000000086";
+const OTHER_CALC_ID: &str = "00000000-0000-4000-a000-000000000084";
+const OTHER_CALC_VERSION_ID: &str = "00000000-0000-4000-a000-000000000083";
+const OTHER_INPUT_ID: &str = "00000000-0000-4000-a000-000000000082";
+const OTHER_INPUT_SLOT_ID: &str = "00000000-0000-4000-a000-000000000081";
+const OTHER_OUTPUT_ID: &str = "00000000-0000-4000-a000-000000000080";
+const OTHER_SESSION_ID: &str = "00000000-0000-4000-a000-00000000007f";
 /// An instrument deployed nowhere, which any caller may name.
 const INVENTORY_SENSOR_ID: &str = "00000000-0000-4000-a000-000000000085";
 const OTHER_CODE: &str = "OUTSIDE";
@@ -44,7 +50,7 @@ const OTHER_TIME: &str = "2025-01-01T00:00:00Z";
 
 /// The second project's ids a listing must not carry. The instrument is left out: the inventory is
 /// shared, so a sensor deployed only in the second project is listed to everyone.
-const OTHER_ROWS: [&str; 19] = [
+const OTHER_ROWS: [&str; 20] = [
     OTHER_PROJECT_ID,
     OTHER_SITE_ID,
     OTHER_SLOT_ID,
@@ -64,6 +70,7 @@ const OTHER_ROWS: [&str; 19] = [
     OTHER_PROPOSAL_ID,
     OTHER_ENTRY_HOLD_ID,
     OTHER_DECIDED_HOLD_ID,
+    OTHER_INPUT_SLOT_ID,
 ];
 
 /// Rows a confined caller passes the gate of that name no project, with the reason.
@@ -135,9 +142,12 @@ const NOT_PROJECT_BOUND: [(&str, &str); 20] = [
     ),
 ];
 
-/// Rows whose outside half is asserted by `scope_confinement_denies_another_projects_row`, which
-/// builds the committed edit a rollback needs.
-const PROBED_ELSEWHERE: [&str; 5] = [
+/// Rows whose outside half is asserted elsewhere: the edits by
+/// `scope_confinement_denies_another_projects_row`, which builds the committed edit a rollback
+/// needs, and the event stream, whose confinement is per frame, by
+/// `tests/events/sse_event_stream.rs`, `a_scoped_token_hears_only_its_own_projects_sites`.
+const PROBED_ELSEWHERE: [&str; 6] = [
+    "GET /api/events",
     "POST /api/readings/edits/preview",
     "POST /api/readings/edits",
     "POST /api/readings/edits/{id}/rollback",
@@ -147,22 +157,17 @@ const PROBED_ELSEWHERE: [&str; 5] = [
 
 /// Project-bound rows with no outside probe yet. Each one is a row whose confinement nothing
 /// asserts, so the list only shrinks.
-const UNPROBED: [&str; 5] = [
-    // An open event stream: confinement is per event, not a status.
-    "GET /api/events",
-    // A chunk names a session, which only an import opened by another caller exercises.
-    "POST /api/readings/import_csv/chunk",
-    // The recompute names a formula, and the sites it reaches follow from where it applies.
-    "POST /api/actions/derived_parameters/{id}/recompute",
-    // A calculation's version ledger lists the runs of every site it computed at.
-    "GET /api/tool_scripts/{id}/version_ledger",
-    // The applied sites follow from a calculation active at a site of each project.
-    "GET /api/calculations/sites",
-];
+const UNPROBED: [&str; 0] = [];
 
 /// Project-bound rows whose outside probe is known to reach the other project, each under the item
 /// that fixes it. The probe is issued and its answer printed, not asserted; the fix drops the entry.
-const KNOWN_LEAKS: [(&str, &str); 0] = [];
+const KNOWN_LEAKS: [(&str, &str); 2] = [
+    ("GET /api/tool_scripts/{id}/version_ledger", "B563"),
+    (
+        "POST /api/actions/derived_parameters/{id}/recompute",
+        "B564",
+    ),
+];
 
 /// How a confined caller is answered when a request names another project's row.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -173,8 +178,11 @@ enum Confined {
     Forbidden,
     /// Refused, or answered with none of the other project's rows in the body.
     Filtered,
-    /// Answered with each named row refused inside the body, which carries this.
+    /// Answered with each named row refused inside the body, or none of the other project's rows
+    /// counted in it, which carries this.
     Declined(&'static str),
+    /// Answered with this status and a body carrying this, as if the named row were not there.
+    Answered(u16, &'static str),
 }
 
 struct Probe {
@@ -408,6 +416,36 @@ fn probes() -> Vec<Probe> {
             "readings": [{ "time": "2025-01-01T01:00:00Z", "raw_value": 5.0 }],
         })),
         refused,
+    );
+
+    // --- Addressed by calculation or upload ---
+    add(
+        "GET",
+        "/api/calculations/sites",
+        "/api/calculations/sites".into(),
+        None,
+        filtered,
+    );
+    add(
+        "GET",
+        "/api/tool_scripts/{id}/version_ledger",
+        format!("/api/tool_scripts/{OTHER_CALC_ID}/version_ledger"),
+        None,
+        Confined::Declined("\"readings\":0"),
+    );
+    add(
+        "POST",
+        "/api/actions/derived_parameters/{id}/recompute",
+        format!("/api/actions/derived_parameters/{OTHER_CALC_ID}/recompute"),
+        None,
+        refused,
+    );
+    add(
+        "POST",
+        "/api/readings/import_csv/chunk",
+        "/api/readings/import_csv/chunk".into(),
+        Some(json!({ "session_id": OTHER_SESSION_ID, "chunk": "2025-01-01T00:00:00Z,1\n" })),
+        Confined::Answered(400, "not found"),
     );
 
     // --- Addressed by instrument ---
@@ -996,6 +1034,55 @@ async fn seed_other_project(db: &sea_orm::DatabaseConnection) {
     for sql in &statements {
         crate::common::db::exec(db, sql).await;
     }
+    for sql in other_calculation() {
+        crate::common::db::exec(db, &sql).await;
+    }
+}
+
+/// A calculation active only at the second project's site: it reads a parameter only that site
+/// declares and publishes one no site declares, and the curation ledger holds one value it computed
+/// there. Beside it, an upload session another caller opened.
+fn other_calculation() -> Vec<String> {
+    let manifest = json!({
+        "label": "Outside calculation",
+        "params": [{ "name": "x", "label": "X", "kind": "number", "required": true }],
+        "event_inputs": [{ "param": "x", "parameter_code": "outside_input" }],
+        "outputs": [{ "key": "o", "label": "o", "suggested_parameter_code": "outside_output" }],
+    });
+    vec![
+        format!(
+            "INSERT INTO parameters (id, code, name, category) \
+             VALUES ('{OTHER_INPUT_ID}', 'outside_input', 'Outside input', 'measurement'), \
+                    ('{OTHER_OUTPUT_ID}', 'outside_output', 'Outside output', 'measurement')"
+        ),
+        format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name) \
+             VALUES ('{OTHER_INPUT_SLOT_ID}', '{OTHER_SITE_ID}', '{OTHER_INPUT_ID}', 'Outside input')"
+        ),
+        format!(
+            "INSERT INTO tool_scripts (id, name, label, created_by) \
+             VALUES ('{OTHER_CALC_ID}', 'outside_calc', 'Outside calculation', 'test')"
+        ),
+        format!(
+            "INSERT INTO tool_script_versions (id, tool_script_id, version_no, script, entry_function, \
+                 manifest, test_cases, content_hash, created_by) \
+             VALUES ('{OTHER_CALC_VERSION_ID}', '{OTHER_CALC_ID}', 1, \
+                 'tool <- function(inputs, constants, curves) list(o = 1)', 'tool', '{manifest}'::jsonb, \
+                 '{{}}'::jsonb, md5('outside_calc'), 'test')"
+        ),
+        format!(
+            "UPDATE tool_scripts SET active_version_id = '{OTHER_CALC_VERSION_ID}' WHERE id = '{OTHER_CALC_ID}'"
+        ),
+        format!(
+            "INSERT INTO reading_decisions (stream_id, time, replicate_index, kind, new, actor, origin) \
+             VALUES ('{OTHER_STREAM_ID}', '{OTHER_TIME}', 0, 'derived_computed', \
+                 '{{\"derived_version_id\": \"{OTHER_CALC_VERSION_ID}\"}}', 'test', 'system')"
+        ),
+        format!(
+            "INSERT INTO csv_import_chunks (session_id, seq, chunk, opened_by) \
+             VALUES ('{OTHER_SESSION_ID}', 0, 'time,outside_input\n', 'someone else')"
+        ),
+    ]
 }
 
 /// What a probe answered, when that is not confinement, or `None` when it is.
@@ -1009,6 +1096,7 @@ fn leak(probe: &Probe, status: u16, body: &str) -> Option<String> {
                 || ((200..300).contains(&status) && !OTHER_ROWS.iter().any(|id| body.contains(id)))
         }
         Confined::Declined(marker) => (200..300).contains(&status) && body.contains(marker),
+        Confined::Answered(code, marker) => status == code && body.contains(marker),
     };
     (!confined).then(|| {
         let excerpt: String = body.chars().take(200).collect();

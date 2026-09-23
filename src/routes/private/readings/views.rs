@@ -15,6 +15,7 @@ use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::QueryTrait;
 use sea_orm::Set;
+use sea_orm::TransactionTrait;
 use sea_orm::sea_query::Expr;
 use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
@@ -121,6 +122,7 @@ pub async fn sample_preview(
             value: row.value,
             flagged: row.flagged,
             withdrawn: row.withdrawn,
+            unverified: row.unverified,
         });
     }
     if let Some((site_id, _)) = slot {
@@ -610,6 +612,7 @@ pub async fn preview(
     let sites = selected_sites(&state.db, rows_where.clone()).await?;
     require_edit_in_scope(&state.db, &scope, &sites).await?;
     refuse_unrouted(&state.db, &req.selection, option).await?;
+    admit_edit_curve(&state.db, rows_where.clone(), kind, req.decision.target_id).await?;
     let parameters = touched_parameters(&state.db, rows_where.clone()).await?;
 
     // The transaction is the preview: the decision is applied, the numbers are read back from the
@@ -688,6 +691,13 @@ pub async fn commit(
     authorise(&auth, option)?;
     let sites = selected_sites(&state.db, req.selection.condition()?).await?;
     require_edit_in_scope(&state.db, &scope, &sites).await?;
+    admit_edit_curve(
+        &state.db,
+        req.selection.condition()?,
+        kind,
+        req.decision.target_id,
+    )
+    .await?;
     let expected = preview_id(&req.selection, &req.decision)?;
     match req.preview_id {
         Some(id) if id == expected => {}
@@ -2954,16 +2964,16 @@ pub async fn insert_grab_samples(
     // An intern enters measurements; a stored value is someone else's to change (Q21). A replace
     // that carries every stored replicate at the number it already holds changes none of them: the
     // entry grid posts the whole group, so a repeat typed into an empty cell arrives this way.
+    let carried: Vec<(Uuid, chrono::DateTime<chrono::Utc>, i16, f64)> = payload
+        .readings
+        .iter()
+        .zip(&preview)
+        .map(|(r, p)| (r.parameter_id, r.time, p.replicate_index, r.value))
+        .collect();
     if crate::routes::private::readings::service::entry_state(auth.highest_role().as_ref())
         .is_some()
         && payload.mode == Some(GrabWriteMode::Replace)
     {
-        let carried: Vec<(Uuid, chrono::DateTime<chrono::Utc>, i16, f64)> = payload
-            .readings
-            .iter()
-            .zip(&preview)
-            .map(|(r, p)| (r.parameter_id, r.time, p.replicate_index, r.value))
-            .collect();
         let moved = crate::routes::private::readings::service::stored_values_moved(
             &carried,
             &existing_groups,
@@ -3422,16 +3432,36 @@ pub async fn insert_grab_samples(
 
             // An intern's entry lands pending: the record carries it, the columns project it and
             // the review queue lists it until a manager verifies or rejects (Q21, M44).
+            // Only what the save entered is pending: a stored replicate the grid carried at its
+            // own number stays as a manager left it.
             if entry_state == Some(crate::routes::private::readings::models::Kind::UnverifiedEntry)
             {
+                let entered =
+                    crate::routes::private::readings::service::entered_rows(&carried, &existing_groups);
+                let entries: Vec<readings::ActiveModel> = models
+                    .iter()
+                    .zip(&entered)
+                    .filter(|(_, entered)| **entered)
+                    .map(|(m, _)| m.clone())
+                    .collect();
+                let entered_groups: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = groups
+                    .iter()
+                    .filter(|group| {
+                        carried
+                            .iter()
+                            .zip(&entered)
+                            .any(|((p, t, _, _), e)| *e && (*p, *t) == **group)
+                    })
+                    .copied()
+                    .collect();
                 crate::routes::private::readings::service::record_unverified_entries(
                     txn,
-                    &models,
+                    &entries,
                     &actor,
                     crate::routes::private::readings::models::Origin::Manual,
                 )
                 .await?;
-                open_unverified_holds(txn, payload.site_id, &groups, &actor).await?;
+                open_unverified_holds(txn, payload.site_id, &entered_groups, &actor).await?;
             }
 
             // A re-post is the same measurement recorded again: the rows the insert skipped on
@@ -4574,10 +4604,11 @@ async fn import_one_site(
 
     // --- Stage the parsed readings and enqueue the worker job ---------------------------------
     // The readings are externalised to `csv_import_staging` so any replica can run the import. The
-    // job reads them back by token.
+    // job reads them back by token, so the rows and the job commit together or not at all.
     let derived_job_id = if has_work {
         let import_token = Uuid::new_v4();
-        stage_import_rows(&state.db, import_token, &staged).await?;
+        let txn = state.db.begin().await?;
+        stage_import_rows(&txn, import_token, &staged).await?;
 
         let param_streams: Vec<serde_json::Value> = mappings
             .iter()
@@ -4603,15 +4634,17 @@ async fn import_one_site(
             "measurement_type": req.measurement_type.as_deref(),
         });
 
-        crate::routes::private::reprocessing_jobs::service::enqueue(
-            &state.db,
+        let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+            &txn,
             "csv_import",
             None,
             None,
             &params,
             None,
         )
-        .await?
+        .await?;
+        txn.commit().await?;
+        job_id
     } else {
         None
     };

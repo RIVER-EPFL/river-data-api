@@ -47,7 +47,6 @@ use crate::routes::private::parameters;
 use crate::routes::private::readings;
 use crate::routes::private::readings::samples;
 use crate::routes::private::readings::status_events::models as status_events;
-use crate::routes::private::reprocessing_jobs::models::job as reprocessing_jobs;
 use crate::routes::private::sensors::service::require_measuring_instrument;
 use crate::routes::private::site_parameters;
 
@@ -198,54 +197,23 @@ impl CRUDOperations for SiteParameterOperations {
         // site-specific row is created only when a user explicitly overrides via the editor.
 
         // Backfill derived values for the readings already present at this site when a
-        // derived site_parameter is assigned. Enqueued as a durable `derived_assignment` job on
-        // the claim-based worker pool. The guard skips the enqueue only when this calculation's
-        // own assignment or recompute is already in flight. An import or pairing backfill at any
-        // site is not an overlap: rows it lands after this point reach the new slot through its
-        // own derived cascade, and rows already present are this job's to compute.
-        //
-        // This stays a query rather than becoming the enqueue's `dedupe_key`: the key is released
-        // when the worker claims the row, so it coalesces only while a job is queued, and the
-        // skip has to hold while one is running too.
+        // derived site_parameter is assigned, as a durable `derived_assignment` job. The key
+        // coalesces a second assignment at this site while the first waits; once one is running it
+        // may have read the slots before this one, so this one gets a run of its own.
         if entity.entry_mode == "tool"
             && let Some(calculation_id) = calculation_producing(db, entity.parameter_id).await?
         {
             let site_id = entity.site_id;
-
-            let in_flight = reprocessing_jobs::Entity::find()
-                .filter(
-                    reprocessing_jobs::Column::Status
-                        .is_in(["queued", "pending", "running", "retrying"]),
-                )
-                .filter(
-                    reprocessing_jobs::Column::TriggerType
-                        .is_in(["derived_assignment", "derived_recompute"]),
-                )
-                .filter(reprocessing_jobs::Column::TriggerId.eq(calculation_id))
-                .select_only()
-                .column(reprocessing_jobs::Column::Id)
-                .into_tuple::<Uuid>()
-                .one(db)
-                .await
-                .map_err(ApiError::database)?;
-
-            if in_flight.is_some() {
-                tracing::info!(
-                    %calculation_id, %site_id,
-                    "Skipping derived assignment backfill: this calculation's backfill is already in flight"
-                );
-            } else {
-                crate::routes::private::reprocessing_jobs::service::enqueue(
-                    db,
-                    "derived_assignment",
-                    None,
-                    Some(calculation_id),
-                    &serde_json::json!({ "calculation_id": calculation_id, "site_id": site_id }),
-                    None,
-                )
-                .await
-                .map_err(ApiError::database)?;
-            }
+            crate::routes::private::reprocessing_jobs::service::enqueue(
+                db,
+                "derived_assignment",
+                None,
+                Some(calculation_id),
+                &serde_json::json!({ "calculation_id": calculation_id, "site_id": site_id }),
+                Some(&assignment_dedupe_key(calculation_id, site_id)),
+            )
+            .await
+            .map_err(ApiError::database)?;
         }
 
         Ok(())
@@ -841,6 +809,12 @@ pub(crate) async fn delete_source<C: ConnectionTrait>(
         .map_err(AppError::Database)?;
 
     Ok(())
+}
+
+/// The key a calculation's backfill at one site is enqueued under: another site's assignment of
+/// the same calculation is its own job.
+pub(super) fn assignment_dedupe_key(calculation_id: Uuid, site_id: Uuid) -> String {
+    format!("derived_assignment:{calculation_id}:{site_id}")
 }
 
 #[cfg(test)]
