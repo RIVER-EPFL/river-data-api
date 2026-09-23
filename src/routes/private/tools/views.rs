@@ -26,8 +26,9 @@ use super::models::{
     DraftRunRequest, DraftRunResponse, DraftRunResults, Engine, FormulaDraftRunRequest,
     FormulaDraftRunResponse, FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse,
     LintFinding, MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse,
-    SavedFormula, SavedSharedStep, ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest,
-    ValidateResponse, VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
+    SavedFormula, SavedSharedStep, ToolCalculation, ToolDescriptor, ToolResult,
+    UpdateScriptRequest, ValidateResponse, VersionLedgerRow, VersionUsage, parse_manifest,
+    reconcile_manifest,
 };
 use super::service::{
     FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
@@ -858,24 +859,20 @@ pub async fn activate_version(
         .filter(script_entity::Column::Id.eq(id))
         .exec(&txn)
         .await?;
+    // The correcting arm reaches exactly the visits the superseded version produced values at
+    // (Q170), and commits with the activation, so a job that cannot be queued activates nothing.
+    super::service::recompute_after_activation(
+        &txn,
+        payload.migrate_stored,
+        &current.name,
+        id,
+        current.active_version_id,
+    )
+    .await?;
     txn.commit().await?;
     let script = load_script(&state, id).await?;
     // The audit is the backstop under either arm: it reports what the activation left disagreeing.
     audit_after_activation(&state.db, &script.name).await;
-    // The correcting arm reaches exactly the visits the superseded version produced values at
-    // (Q170). It is enqueued after the commit, so a failure here leaves the activation standing
-    // and the audit's findings say what was not repaired.
-    if let Err(e) = super::service::recompute_after_activation(
-        &state.db,
-        payload.migrate_stored,
-        &script.name,
-        id,
-        current.active_version_id,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, calculation = %script.name, "failed to enqueue the version migration");
-    }
     Ok(Json(ActivateResponse { script, lint }))
 }
 

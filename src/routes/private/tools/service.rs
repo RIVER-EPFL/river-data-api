@@ -4322,7 +4322,7 @@ pub async fn calculation_health(
     for row in &visits {
         entry(&mut by_tool, &row.tool).stale_visits += 1;
     }
-    for (tool, repair) in latest_repairs(db).await? {
+    for (tool, repair) in latest_repairs(db, site_ids).await? {
         entry(&mut by_tool, &tool).repair = Some(repair);
     }
     let mut out: Vec<CalculationHealth> = by_tool.into_values().collect();
@@ -4331,16 +4331,27 @@ pub async fn calculation_health(
 }
 
 /// Each calculation's latest `event_recompute` run that still needs watching, keyed by the
-/// calculation name the Recompute action writes into the job's params.
-async fn latest_repairs(db: &DatabaseConnection) -> AppResult<Vec<(String, CalculationRepair)>> {
+/// calculation name the Recompute action writes into the job's params. Given `site_ids`, a run
+/// naming a site outside them is left out; one naming no site is global, as a job listing reads it.
+async fn latest_repairs(
+    db: &DatabaseConnection,
+    site_ids: Option<&[Uuid]>,
+) -> AppResult<Vec<(String, CalculationRepair)>> {
     use crate::routes::private::reprocessing_jobs::models::job;
     use sea_orm::sea_query::ExprTrait as _;
     use sea_orm::sea_query::extension::postgres::PgExpr as _;
 
     let calculation = || Expr::col(job::Column::Params).cast_json_field("calculation");
+    let site = || Expr::col(job::Column::Params).cast_json_field("site_id");
+    let in_scope = site_ids.map(|ids| {
+        Condition::any()
+            .add(site().is_null())
+            .add(site().is_in(ids.iter().map(ToString::to_string)))
+    });
     let runs = job::Entity::find()
         .filter(job::Column::TriggerType.eq("event_recompute"))
         .filter(calculation().is_not_null())
+        .filter(Condition::all().add_option(in_scope))
         .order_by_desc(job::Column::CreatedAt)
         .all(db)
         .await?;

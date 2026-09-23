@@ -80,6 +80,17 @@ pub struct RollbackDeploymentResponse {
     pub job_id: Uuid,
 }
 
+/// One `attribution` decision per reading a rollback is about to release from `deployment_id`.
+fn rollback_ledger(deployment_id: Uuid) -> sea_orm::sea_query::InsertStatement {
+    readings::service::column_ledger(
+        readings::models::Kind::Attribution,
+        Condition::all().add(readings::models::Column::DeploymentId.eq(deployment_id)),
+        readings::models::Column::DeploymentId,
+        Expr::val(Option::<Uuid>::None),
+        "deployment rolled back",
+    )
+}
+
 /// Undo the most recent sensor deployment, reassigning its readings back to the previous
 /// deployment's site. Used after an accidentally-created deployment. Requires `write_data`.
 #[utoipa::path(
@@ -145,6 +156,7 @@ pub async fn rollback_deployment(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
+    crate::common::bulk_write::mutation_rows(&txn, rollback_ledger(payload.deployment_id)).await?;
     let readings_reassigned = readings::Entity::update_many()
         .col_expr(
             readings::Column::DeploymentId,

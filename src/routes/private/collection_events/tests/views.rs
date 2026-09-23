@@ -110,18 +110,3 @@ mod repeated_visits {
         assert!(repeated_visits(&[]).is_empty());
     }
 }
-
-#[test]
-fn test_cell_curves_is_each_distinct_curve_in_replicate_order() {
-    let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
-    let names =
-        std::collections::HashMap::from([(a, Some("Curve 2026-03".to_string())), (b, None)]);
-    let curves = cell_curves(&[b, a, b], &names);
-    let got: Vec<(Uuid, Option<&str>)> = curves.iter().map(|c| (c.id, c.name.as_deref())).collect();
-    assert_eq!(got, vec![(b, None), (a, Some("Curve 2026-03"))]);
-}
-
-#[test]
-fn test_cell_curves_is_empty_for_an_uncorrected_cell() {
-    assert!(cell_curves(&[], &std::collections::HashMap::new()).is_empty());
-}

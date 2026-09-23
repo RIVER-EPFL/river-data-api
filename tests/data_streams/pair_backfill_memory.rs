@@ -91,6 +91,20 @@ async fn test_pair_backfill_executor_memory_stays_flat() {
         peak < EXECUTOR_BOUND_BYTES,
         "ExecutorState peaked at {peak} bytes over {READINGS} readings"
     );
+    assert_eq!(
+        crate::common::e2e::count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM reading_decisions \
+                 WHERE stream_id = '{stream}' AND kind = 'attribution' AND reason = 'paired' \
+                   AND old ->> 'site_id' IS NULL AND new ->> 'site_id' = '{}'",
+                crate::common::SITE1_ID
+            ),
+        )
+        .await,
+        i64::from(READINGS),
+        "every reading the pairing attributed records where its attribution came from"
+    );
 }
 
 /// Scenario: the stream is unpaired again, so the teardown releases the same history.

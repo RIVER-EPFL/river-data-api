@@ -839,26 +839,19 @@ impl CsvImport {
 /// Decompression-safe: portal/lab history lives in compressed (>30-day) chunks.
 pub struct MeasurementRetag;
 
-/// The rewrite a `measurement_retag` run makes. `target` is the classification every reading in
-/// scope takes; `None` is the 'declared' arm, which joins each reading to its stream and takes the
-/// stream's own. The scope also matches by stream ownership: a reading ingested before attribution
-/// backfill carries `sensor_id` NULL and belongs to the sensor's streams all the same.
-fn retag_readings(
-    target: Option<&str>,
+/// The readings a `measurement_retag` run covers. The scope also matches by stream ownership: a
+/// reading ingested before attribution backfill carries `sensor_id` NULL and belongs to the
+/// sensor's streams all the same.
+fn retag_scope(
     sensor_ids: &[Uuid],
     stream_ids: &[Uuid],
     source_system: Option<&str>,
-) -> crate::common::bulk_write::Spanned {
+) -> sea_query::Condition {
     use crate::routes::private::data_streams::models as data_streams;
     use crate::routes::private::readings::models as readings;
     use sea_orm::sea_query::ExprTrait;
 
     let r = sea_query::Alias::new("readings");
-    let ds = sea_query::Alias::new("data_streams");
-    let col = |alias: &sea_query::Alias, column: readings::Column| {
-        sea_query::Expr::col((alias.clone(), column))
-    };
-
     let streams_of = |predicate: sea_query::Expr| {
         sea_query::Query::select()
             .column(data_streams::Column::Id)
@@ -867,55 +860,90 @@ fn retag_readings(
             .to_owned()
     };
     let mut scope = sea_query::Condition::any()
-        .add(col(&r, readings::Column::SensorId).is_in(sensor_ids.to_vec()))
-        .add(col(&r, readings::Column::StreamId).is_in(stream_ids.to_vec()))
-        .add(col(&r, readings::Column::StreamId).in_subquery(streams_of(
-            sea_query::Expr::col(data_streams::Column::SensorId).is_in(sensor_ids.to_vec()),
-        )));
+        .add(
+            sea_query::Expr::col((r.clone(), readings::Column::SensorId))
+                .is_in(sensor_ids.to_vec()),
+        )
+        .add(
+            sea_query::Expr::col((r.clone(), readings::Column::StreamId))
+                .is_in(stream_ids.to_vec()),
+        )
+        .add(
+            sea_query::Expr::col((r.clone(), readings::Column::StreamId)).in_subquery(streams_of(
+                sea_query::Expr::col(data_streams::Column::SensorId).is_in(sensor_ids.to_vec()),
+            )),
+        );
     if let Some(system) = source_system {
-        scope = scope.add(col(&r, readings::Column::StreamId).in_subquery(streams_of(
-            sea_query::Expr::col(data_streams::Column::SourceSystem).eq(system),
-        )));
+        scope = scope.add(
+            sea_query::Expr::col((r, readings::Column::StreamId)).in_subquery(streams_of(
+                sea_query::Expr::col(data_streams::Column::SourceSystem).eq(system),
+            )),
+        );
     }
+    scope
+}
 
-    // What the write changes and what the span reads are the same rows, so the predicate is built
-    // once: the `declared` arm joins `data_streams` to compare against each stream's own value.
-    let changing = || {
-        match target {
+/// The classification a retag gives each reading: `target`, or on the 'declared' arm (`None`)
+/// the reading's own stream's.
+fn retag_value(target: Option<&str>) -> sea_query::Expr {
+    use crate::routes::private::data_streams::models as data_streams;
+
+    match target {
+        Some(value) => sea_query::Expr::val(value),
+        None => sea_query::Expr::col((
+            sea_query::Alias::new("data_streams"),
+            data_streams::Column::MeasurementType,
+        )),
+    }
+}
+
+/// The readings in scope a retag changes. The 'declared' arm joins `data_streams` to compare
+/// against each stream's own value, so every statement over these rows names that table too.
+fn retag_changing(target: Option<&str>) -> sea_query::Condition {
+    use crate::routes::private::data_streams::models as data_streams;
+    use crate::routes::private::readings::models as readings;
+    use sea_orm::sea_query::ExprTrait;
+
+    let ds = sea_query::Alias::new("data_streams");
+    match target {
         // sea-query has no IS DISTINCT FROM, and a NULL measurement_type reads as continuous, so
         // the comparison cannot be a plain inequality.
         Some(value) => sea_query::Condition::all().add(sea_query::Expr::cust(format!(
             r#""readings"."measurement_type" IS DISTINCT FROM '{value}'"#
         ))),
         None => sea_query::Condition::all()
-            .add(col(&r, readings::Column::StreamId).equals((ds.clone(), data_streams::Column::Id)))
             .add(
-                sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType))
-                    .is_not_null(),
+                sea_query::Expr::col((sea_query::Alias::new("readings"), readings::Column::StreamId))
+                    .equals((ds.clone(), data_streams::Column::Id)),
             )
+            .add(sea_query::Expr::col((ds, data_streams::Column::MeasurementType)).is_not_null())
             .add(sea_query::Expr::cust(
                 r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#,
             )),
     }
-    };
+}
 
+/// The rewrite a `measurement_retag` run makes. `target` is the classification every reading in
+/// scope takes; `None` is the 'declared' arm, which takes each reading's stream's own.
+fn retag_readings(
+    target: Option<&str>,
+    sensor_ids: &[Uuid],
+    stream_ids: &[Uuid],
+    source_system: Option<&str>,
+) -> crate::common::bulk_write::Spanned {
+    use crate::routes::private::data_streams::models as data_streams;
+    use crate::routes::private::readings::models as readings;
+
+    let scope = retag_scope(sensor_ids, stream_ids, source_system);
     let mut update = sea_query::Query::update();
-    update.table(readings::Entity);
-    match target {
-        Some(value) => {
-            update.value(readings::Column::MeasurementType, value);
-        }
-        None => {
-            update
-                .value(
-                    readings::Column::MeasurementType,
-                    sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType)),
-                )
-                .from(data_streams::Entity);
-        }
+    update
+        .table(readings::Entity)
+        .value(readings::Column::MeasurementType, retag_value(target));
+    if target.is_none() {
+        update.from(data_streams::Entity);
     }
     let update = update
-        .cond_where(changing())
+        .cond_where(retag_changing(target))
         .cond_where(scope.clone())
         .to_owned();
 
@@ -924,9 +952,58 @@ fn retag_readings(
     if target.is_none() {
         rows.from(data_streams::Entity);
     }
-    let rows = rows.cond_where(changing()).cond_where(scope).to_owned();
+    let rows = rows
+        .cond_where(retag_changing(target))
+        .cond_where(scope)
+        .to_owned();
 
     crate::common::bulk_write::Spanned::new(rows, update)
+}
+
+/// The ledger rows a retag owes: one `retag` decision per reading [`retag_readings`] is about to
+/// move, naming the classification on each side and the run, inserted before the write.
+fn retag_ledger(
+    target: Option<&str>,
+    sensor_ids: &[Uuid],
+    stream_ids: &[Uuid],
+    source_system: Option<&str>,
+    job_id: Option<Uuid>,
+) -> sea_query::InsertStatement {
+    use crate::routes::private::data_streams::models as data_streams;
+    use crate::routes::private::readings::models as readings;
+    use crate::routes::private::readings::service::{columns_object, derivation_ledger};
+
+    let r = sea_query::Alias::new("readings");
+    let mut moving = sea_query::Query::select();
+    moving
+        .column((r.clone(), readings::Column::StreamId))
+        .column((r.clone(), readings::Column::Time))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .expr_as(
+            columns_object(vec![(
+                "measurement_type",
+                sea_query::Expr::col((r, readings::Column::MeasurementType)),
+            )]),
+            sea_query::Alias::new("old"),
+        )
+        .expr_as(
+            columns_object(vec![("measurement_type", retag_value(target))]),
+            sea_query::Alias::new("new"),
+        )
+        .from(readings::Entity);
+    if target.is_none() {
+        moving.from(data_streams::Entity);
+    }
+    let moving = moving
+        .cond_where(retag_changing(target))
+        .cond_where(retag_scope(sensor_ids, stream_ids, source_system))
+        .to_owned();
+    derivation_ledger(
+        crate::routes::private::readings::models::Kind::Retag,
+        moving,
+        None,
+        job_id,
+    )
 }
 
 #[async_trait]
@@ -1004,17 +1081,26 @@ impl Job for MeasurementRetag {
 
         ctx.info(&format!("Retagging readings in scope to '{target}'"))
             .await;
-        let touched = crate::common::bulk_write::guarded_mutation(
-            ctx.db(),
-            retag_readings(
-                declared
-                    .then_some(())
-                    .map_or(Some(target.as_str()), |()| None),
-                &sensor_ids,
-                &stream_ids,
-                source_system.as_deref(),
-            ),
-        )
+        let fixed = (!declared).then_some(target.as_str());
+        let job_id = ctx.job_id();
+        let touched = crate::common::bulk_write::guarded(ctx.db(), async |txn| {
+            crate::common::bulk_write::mutation_rows(
+                txn,
+                retag_ledger(
+                    fixed,
+                    &sensor_ids,
+                    &stream_ids,
+                    source_system.as_deref(),
+                    Some(job_id),
+                ),
+            )
+            .await?;
+            crate::common::bulk_write::mutation(
+                txn,
+                retag_readings(fixed, &sensor_ids, &stream_ids, source_system.as_deref()),
+            )
+            .await
+        })
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;
         let retagged = touched.rows;

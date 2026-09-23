@@ -484,6 +484,94 @@ async fn the_sweep_reports_the_visits_whose_inputs_it_moved() {
     assert_eq!(events[0].source, "manual");
 }
 
+/// An enabled calculation whose only event input is the dissolved oxygen the grabs here enter.
+async fn install_calculation(db: &DatabaseConnection) {
+    for sql in [
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name = 'reprocessrecompute'",
+        "DELETE FROM tool_script_versions v USING tool_scripts s \
+          WHERE v.tool_script_id = s.id AND s.name = 'reprocessrecompute'",
+        "DELETE FROM tool_scripts WHERE name = 'reprocessrecompute'",
+    ] {
+        crate::common::exec(db, sql).await;
+    }
+    let manifest = serde_json::json!({
+        "label": "Reprocess recompute",
+        "params": [{ "name": "o", "label": "O", "kind": "number", "required": true }],
+        "event_inputs": [{ "param": "o", "parameter_code": "Dissolved_O2" }],
+        "outputs": [{ "key": "out", "label": "Out", "suggested_parameter_code": "ReprocessRecomputeOut" }],
+    });
+    for statement in [
+        Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO tool_scripts (name, label, created_by) \
+             VALUES ('reprocessrecompute', 'Reprocess recompute', 'test')"
+                .to_string(),
+        ),
+        Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO tool_script_versions
+                  (tool_script_id, version_no, script, entry_function, manifest, test_cases,
+                   content_hash, created_by, validated_at)
+              SELECT s.id, 1, $1, 'tool', $2::jsonb, '{}'::jsonb, md5($1), 'test', now()
+              FROM tool_scripts s WHERE s.name = 'reprocessrecompute'",
+            [
+                "tool <- function(inputs, constants, curves) list(out = 1)".into(),
+                manifest.to_string().into(),
+            ],
+        ),
+        Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE tool_scripts s SET active_version_id = v.id
+              FROM tool_script_versions v
+              WHERE v.tool_script_id = s.id AND s.name = 'reprocessrecompute'"
+                .to_string(),
+        ),
+    ] {
+        db.execute_raw(statement)
+            .await
+            .expect("calculation installed");
+    }
+}
+
+/// Scenario: a reprocess moves a grab's corrected value onto its curve's current coefficients,
+/// and a calculation at the grab's visit reads that value (Q108).
+///
+/// Expected behaviour: the reprocess queues the visit's recompute, as the drift sweep does, rather
+/// than leaving the calculation on the old number with nothing left for the sweep to find.
+#[tokio::test]
+#[serial]
+async fn a_reprocess_that_moves_a_grab_recomputes_the_visit_that_reads_it() {
+    let (db, app, token) = setup().await;
+    let (sensor, calibration) = deployed_lab_sensor(&db, 2.0, 1.0).await;
+    post_grab(&app, &token, sensor, None, 10.0).await;
+    install_calculation(&db).await;
+
+    crate::common::exec(
+        &db,
+        &format!("UPDATE sensor_calibrations SET slope = 5.0 WHERE id = '{calibration}'"),
+    )
+    .await;
+    river_db::routes::private::sensor_calibrations::service::reprocess_sensor_readings(
+        &db, sensor, None, None,
+    )
+    .await
+    .expect("reprocess runs");
+    assert_eq!(stored(&db).await, (10.0, Some(51.0)), "5 * 10 + 1");
+
+    let queued = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM reprocessing_jobs j \
+               JOIN readings r ON r.collection_event_id = j.trigger_id \
+              WHERE j.trigger_type = 'event_recompute' \
+                AND r.site_id = '{SITE1_ID}' AND r.parameter_id = '{GLOBAL_PARAM_DO_ID}' \
+                AND r.time = '{GRAB_TIME}'"
+        ),
+    )
+    .await;
+    assert_eq!(queued, 1, "the visit whose input moved is recomputed");
+}
+
 /// Scenario: the sweep changes a stored value, and the ledger is the one place a value's history
 /// is read from (Q118).
 /// Expected behaviour: the move is recorded as a `curve_recompose` decision naming both numbers,

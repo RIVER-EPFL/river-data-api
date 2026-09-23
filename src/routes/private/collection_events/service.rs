@@ -1,14 +1,13 @@
 //! Collection event queries: the CRUD guard, the attach helper every spot write path lands
-//! through, the SQL fragments the visit lists are built from, and the recompute state a visit is
-//! listed with.
+//! through, the visit lists and their grid, and the recompute state a visit is listed with.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::sea_query::{
-    Alias, Expr, ExprTrait, IntoTableRef, JoinType, OnConflict, PostgresQueryBuilder,
-    Query as SeaQuery,
+    Alias, Expr, ExprTrait, IntoTableRef, JoinType, OnConflict, Order, PostgresQueryBuilder,
+    Query as SeaQuery, SelectStatement,
 };
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult,
@@ -16,12 +15,20 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use super::models::{CollectionEvent, StagedEvent};
+use super::models::{
+    CollectionEvent, ExpectedParameter, StagedEvent, VisitCell, VisitCellCurve, VisitListRow,
+    VisitReplicate, VisitRow,
+};
 use crate::common::bulk_write;
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::site_parameters::models as site_parameters;
+use crate::routes::private::sites::models as sites;
+use crate::routes::private::standard_curves::models as standard_curves;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 
@@ -435,38 +442,114 @@ pub(super) fn paging(page: Option<u64>, page_size: Option<u64>) -> Option<Window
     ))
 }
 
-pub(super) fn range_clause(
+fn s() -> Alias {
+    Alias::new("s")
+}
+
+/// The visits a listing covers: at the site when one is named, in the caller's projects when the
+/// scope is restricted, and collected within the bounds given.
+#[must_use]
+pub(super) fn visit_filter(
+    site_id: Option<Uuid>,
+    projects: Option<Vec<Uuid>>,
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
-    binds: &mut Vec<sea_orm::Value>,
-) -> String {
-    let mut range = String::new();
-    if let Some(start) = start {
-        binds.push(start.into());
-        range.push_str(&format!(" AND ce.collected_at >= ${}", binds.len()));
-    }
-    if let Some(end) = end {
-        binds.push(end.into());
-        range.push_str(&format!(" AND ce.collected_at <= ${}", binds.len()));
-    }
-    range
+) -> Condition {
+    Condition::all()
+        .add_option(site_id.map(|id| Expr::col((ce(), super::Column::SiteId)).eq(id)))
+        .add_option(projects.map(|ids| Expr::col((s(), sites::Column::ProjectId)).is_in(ids)))
+        .add_option(start.map(|at| Expr::col((ce(), super::Column::CollectedAt)).gte(at)))
+        .add_option(end.map(|at| Expr::col((ce(), super::Column::CollectedAt)).lte(at)))
 }
 
-pub(super) fn limit_clause(paging: Option<Window>, binds: &mut Vec<sea_orm::Value>) -> String {
-    let Some(window) = paging else {
-        return String::new();
-    };
-    binds.push((window.limit as i64).into());
-    let limit_ref = binds.len();
-    binds.push((window.offset as i64).into());
-    format!(" LIMIT ${limit_ref} OFFSET ${}", binds.len())
+/// `collection_events` as `ce` beside its site as `s`, narrowed to `filter`.
+fn visits_where(filter: Condition) -> SelectStatement {
+    SeaQuery::select()
+        .from_as(super::Entity, ce())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s(),
+            Expr::col((s(), sites::Column::Id)).equals((ce(), super::Column::SiteId)),
+        )
+        .cond_where(filter)
+        .to_owned()
 }
 
-/// The `ORDER BY` a sort name resolves to; the secondary key keeps ties stable.
-pub(super) fn visit_list_order(sort: Option<&str>, order: Option<&str>) -> AppResult<String> {
+/// The columns a listed visit carries: its own, and the fill and finding counts over it.
+fn visit_headers(filter: Condition, paging: Option<Window>) -> SelectStatement {
+    let mut query = visits_where(filter);
+    query
+        .columns(
+            [
+                super::Column::Id,
+                super::Column::SiteId,
+                super::Column::CollectedAt,
+                super::Column::Source,
+                super::Column::CreatedBy,
+                super::Column::Notes,
+                super::Column::Unverified,
+                super::Column::WithdrawnAt,
+            ]
+            .map(|c| (ce(), c)),
+        )
+        .expr_as(
+            Expr::col((s(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr(Expr::cust(visit_count_columns()));
+    if let Some(window) = paging {
+        query.limit(window.limit).offset(window.offset);
+    }
+    query
+}
+
+/// How many visits `filter` covers.
+pub async fn count_visits(db: &DatabaseConnection, filter: Condition) -> AppResult<u64> {
+    let mut query = visits_where(filter);
+    query.expr_as(
+        Expr::col((ce(), super::Column::Id)).count(),
+        Alias::new("n"),
+    );
+    let n = CountRow::find_by_statement(sea_orm::DatabaseBackend::Postgres.build(&query))
+        .one(db)
+        .await?
+        .map_or(0, |r| r.n);
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
+/// A page of the visits `filter` covers in `order`, with their fill and finding counts.
+pub async fn visit_headers_page(
+    db: &DatabaseConnection,
+    filter: Condition,
+    order: &[(Expr, Order)],
+    paging: Option<Window>,
+) -> AppResult<Vec<VisitHeader>> {
+    let mut query = visit_headers(filter, paging);
+    for (expr, direction) in order {
+        query.order_by_expr(expr.clone(), direction.clone());
+    }
+    Ok(
+        VisitHeader::find_by_statement(sea_orm::DatabaseBackend::Postgres.build(&query))
+            .all(db)
+            .await?,
+    )
+}
+
+/// A site's visits newest first, the order its grid shows them in.
+#[must_use]
+pub(super) fn newest_first() -> Vec<(Expr, Order)> {
+    vec![(Expr::col((ce(), super::Column::CollectedAt)), Order::Desc)]
+}
+
+/// The order a sort name resolves to; the trailing keys keep ties stable.
+pub(super) fn visit_list_order(
+    sort: Option<&str>,
+    order: Option<&str>,
+) -> AppResult<Vec<(Expr, Order)>> {
     let direction = match order.unwrap_or("desc") {
-        "asc" => "ASC",
-        "desc" => "DESC",
+        "asc" => Order::Asc,
+        "desc" => Order::Desc,
         other => {
             return Err(AppError::BadRequest(format!(
                 "order must be asc or desc, not {other}"
@@ -474,10 +557,10 @@ pub(super) fn visit_list_order(sort: Option<&str>, order: Option<&str>) -> AppRe
         }
     };
     let column = match sort.unwrap_or("collected_at") {
-        "collected_at" => "ce.collected_at",
-        "parameters_filled" => "filled",
-        "findings_open" => "findings_open",
-        "site_name" => "s.name",
+        "collected_at" => Expr::col((ce(), super::Column::CollectedAt)),
+        "parameters_filled" => Expr::col(Alias::new("filled")),
+        "findings_open" => Expr::col(Alias::new("findings_open")),
+        "site_name" => Expr::col((s(), sites::Column::Name)),
         other => {
             return Err(AppError::BadRequest(format!(
                 "sort must be collected_at, parameters_filled, findings_open or site_name, \
@@ -485,7 +568,71 @@ pub(super) fn visit_list_order(sort: Option<&str>, order: Option<&str>) -> AppRe
             )));
         }
     };
-    Ok(format!("{column} {direction}, ce.collected_at DESC, ce.id"))
+    Ok(vec![
+        (column, direction),
+        (Expr::col((ce(), super::Column::CollectedAt)), Order::Desc),
+        (Expr::col((ce(), super::Column::Id)), Order::Asc),
+    ])
+}
+
+/// A listed visit's header row, as [`visit_headers`] selects it.
+#[derive(Debug, FromQueryResult)]
+pub struct VisitHeader {
+    pub id: Uuid,
+    pub site_id: Uuid,
+    pub site_name: String,
+    pub collected_at: DateTime<Utc>,
+    pub source: String,
+    pub created_by: Option<String>,
+    pub notes: Option<String>,
+    pub unverified: bool,
+    pub withdrawn_at: Option<DateTime<Utc>>,
+    pub filled: i64,
+    pub findings_open: i64,
+    #[sea_orm(skip)]
+    pub recompute: String,
+}
+
+impl From<VisitHeader> for VisitRow {
+    fn from(h: VisitHeader) -> Self {
+        Self {
+            id: h.id,
+            collected_at: h.collected_at,
+            source: h.source,
+            created_by: h.created_by,
+            notes: h.notes,
+            parameters_filled: h.filled,
+            findings_open: h.findings_open,
+            unverified: h.unverified,
+            withdrawn_at: h.withdrawn_at,
+            recompute: h.recompute,
+            cells: Vec::new(),
+        }
+    }
+}
+
+impl From<VisitHeader> for VisitListRow {
+    fn from(h: VisitHeader) -> Self {
+        Self {
+            id: h.id,
+            site_id: h.site_id,
+            site_name: h.site_name,
+            collected_at: h.collected_at,
+            source: h.source,
+            created_by: h.created_by,
+            notes: h.notes,
+            parameters_filled: h.filled,
+            findings_open: h.findings_open,
+            unverified: h.unverified,
+            withdrawn_at: h.withdrawn_at,
+            recompute: h.recompute,
+        }
+    }
+}
+
+#[derive(FromQueryResult)]
+struct CountRow {
+    n: i64,
 }
 
 #[derive(FromQueryResult)]
@@ -633,6 +780,521 @@ pub async fn status_for(
         );
     }
     Ok(out)
+}
+
+// --- Visit grid ---
+
+/// Fill each listed visit's grid cells from the page's readings, samples and open findings.
+pub async fn fill_visit_cells(db: &DatabaseConnection, visits: &mut [VisitRow]) -> AppResult<()> {
+    let event_ids: Vec<Uuid> = visits.iter().map(|v| v.id).collect();
+    if event_ids.is_empty() {
+        return Ok(());
+    }
+    let cell_rows = visit_cell_rows(db, &event_ids).await?;
+    let measurements = replicate_measurements(db, &event_ids).await?;
+    let findings = open_findings_by_slot(db, &event_ids).await?;
+    let curve_names = curve_names(db, &cell_rows).await?;
+    place_cells(visits, cell_rows, &measurements, &findings, &curve_names);
+    Ok(())
+}
+
+/// The oldest open finding's kind and the count open, by (instant, parameter).
+type Findings = HashMap<(DateTime<Utc>, Uuid), (String, i64)>;
+
+/// A site's grid columns, each with the calculations reading it and the one writing it.
+pub async fn expected_parameters(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> AppResult<Vec<ExpectedParameter>> {
+    // The column set is every parameter the site's visits carry, plus every active slot configured
+    // on it, at any cadence. The first arm reads the readings through
+    // `collection_events` rather than by an unbounded DISTINCT over the hypertable, which pays a
+    // planning cost proportional to the chunk count on every page load; `samples` cannot speak for
+    // it, since a measurement taken once forms no row there. Taking the union means a parameter
+    // with no reading yet still gets a column, so its value has somewhere to render and the fill
+    // ratio cannot exceed its own denominator.
+    let p = Alias::new("p");
+    let sp = Alias::new("sp");
+    let measured_here = SeaQuery::select()
+        .column((Alias::new("r"), readings::Column::ParameterId))
+        .from_as(readings::Entity, Alias::new("r"))
+        .inner_join(
+            super::Entity,
+            Expr::col((super::Entity, super::Column::Id))
+                .equals((Alias::new("r"), readings::Column::CollectionEventId)),
+        )
+        .and_where(Expr::col((super::Entity, super::Column::SiteId)).eq(site_id))
+        .take();
+    let declared_here = SeaQuery::select()
+        .column(site_parameters::Column::ParameterId)
+        .from(site_parameters::Entity)
+        .and_where(Expr::col(site_parameters::Column::SiteId).eq(site_id))
+        .and_where(Expr::cust("COALESCE(is_active, true) = true"))
+        .take();
+    let expected_query = SeaQuery::select()
+        .distinct_on([(p.clone(), parameters::Column::Code)])
+        .column((p.clone(), parameters::Column::Id))
+        .column((p.clone(), parameters::Column::Code))
+        .column((p.clone(), parameters::Column::Name))
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::DefaultUnits)),
+            Alias::new("units"),
+        )
+        .column((sp.clone(), site_parameters::Column::DecimalPlaces))
+        .from_as(parameters::Entity, p.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((sp.clone(), site_parameters::Column::ParameterId))
+                        .equals((p.clone(), parameters::Column::Id)),
+                )
+                .add(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site_id)),
+        )
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((p.clone(), parameters::Column::Id)).in_subquery(measured_here))
+                .add(Expr::col((p.clone(), parameters::Column::Id)).in_subquery(declared_here)),
+        )
+        .order_by((p.clone(), parameters::Column::Code), Order::Asc)
+        .order_by((sp.clone(), site_parameters::Column::Id), Order::Asc)
+        .take();
+    let expected_rows =
+        ExpectedRow::find_by_statement(sea_orm::DatabaseBackend::Postgres.build(&expected_query))
+            .all(db)
+            .await?;
+    let mut expected_parameters = Vec::with_capacity(expected_rows.len());
+    for r in expected_rows {
+        expected_parameters.push(ExpectedParameter {
+            parameter_id: r.id,
+            code: r.code,
+            name: r.name,
+            units: r.units,
+            decimal_places: r.decimal_places,
+            written_by: None,
+            read_by: Vec::new(),
+        });
+    }
+    let columns: Vec<Uuid> = expected_parameters.iter().map(|p| p.parameter_id).collect();
+    let impacts = crate::routes::private::tools::service::calculations_fed_by(db, &columns).await?;
+    for column in &mut expected_parameters {
+        (column.read_by, column.written_by) = parameter_roles(&impacts, column.parameter_id);
+    }
+    Ok(expected_parameters)
+}
+
+/// Each listed visit's cells, one per (visit, parameter): the served value, the curation counts,
+/// the sample statistics and the replicates as parallel arrays.
+async fn visit_cell_rows(db: &DatabaseConnection, event_ids: &[Uuid]) -> AppResult<Vec<CellRow>> {
+    // The served value is the sample mean where a replicate group formed one, else the lowest
+    // unflagged replicate's own value. The aggregates stay `Expr::cust`: FILTER, BOOL_AND and
+    // the array subscript have no builder form.
+    let r = Alias::new("r");
+    let s_ = Alias::new("s");
+    let agg = |sql: &str, name: &str| (Expr::cust(sql.to_string()), Alias::new(name.to_string()));
+    let mut cell_query = SeaQuery::select();
+    cell_query
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::CollectionEventId)),
+            Alias::new("event_id"),
+        )
+        .column((r.clone(), readings::Column::ParameterId));
+    for (expr, name) in [
+        agg(
+            "COALESCE(MAX(s.mean), \
+             (ARRAY_AGG(COALESCE(r.calibrated_value, r.raw_value) ORDER BY r.replicate_index) \
+              FILTER (WHERE r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL))[1])",
+            "value",
+        ),
+        agg("BOOL_AND(r.is_flagged IS TRUE)", "all_flagged"),
+        agg("BOOL_AND(r.withdrawn_at IS NOT NULL)", "all_withdrawn"),
+        agg("COUNT(*)::bigint", "n_total"),
+        agg(
+            "COUNT(*) FILTER (WHERE r.is_flagged IS TRUE)::bigint",
+            "n_flagged",
+        ),
+        agg(
+            "COUNT(*) FILTER (WHERE r.withdrawn_at IS NOT NULL)::bigint",
+            "n_withdrawn",
+        ),
+        agg(
+            "COUNT(*) FILTER (WHERE r.unverified IS TRUE)::bigint",
+            "n_unverified",
+        ),
+        // A single measurement forms no `samples` row, and the serving arm reports it as
+        // n = 1 (`routes/public/views.rs`). Count what the mean would stand on, so the two
+        // surfaces agree and a lone excluded replicate still says zero.
+        agg(
+            "COALESCE(MAX(s.n), COUNT(*) FILTER (WHERE r.unverified IS NOT TRUE \
+               AND r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL)::int)",
+            "sample_n",
+        ),
+        agg("MAX(s.stdev)", "stdev"),
+        agg("MAX(s.median)", "median"),
+        agg("MAX(s.min_value)", "min_value"),
+        agg("MAX(s.max_value)", "max_value"),
+        // The replicates themselves, as parallel arrays in one index order: a composite array
+        // would decode by hand, and the four are read back together or not at all.
+        agg(
+            "ARRAY_AGG(r.replicate_index ORDER BY r.replicate_index)",
+            "replicate_indexes",
+        ),
+        agg(
+            "ARRAY_AGG(COALESCE(r.calibrated_value, r.raw_value) ORDER BY r.replicate_index)",
+            "replicate_values",
+        ),
+        agg(
+            "ARRAY_AGG(r.is_flagged IS TRUE ORDER BY r.replicate_index)",
+            "replicate_flagged",
+        ),
+        agg(
+            "ARRAY_AGG(r.withdrawn_at IS NOT NULL ORDER BY r.replicate_index)",
+            "replicate_withdrawn",
+        ),
+        agg(
+            "ARRAY_AGG(r.unverified IS TRUE ORDER BY r.replicate_index)",
+            "replicate_unverified",
+        ),
+        agg(
+            "ARRAY_AGG(r.stream_id ORDER BY r.replicate_index)",
+            "replicate_streams",
+        ),
+        agg("BOOL_OR(r.provenance IS NOT NULL)", "has_provenance"),
+        agg("MAX(r.provenance ->> 'tool')", "tool"),
+        agg("(MAX(r.provenance ->> 'run_id'))::uuid", "tool_run_id"),
+        agg(
+            "ARRAY_AGG(r.standard_curve_id ORDER BY r.replicate_index) \
+             FILTER (WHERE r.standard_curve_id IS NOT NULL)",
+            "replicate_curves",
+        ),
+    ] {
+        cell_query.expr_as(expr, name);
+    }
+    let cell_query = cell_query
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            s_.clone(),
+            Expr::col((s_.clone(), samples::Column::Id))
+                .equals((r.clone(), readings::Column::SampleId)),
+        )
+        .and_where(Expr::cust_with_values(
+            "r.collection_event_id = ANY($1)",
+            [event_ids.to_vec()],
+        ))
+        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).is_not_null())
+        .add_group_by([
+            Expr::col((r.clone(), readings::Column::CollectionEventId)),
+            Expr::col((r.clone(), readings::Column::ParameterId)),
+        ])
+        .take();
+    Ok(
+        CellRow::find_by_statement(sea_orm::DatabaseBackend::Postgres.build(&cell_query))
+            .all(db)
+            .await?,
+    )
+}
+
+/// The open findings at each listed visit, by (instant, parameter): the oldest one's kind and how
+/// many are open there.
+async fn open_findings_by_slot(db: &DatabaseConnection, event_ids: &[Uuid]) -> AppResult<Findings> {
+    let finding_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            // A hold is keyed on the slot (an event-audit finding) or on the stream that
+            // raised it (a statistics disagreement, a source modification, a brake). Both
+            // land at a visit's instant and both belong in its grid, so the stream's own
+            // pairing resolves the slot rather than the hold being skipped for lacking one.
+            // Oldest first, matching the detail endpoint, so the two grids cannot disagree
+            // about which finding a cell carries.
+            format!(
+                "SELECT COALESCE(h.parameter_id, sp.parameter_id) AS parameter_id, \
+                    h.group_time, h.kind, h.created_at \
+             FROM replicate_audit_holds h \
+             LEFT JOIN data_streams ds ON ds.id = h.stream_id \
+             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
+             JOIN collection_events ce \
+               ON ce.site_id = COALESCE(h.site_id, sp.site_id) \
+              AND ce.collected_at = h.group_time \
+             WHERE h.status = '{pending}' AND ce.id = ANY($1) \
+               AND COALESCE(h.parameter_id, sp.parameter_id) IS NOT NULL \
+             ORDER BY h.created_at",
+                pending = HoldStatus::Pending.as_str()
+            ),
+            [event_ids.to_vec().into()],
+        ))
+        .await?;
+    // Oldest wins, and the rest are counted: a cell carrying two open findings says so
+    // rather than picking one silently.
+    let mut findings: HashMap<(DateTime<Utc>, Uuid), (String, i64)> = HashMap::new();
+    for f in &finding_rows {
+        let f = VisitFindingRow::from_query_result(f, "")?;
+        findings
+            .entry((f.group_time.with_timezone(&Utc), f.parameter_id))
+            .and_modify(|(_, n)| *n += 1)
+            .or_insert((f.kind, 1));
+    }
+    Ok(findings)
+}
+
+/// Put each cell on its visit and each open finding on its cell, giving a finding with no cell (a
+/// missing output names a parameter with no readings) one of its own.
+fn place_cells(
+    visits: &mut [VisitRow],
+    cell_rows: Vec<CellRow>,
+    measurements: &HashMap<ReplicateAt, Measurement>,
+    findings: &Findings,
+    curve_names: &HashMap<Uuid, Option<String>>,
+) {
+    let mut by_event: HashMap<Uuid, Vec<VisitCell>> = HashMap::new();
+    for c in cell_rows {
+        let replicates = replicates_of(&c, measurements);
+        let curves = cell_curves(
+            c.replicate_curves.as_deref().unwrap_or_default(),
+            curve_names,
+        );
+        by_event.entry(c.event_id).or_default().push(VisitCell {
+            parameter_id: c.parameter_id,
+            value: c.value,
+            flagged: c.all_flagged.unwrap_or(false),
+            withdrawn: c.all_withdrawn.unwrap_or(false),
+            n_total: c.n_total,
+            n_flagged: c.n_flagged,
+            n_withdrawn: c.n_withdrawn,
+            n_unverified: c.n_unverified,
+            n: c.sample_n,
+            stdev: c.stdev,
+            median: c.median,
+            min: c.min_value,
+            max: c.max_value,
+            finding: None,
+            finding_count: None,
+            replicates,
+            has_provenance: c.has_provenance.unwrap_or(false),
+            tool: c.tool,
+            tool_run_id: c.tool_run_id,
+            curves,
+        });
+    }
+    for visit in visits.iter_mut() {
+        let mut cells = by_event.remove(&visit.id).unwrap_or_default();
+        for cell in &mut cells {
+            if let Some((kind, n)) = findings.get(&(visit.collected_at, cell.parameter_id)) {
+                cell.finding = Some(kind.clone());
+                cell.finding_count = (*n > 1).then_some(*n);
+            }
+        }
+        // A missing-output finding names a parameter with no readings; it still gets a cell.
+        for ((at, parameter_id), (kind, n)) in findings {
+            if *at == visit.collected_at && !cells.iter().any(|c| c.parameter_id == *parameter_id) {
+                cells.push(VisitCell {
+                    parameter_id: *parameter_id,
+                    value: None,
+                    flagged: false,
+                    withdrawn: false,
+                    n_total: 0,
+                    n_flagged: 0,
+                    n_withdrawn: 0,
+                    n_unverified: 0,
+                    n: None,
+                    stdev: None,
+                    median: None,
+                    min: None,
+                    max: None,
+                    finding: Some(kind.clone()),
+                    finding_count: (*n > 1).then_some(*n),
+                    replicates: Vec::new(),
+                    has_provenance: false,
+                    tool: None,
+                    tool_run_id: None,
+                    curves: Vec::new(),
+                });
+            }
+        }
+        visit.cells = cells;
+    }
+}
+
+/// A grid column as [`expected_parameters`] selects it.
+#[derive(FromQueryResult)]
+struct ExpectedRow {
+    id: Uuid,
+    code: String,
+    name: String,
+    units: Option<String>,
+    decimal_places: Option<i16>,
+}
+
+#[derive(FromQueryResult)]
+struct VisitFindingRow {
+    group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    parameter_id: Uuid,
+    kind: String,
+}
+
+#[derive(FromQueryResult)]
+struct CellRow {
+    event_id: Uuid,
+    parameter_id: Uuid,
+    value: Option<f64>,
+    all_flagged: Option<bool>,
+    all_withdrawn: Option<bool>,
+    n_total: i64,
+    n_flagged: i64,
+    n_withdrawn: i64,
+    n_unverified: i64,
+    sample_n: Option<i32>,
+    stdev: Option<f64>,
+    median: Option<f64>,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
+    replicate_indexes: Vec<i16>,
+    replicate_values: Vec<f64>,
+    replicate_flagged: Vec<bool>,
+    replicate_withdrawn: Vec<bool>,
+    replicate_unverified: Vec<bool>,
+    replicate_streams: Vec<Uuid>,
+    has_provenance: Option<bool>,
+    tool: Option<String>,
+    tool_run_id: Option<Uuid>,
+    replicate_curves: Option<Vec<Uuid>>,
+}
+
+/// The name of every curve the page's cells were corrected through, in one lookup.
+async fn curve_names(
+    db: &DatabaseConnection,
+    rows: &[CellRow],
+) -> AppResult<HashMap<Uuid, Option<String>>> {
+    let ids: std::collections::BTreeSet<Uuid> = rows
+        .iter()
+        .flat_map(|r| r.replicate_curves.iter().flatten().copied())
+        .collect();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(standard_curves::Entity::find()
+        .filter(standard_curves::Column::Id.is_in(ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect())
+}
+
+/// A cell's curves: each distinct one its replicates name, in replicate order.
+fn cell_curves(
+    replicate_curves: &[Uuid],
+    names: &HashMap<Uuid, Option<String>>,
+) -> Vec<VisitCellCurve> {
+    let mut curves: Vec<VisitCellCurve> = Vec::new();
+    for id in replicate_curves {
+        if curves.iter().any(|c| c.id == *id) {
+            continue;
+        }
+        curves.push(VisitCellCurve {
+            id: *id,
+            name: names.get(id).cloned().flatten(),
+        });
+    }
+    curves
+}
+
+/// A replicate's measurement before any curve, and the curves that correct it, as the page's one
+/// lookup selects it.
+#[derive(FromQueryResult)]
+struct Measurement {
+    collection_event_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    stream_id: Uuid,
+    replicate_index: i16,
+    raw_value: f64,
+    calibration_id: Option<Uuid>,
+    standard_curve_id: Option<Uuid>,
+}
+
+/// A listed replicate: its visit, parameter, stream and index.
+type ReplicateAt = (Uuid, Uuid, Uuid, i16);
+
+/// Every listed replicate's [`Measurement`].
+async fn replicate_measurements(
+    db: &DatabaseConnection,
+    event_ids: &[Uuid],
+) -> AppResult<HashMap<ReplicateAt, Measurement>> {
+    let rows = readings::Entity::find()
+        .select_only()
+        .columns([
+            readings::Column::CollectionEventId,
+            readings::Column::ParameterId,
+            readings::Column::StreamId,
+            readings::Column::ReplicateIndex,
+            readings::Column::RawValue,
+            readings::Column::CalibrationId,
+            readings::Column::StandardCurveId,
+        ])
+        .filter(readings::Column::CollectionEventId.is_in(event_ids.iter().copied()))
+        .into_model::<Measurement>()
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|m| {
+            let at = (
+                m.collection_event_id?,
+                m.parameter_id?,
+                m.stream_id,
+                m.replicate_index,
+            );
+            Some((at, m))
+        })
+        .collect())
+}
+
+/// The parallel arrays one `ARRAY_AGG` group returns, read back as replicates. They come out of one
+/// group over one ordering, so position `i` is the same replicate in each.
+fn replicates_of(
+    row: &CellRow,
+    measurements: &HashMap<ReplicateAt, Measurement>,
+) -> Vec<VisitReplicate> {
+    row.replicate_indexes
+        .iter()
+        .zip(&row.replicate_values)
+        .enumerate()
+        .map(|(i, (replicate_index, value))| {
+            let stream_id = row.replicate_streams.get(i).copied().unwrap_or_default();
+            let measured =
+                measurements.get(&(row.event_id, row.parameter_id, stream_id, *replicate_index));
+            VisitReplicate {
+                replicate_index: *replicate_index,
+                value: *value,
+                raw_value: measured.map_or(*value, |m| m.raw_value),
+                calibration_id: measured.and_then(|m| m.calibration_id),
+                standard_curve_id: measured.and_then(|m| m.standard_curve_id),
+                stream_id,
+                flagged: row.replicate_flagged.get(i).copied().unwrap_or(false),
+                withdrawn: row.replicate_withdrawn.get(i).copied().unwrap_or(false),
+                unverified: row.replicate_unverified.get(i).copied().unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
+/// Put each listed visit's recompute state on it, per [`status_for`].
+pub async fn attach_recompute_status(
+    db: &DatabaseConnection,
+    visits: &mut [VisitHeader],
+) -> AppResult<()> {
+    let ids: Vec<Uuid> = visits.iter().map(|v| v.id).collect();
+    let states = status_for(db, &ids).await?;
+    for visit in visits {
+        visit.recompute = states
+            .get(&visit.id)
+            .cloned()
+            .unwrap_or_else(|| "current".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

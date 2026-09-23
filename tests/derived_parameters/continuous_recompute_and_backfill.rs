@@ -496,6 +496,11 @@ async fn na_clears_the_value_the_formula_no_longer_produces_and_a_divide_by_zero
         "0 / 0 is NA, so the slot no longer serves 1.0"
     );
     assert_eq!(
+        latest_computation(&db, na_param, t).await,
+        Some(("formula_transition".to_string(), None)),
+        "the clearing is on the ledger, naming no value on its new side"
+    );
+    assert_eq!(
         poll_for_derived(&db, site_id, inf_param, t, 2).await,
         Some(0.02),
         "1 / 0 refuses, so the value that stands is left alone"
@@ -533,6 +538,45 @@ async fn na_clears_the_value_the_formula_no_longer_produces_and_a_divide_by_zero
     }
     assert_eq!(served, Some(-0.02), "1 / -50");
     assert_eq!(standing, None, "the repaired slot's finding is closed");
+
+    // -50 / -50: the cleared slot computes again, and its return is on the ledger too.
+    assert_eq!(
+        poll_for_derived(&db, site_id, na_param, t, POLL_DEADLINE_SECS).await,
+        Some(1.0)
+    );
+    assert_eq!(
+        latest_computation(&db, na_param, t).await,
+        Some(("derived_computed".to_string(), Some(1.0))),
+        "a slot computed again after it was cleared is a second arrival"
+    );
+}
+
+/// The newest computation decision on a derived slot's reading, whatever its site now, and the
+/// value it names.
+async fn latest_computation(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+    time: DateTime<Utc>,
+) -> Option<(String, Option<f64>)> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.kind, (d.new->>'raw_value')::float8 AS raw_value \
+               FROM reading_decisions d \
+               JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time \
+                AND r.replicate_index = d.replicate_index \
+              WHERE r.parameter_id = $1 AND r.time = $2 AND r.measurement_type = 'derived' \
+                AND d.kind IN ('formula_transition', 'derived_computed') \
+              ORDER BY d.seq DESC LIMIT 1",
+            [parameter_id.into(), time.into()],
+        ))
+        .await
+        .expect("ledger query")?;
+    Some((
+        row.try_get::<String>("", "kind").expect("kind"),
+        row.try_get::<Option<f64>>("", "raw_value")
+            .expect("raw_value"),
+    ))
 }
 
 /// One formula of a set, posted to its calculation. A step declares `intermediate`, an output

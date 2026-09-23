@@ -190,13 +190,31 @@ async fn claim_unparameterised<C: ConnectionTrait>(
     sensor_id: Uuid,
     parameter_id: Uuid,
 ) -> AppResult<()> {
+    crate::common::bulk_write::mutation_rows(conn, claim_ledger(sensor_id, parameter_id)).await?;
     readings::Entity::update_many()
         .col_expr(readings::Column::ParameterId, Expr::value(parameter_id))
-        .filter(readings::Column::SensorId.eq(sensor_id))
-        .filter(readings::Column::ParameterId.is_null())
+        .filter(unparameterised(sensor_id))
         .exec(conn)
         .await?;
     Ok(())
+}
+
+/// The sensor's readings that name no parameter yet.
+fn unparameterised(sensor_id: Uuid) -> sea_orm::Condition {
+    sea_orm::Condition::all()
+        .add(readings::Column::SensorId.eq(sensor_id))
+        .add(readings::Column::ParameterId.is_null())
+}
+
+/// One `attribution` decision per reading [`claim_unparameterised`] is about to give a parameter.
+fn claim_ledger(sensor_id: Uuid, parameter_id: Uuid) -> sea_orm::sea_query::InsertStatement {
+    crate::routes::private::readings::service::column_ledger(
+        crate::routes::private::readings::models::Kind::Attribution,
+        unparameterised(sensor_id),
+        readings::Column::ParameterId,
+        Expr::val(parameter_id),
+        "claimed by the slot the instrument was deployed to",
+    )
 }
 
 /// Adopt (deploy) a sensor to a site slot for a window. Auto-creates the site_parameter if missing,

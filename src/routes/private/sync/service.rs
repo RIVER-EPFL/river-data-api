@@ -5167,7 +5167,12 @@ pub async fn apply_plan(
     )
     .await;
 
-    let backfilled = backfill_plan_readings(&txn, plan_id).await?;
+    let backfilled = backfill_plan_readings(
+        &txn,
+        plan_id,
+        progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
+    )
+    .await?;
     let readings_backfilled = backfilled.readings;
     let changed = plan_slot_tally(&txn, plan_id).await?;
     step(
@@ -5965,8 +5970,15 @@ async fn plan_touched_events<C: ConnectionTrait>(
 pub(super) async fn backfill_plan_readings<C: ConnectionTrait>(
     txn: &C,
     plan_id: Uuid,
+    job_id: Option<Uuid>,
 ) -> AppResult<crate::routes::private::data_streams::models::Backfilled> {
-    crate::routes::private::data_streams::flows::backfill(txn, HoldScope::Plan(plan_id), None).await
+    crate::routes::private::data_streams::flows::backfill(
+        txn,
+        HoldScope::Plan(plan_id),
+        None,
+        job_id,
+    )
+    .await
 }
 
 /// The readings the plan's streams serve, counted per (site, parameter) slot: what an apply has

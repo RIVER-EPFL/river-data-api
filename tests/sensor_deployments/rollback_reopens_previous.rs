@@ -113,6 +113,23 @@ async fn rollback_reopens_previous_deployment() {
         resp["previous_deployment_id"].as_str(),
         Some(dep_a.to_string().as_str())
     );
+    let released: i64 = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS c FROM reading_decisions \
+             WHERE stream_id = $1 AND kind = 'attribution' AND reason = 'deployment rolled back' \
+               AND old ->> 'deployment_id' = $2 AND new -> 'deployment_id' = 'null'::jsonb",
+            [stream.into(), dep_b.to_string().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "c")
+        .unwrap();
+    assert_eq!(
+        released, 3,
+        "each reading released from B records the deployment it left"
+    );
 
     // A reopened to open-ended (B was open), absorbing B's vacated window.
     assert_eq!(

@@ -87,7 +87,7 @@ async fn pair_to_uncommitted(
     let ctx = create_sensor_for_stream(&txn, &stream, parameter_id, site_id, None)
         .await
         .unwrap();
-    flows::backfill(&txn, HoldScope::Stream(stream_id), ctx.deployment_id)
+    flows::backfill(&txn, HoldScope::Stream(stream_id), ctx.deployment_id, None)
         .await
         .unwrap();
     txn

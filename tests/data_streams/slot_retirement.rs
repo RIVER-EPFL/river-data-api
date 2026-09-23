@@ -363,7 +363,11 @@ async fn retiring_a_stream_whose_rollup_refresh_cannot_be_queued_releases_nothin
     crate::common::jobs::restore_enqueue(&db).await;
 
     assert!(refused.is_err(), "the release reports the refused enqueue");
-    assert_eq!(attributed_count(&db, stream).await, 1, "nothing is released");
+    assert_eq!(
+        attributed_count(&db, stream).await,
+        1,
+        "nothing is released"
+    );
 
     retire_slot(&db, SlotScope::Stream(stream), "test")
         .await

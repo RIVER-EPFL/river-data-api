@@ -266,7 +266,7 @@ async fn the_sites_a_calculation_is_active_at_are_named() {
 ///
 /// Expected behaviour: a token scoped to the first project is refused the second project's site by
 /// name, counts only its own projects' slots when it names no site, and sees only its own
-/// projects' findings in the calculation's health.
+/// projects' findings and repairs in the calculation's health.
 #[tokio::test]
 #[serial]
 async fn coverage_and_health_are_confined_to_the_callers_projects() {
@@ -286,6 +286,11 @@ async fn coverage_and_health_are_confined_to_the_callers_projects() {
                (group_time, expected, computed, delta, status, kind, site_id, parameter_id, tool) \
              VALUES ('{AT}', '{{}}', '{{}}', '{{}}', 'pending', 'stale_output', \
                      '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'closure_a')"
+        ),
+        format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, params) \
+             VALUES (gen_random_uuid(), 'event_recompute', 'failed', 'operator', \
+                     '{{\"site_id\": \"{SITE_B_ID}\", \"calculation\": \"closure_b_repair\"}}')"
         ),
     ] {
         crate::common::db::exec(&db, &sql).await;
@@ -339,6 +344,15 @@ async fn coverage_and_health_are_confined_to_the_callers_projects() {
         crate::common::get_json_with_token(&app, "/api/calculations/health", &scoped).await;
     assert_eq!(status, 200, "{own}");
     assert_eq!(stale(&own), 0, "the foreign finding is not counted: {own}");
+
+    let repaired = |body: &serde_json::Value| {
+        body.as_array()
+            .expect("a list")
+            .iter()
+            .any(|r| r["tool"] == "closure_b_repair")
+    };
+    assert!(repaired(&all), "the repair is reported: {all}");
+    assert!(!repaired(&own), "the foreign repair is not reported: {own}");
 }
 
 /// Expected behaviour: the grid marks each cell with the calculations that read it and the one

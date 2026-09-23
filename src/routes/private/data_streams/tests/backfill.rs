@@ -51,6 +51,54 @@ fn test_attribute_scopes_to_the_stream_or_the_plan() {
     );
 }
 
+/// Scenario: a pairing records each reading it attributes on the ledger (Q118), read before the
+/// write. Expected behaviour: the ledger insert selects the rows the write attributes and names
+/// every column the write sets, on both sides.
+#[test]
+fn test_attribution_ledger_records_the_rows_the_backfill_writes() {
+    let job = Uuid::from_u128(9);
+    let sql = attribution_ledger(HoldScope::Plan(Uuid::nil()), None, Some(job))
+        .to_string(PostgresQueryBuilder);
+    let write =
+        attribute_readings(HoldScope::Plan(Uuid::nil()), None).to_string(PostgresQueryBuilder);
+
+    assert!(
+        sql.starts_with(r#"INSERT INTO "reading_decisions""#),
+        "{sql}"
+    );
+    assert!(sql.contains("'attribution'"), "{sql}");
+    assert!(sql.contains("'paired'"), "{sql}");
+    assert!(sql.contains(&job.to_string()), "{sql}");
+    for predicate in [
+        r#""readings"."site_id" IS NULL"#,
+        r#""data_streams"."site_parameter_id" = "site_parameters"."id""#,
+        r#""data_streams"."pairing_plan_id" ="#,
+    ] {
+        assert!(write.contains(predicate), "{write}");
+        assert!(sql.contains(predicate), "{sql}");
+    }
+    for column in [
+        "site_id",
+        "parameter_id",
+        "sensor_id",
+        "deployment_id",
+        "measurement_type",
+    ] {
+        assert!(
+            sql.contains(&format!(r#"'{column}', "readings"."{column}""#)),
+            "{column} is recorded as it was: {sql}"
+        );
+        assert!(
+            write.contains(&format!(r#""{column}" = "#)),
+            "{column} is written: {write}"
+        );
+    }
+    assert!(
+        sql.contains(r#"'site_id', "site_parameters"."site_id""#),
+        "{sql}"
+    );
+}
+
 /// The non-numeric series carries no value, so its attribution writes the slot and the instrument
 /// and nothing else.
 #[test]

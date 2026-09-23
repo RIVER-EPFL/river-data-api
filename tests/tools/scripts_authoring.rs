@@ -841,6 +841,114 @@ async fn activation_runs_the_cases_rather_than_trusting_the_stamp() {
     .expect("probe constant removed");
 }
 
+async fn validated_version(
+    app: &axum::Router,
+    admin: &str,
+    sid: &str,
+    script: &str,
+    expected: f64,
+) -> String {
+    let (status, created) = crate::common::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{sid}/versions"),
+        &json!({ "script": script, "manifest": manifest("Doubler"), "test_cases": cases(expected) }),
+        admin,
+    )
+    .await;
+    assert_eq!(status, 200, "version created: {created}");
+    let vid = created["version"]["id"].as_str().unwrap().to_string();
+    let (status, validated) = crate::common::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{sid}/versions/{vid}/validate"),
+        &json!({}),
+        admin,
+    )
+    .await;
+    assert_eq!(status, 200, "validation ran: {validated}");
+    assert_eq!(validated["passed"], true, "{validated}");
+    vid
+}
+
+/// Scenario: an activation asks to migrate the superseded version's stored values, and the
+/// migration job cannot be queued.
+///
+/// Expected behaviour: the activation is refused and the script stays on its version, since
+/// otherwise the new version is live with nothing queued to repair what the old one computed.
+#[tokio::test]
+#[serial]
+async fn an_activation_whose_migration_cannot_be_queued_activates_nothing() {
+    if !crate::common::profile::Service::ToolsRunner
+        .require("an_activation_whose_migration_cannot_be_queued_activates_nothing")
+        .await
+    {
+        return;
+    }
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_activation_migration")
+        .await
+    {
+        return;
+    }
+    let (app, admin, sid, db) = setup_with_db("activation_migration_subject").await;
+    let v1 = validated_version(&app, &admin, &sid, DOUBLER, 4.0).await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/tool_scripts/{sid}/versions/{v1}/activate"),
+        &json!({}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "version 1 activates: {body}");
+    let v2 = validated_version(
+        &app,
+        &admin,
+        &sid,
+        "tool <- function(inputs, constants, curves) list(doubled = inputs$x + inputs$x)",
+        4.0,
+    )
+    .await;
+
+    crate::common::exec(
+        &db,
+        "CREATE FUNCTION refuse_version_migration() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.trigger_type = 'event_recompute' THEN \
+         RAISE EXCEPTION 'the migration is refused'; END IF; RETURN NEW; END $$",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "CREATE TRIGGER refuse_version_migration BEFORE INSERT ON reprocessing_jobs \
+         FOR EACH ROW EXECUTE FUNCTION refuse_version_migration()",
+    )
+    .await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/tool_scripts/{sid}/versions/{v2}/activate"),
+        &json!({ "migrate_stored": true }),
+        &admin,
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DROP TRIGGER refuse_version_migration ON reprocessing_jobs",
+    )
+    .await;
+    crate::common::exec(&db, "DROP FUNCTION refuse_version_migration()").await;
+
+    assert!(
+        !(200..300).contains(&status),
+        "an activation whose migration was not queued is refused ({status}): {body}"
+    );
+    let (status, script) =
+        crate::common::get_json_with_token(&app, &format!("/api/tool_scripts/{sid}"), &admin).await;
+    assert_eq!(status, 200, "{script}");
+    assert_eq!(
+        script["active_version_id"].as_str(),
+        Some(v1.as_str()),
+        "the script stays on its version: {script}"
+    );
+}
+
 /// Scenario: the lint reads the parse tree, so a rule written against one spelling now reaches
 /// every spelling of it.
 ///

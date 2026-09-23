@@ -1075,16 +1075,19 @@ async fn stream_for_slot(
 
 /// What one derived slot's pass did at one instant. The instant is the caller's, which is what
 /// lets a run report a slot once for the whole pass rather than once per instant (Q172).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotPass {
     /// A value was written.
     Stored,
     /// The formula produced a number that is not finite: the divide by zero, refused.
     Refused,
+    /// The set could not be evaluated at all, with the evaluator's error. The value that stands
+    /// stays served, as a refusal leaves it.
+    Unevaluable(String),
 }
 
 /// One slot of a site, and what the pass did there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedSlot {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
@@ -1553,13 +1556,39 @@ fn unattribute_statement(
 }
 
 /// Clear the site off a stored derived row, the unattributed state a recalled input leaves it in.
+///
+/// The clearing is a recompute moving the stored value to none, so it is recorded as a
+/// `formula_transition` naming no value on its new side (Q116), before the write so `old` is the
+/// value the slot served. A row already cleared matches nothing and records nothing.
 async fn unattribute_derived_at(
     db: &DatabaseConnection,
     site_id: Uuid,
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
+    version: Option<Uuid>,
+    consumed: &[ConsumedInput],
 ) -> Result<(), sea_orm::DbErr> {
+    use crate::routes::private::collection_events::flows::row;
     crate::common::bulk_write::guarded(db, async |txn| {
+        crate::routes::private::readings::service::record_many(
+            txn,
+            Kind::FormulaTransition,
+            Condition::all()
+                .add(row(readings::Column::SiteId).eq(site_id))
+                .add(row(readings::Column::ParameterId).eq(parameter_id))
+                .add(row(readings::Column::Time).eq(time))
+                .add(row(readings::Column::MeasurementType).eq(DERIVED)),
+            crate::routes::private::readings::service::NewValue::Literal(serde_json::json!({
+                "raw_value": null,
+                "derived_version_id": version,
+                "consumed": consumed,
+            })),
+            "system",
+            Some("the calculation now yields no value"),
+            Origin::System,
+            None,
+        )
+        .await?;
         crate::common::bulk_write::mutation_rows(
             txn,
             unattribute_statement(site_id, parameter_id, time),
@@ -1572,18 +1601,34 @@ async fn unattribute_derived_at(
     Ok(())
 }
 
+/// Every output slot a set fills, reported unevaluable with the evaluator's error: nothing was
+/// stored, and the run raises the finding that says so.
+fn unevaluable_slots(item: &DerivedWork, error: &str) -> Vec<DerivedSlot> {
+    item.outputs
+        .iter()
+        .map(|output| DerivedSlot {
+            site_id: item.derived_site_id,
+            parameter_id: output.parameter_id,
+            calculation_id: item.calculation.id,
+            pass: SlotPass::Unevaluable(error.to_string()),
+        })
+        .collect()
+}
+
 /// The stored derived row at a slot instant, as the transition record compares against.
 #[derive(sea_orm::FromQueryResult)]
 struct StoredDerived {
     raw_value: Option<f64>,
     derived_version_id: Option<Uuid>,
+    site_id: Option<Uuid>,
 }
 
 /// Record a derived value's move onto a new formula version, if it moved.
 ///
 /// The kind projects no column: the upsert that follows is what writes the value. Nothing is
 /// recorded when no row is stored yet, because a first computation came from no version; the
-/// caller is told so, and records the arrival once the row exists.
+/// caller is told so, and records the arrival once the row exists. A row the engine cleared
+/// serves nothing, so its value computed again is an arrival too.
 async fn record_formula_transition<C: ConnectionTrait>(
     db: &C,
     stream_id: Uuid,
@@ -1599,10 +1644,13 @@ async fn record_formula_transition<C: ConnectionTrait>(
         .select_only()
         .column(readings::Column::RawValue)
         .column(readings::Column::DerivedVersionId)
+        .column(readings::Column::SiteId)
         .into_model::<StoredDerived>()
         .one(db)
         .await?;
-    let Some(prior) = stored else { return Ok(true) };
+    let Some(prior) = stored.filter(|row| row.site_id.is_some()) else {
+        return Ok(true);
+    };
     if prior.raw_value == Some(result) && prior.derived_version_id == version {
         return Ok(false);
     }
@@ -1724,7 +1772,7 @@ async fn evaluate_set_and_upsert(
                 error,
                 "Continuous calculation could not be evaluated"
             );
-            return Ok(Vec::new());
+            return Ok(unevaluable_slots(item, &error));
         }
     };
 
@@ -1775,11 +1823,6 @@ async fn evaluate_set_and_upsert(
         // Everything else with no value is the unattribution arm: an input the formula reads
         // outside a guard went away, or the arithmetic came out NA. Either way the slot stops
         // serving a number it no longer computes.
-        let Some(value) = cell.value else {
-            unattribute_derived_at(db, site_id, output.parameter_id, time).await?;
-            continue;
-        };
-
         let consumed = output_capture(
             db,
             formula,
@@ -1789,6 +1832,19 @@ async fn evaluate_set_and_upsert(
             &steps,
         )
         .await?;
+        let Some(value) = cell.value else {
+            unattribute_derived_at(
+                db,
+                site_id,
+                output.parameter_id,
+                time,
+                item.calculation.active_version_id,
+                &consumed,
+            )
+            .await?;
+            continue;
+        };
+
         let stream_id =
             get_or_create_derived_stream(db, &item.calculation.name, site_id, output).await?;
         // The value names the version of the set that made it, which is what lets a reader open
@@ -2315,8 +2371,14 @@ fn moved_pairs(was: &str, now: &str, columns: &[&str]) -> String {
 /// visited row whose columns all came back the same is not a move and records nothing; the
 /// statement still returns it, so the caller's count and cascade are unchanged, and reports it as
 /// not `changed`, so it is not announced. `left_site_id` is the site a row that changed site was
-/// served at before, which is stale too.
-fn record_moved(write: UpdateStatement, columns: &[&str], job_id: Option<Uuid>) -> WithQuery {
+/// served at before, which is stale too. Each of `carried` is a further column the statement
+/// returns, reported as it came back.
+fn record_moved(
+    write: UpdateStatement,
+    columns: &[&str],
+    carried: &[&str],
+    job_id: Option<Uuid>,
+) -> WithQuery {
     let pairs = |side: &str| {
         columns
             .iter()
@@ -2348,12 +2410,17 @@ fn record_moved(write: UpdateStatement, columns: &[&str], job_id: Option<Uuid>) 
     } else {
         Expr::val(Option::<Uuid>::None).cast_as(Alias::new("uuid"))
     };
-    SeaQuery::select()
+    let mut select = SeaQuery::select();
+    select
         .expr(m("site_id"))
         .expr(m("time"))
         .expr(m("parameter_id"))
         .expr_as(left_site, Alias::new("left_site_id"))
-        .expr_as(changed, Alias::new("changed"))
+        .expr_as(changed, Alias::new("changed"));
+    for c in carried {
+        select.expr(m(c));
+    }
+    select
         .from_as(Alias::new("moved"), Alias::new("m"))
         .take()
         .with(with_ledger("moved", write, recorded))
@@ -2444,6 +2511,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             ))]))
             .take(),
         scope.attribution_columns(),
+        &[],
         job_id,
     );
 
@@ -2471,22 +2539,26 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             )])),
         ),
         &["calibration_id", "calibrated_value"],
+        &[],
         job_id,
     );
 
     // Step 3, the grabs: they keep the curves they were entered against, and their value follows
-    // those curves' current coefficients.
+    // those curves' current coefficients. A grab is an input its visit's calculations read, so the
+    // step reports the visit of each grab, as the drift sweep does (Q108).
     let spot = record_moved(
         recompose_statement(own_curve_rows(
             Expr::cust("r.measurement_type = 'spot'").and(scope.readings_predicate()),
         ))
         .returning(ReturningClause::Exprs(vec![Expr::cust(
             "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, tgt.parameter_id, \
+             tgt.collection_event_id, \
              r.calibrated_value AS was_calibrated_value, \
              tgt.calibrated_value AS now_calibrated_value",
         )]))
         .take(),
         &["calibrated_value"],
+        &["collection_event_id"],
         job_id,
     );
 
@@ -2511,6 +2583,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             ))]))
             .take(),
         &recall_columns,
+        &[],
         job_id,
     );
 
@@ -2535,6 +2608,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             ))]))
             .take(),
         &release_columns,
+        &[],
         job_id,
     );
 
@@ -2585,32 +2659,38 @@ pub async fn reprocess(
 ) -> Result<usize, sea_orm::DbErr> {
     let steps = reprocess_statements(scope, job_id);
 
-    let (readings_updated, moved, changed) = crate::common::bulk_write::guarded(db, async |txn| {
-        let mut touched: Vec<(Uuid, DateTime<Utc>, Option<Uuid>)> = Vec::new();
-        let mut changed = crate::common::SlotTally::default();
-        let mut readings_updated = 0usize;
-        for query in [&steps.attribution, &steps.calibration, &steps.spot] {
-            readings_updated += write_and_collect(txn, query, &mut touched, &mut changed).await?;
-        }
+    let (readings_updated, moved, changed, visits) =
+        crate::common::bulk_write::guarded(db, async |txn| {
+            let mut touched: Vec<(Uuid, DateTime<Utc>, Option<Uuid>)> = Vec::new();
+            let mut changed = crate::common::SlotTally::default();
+            let mut readings_updated = 0usize;
+            for query in [&steps.attribution, &steps.calibration] {
+                readings_updated += write_and_collect(txn, query, &mut touched, &mut changed)
+                    .await?
+                    .len();
+            }
+            let grabs = write_and_collect(txn, &steps.spot, &mut touched, &mut changed).await?;
+            readings_updated += grabs.len();
+            let visits = moved_visits(&grabs)?;
 
-        // The recall's rows are not part of `readings_updated`: it clears an attribution rather
-        // than re-deriving one.
-        write_and_collect(txn, &steps.recall, &mut touched, &mut changed).await?;
-        // Nothing served reads a deployment reference, so the release moves no instant.
-        write_and_collect(
-            txn,
-            &steps.release,
-            &mut Vec::new(),
-            &mut crate::common::SlotTally::default(),
-        )
-        .await?;
+            // The recall's rows are not part of `readings_updated`: it clears an attribution rather
+            // than re-deriving one.
+            write_and_collect(txn, &steps.recall, &mut touched, &mut changed).await?;
+            // Nothing served reads a deployment reference, so the release moves no instant.
+            write_and_collect(
+                txn,
+                &steps.release,
+                &mut Vec::new(),
+                &mut crate::common::SlotTally::default(),
+            )
+            .await?;
 
-        touched.sort_unstable();
-        touched.dedup();
-        Ok((readings_updated, touched, changed))
-    })
-    .await
-    .map_err(app_error_as_db_err)?;
+            touched.sort_unstable();
+            touched.dedup();
+            Ok((readings_updated, touched, changed, visits))
+        })
+        .await
+        .map_err(app_error_as_db_err)?;
 
     // The cascade runs over what this run moved, not over every instant in the scope: a derived
     // value at (site, time) is a function of the served values, and those changed only where a
@@ -2630,6 +2710,21 @@ pub async fn reprocess(
         }
     }
     refused.report(db).await?;
+
+    // A moved grab is an input its visit's calculations read, so those recompute in dependency
+    // order rather than standing on the old value (Q108).
+    let visit_events =
+        crate::routes::private::collection_events::flows::events_from_pairs(db, &visits)
+            .await
+            .map_err(app_error_as_db_err)?;
+    crate::routes::private::collection_events::flows::enqueue_for(
+        db,
+        &visit_events,
+        "reprocess",
+        crate::routes::private::collection_events::flows::Writer::Person,
+    )
+    .await
+    .map_err(app_error_as_db_err)?;
 
     let since = readings::Entity::find()
         .filter(scope.refresh_condition())
@@ -2725,7 +2820,7 @@ async fn write_and_collect<C: ConnectionTrait>(
     query: &WithQuery,
     touched: &mut Vec<(Uuid, DateTime<Utc>, Option<Uuid>)>,
     changed: &mut crate::common::SlotTally,
-) -> Result<usize, sea_orm::DbErr> {
+) -> Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr> {
     let rows = conn.query_all_raw(build(query.clone())).await?;
     for row in &rows {
         // `site_id` is nullable on an unpaired reading, which has no slot to touch.
@@ -2735,7 +2830,32 @@ async fn write_and_collect<C: ConnectionTrait>(
             touched.push((site_id, moved.time.with_timezone(&Utc), moved.parameter_id));
         }
     }
-    Ok(rows.len())
+    Ok(rows)
+}
+
+/// The visit and parameter of one grab the spot step visited, and whether its value moved.
+#[derive(FromQueryResult)]
+struct MovedGrab {
+    collection_event_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    changed: bool,
+}
+
+/// The (visit, parameter) pairs of the grabs the spot step moved, once each. A grab left as it was
+/// changes nothing a calculation read, and a grab at no visit has no calculation to rerun.
+fn moved_visits(rows: &[sea_orm::QueryResult]) -> Result<Vec<(Uuid, Uuid)>, sea_orm::DbErr> {
+    let mut pairs = Vec::new();
+    for row in rows {
+        let grab = MovedGrab::from_query_result(row, "")?;
+        if let (true, Some(event), Some(parameter)) =
+            (grab.changed, grab.collection_event_id, grab.parameter_id)
+        {
+            pairs.push((event, parameter));
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    Ok(pairs)
 }
 
 pub struct SensorCalibrationOperations;

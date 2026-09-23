@@ -36,6 +36,8 @@ mod m20260923_000004_calculation_decommission;
 mod m20260923_000006_output_slot_cadence;
 mod m20260923_000007_calibration_instant_unique;
 mod m20260923_000009_drop_formula_required_types;
+mod m20260924_000001_retag_decision_kind;
+mod m20260924_000002_attribution_decision_kind;
 
 pub struct Migrator;
 
@@ -92,6 +94,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260923_000006_output_slot_cadence::Migration),
             Box::new(m20260923_000007_calibration_instant_unique::Migration),
             Box::new(m20260923_000009_drop_formula_required_types::Migration),
+            Box::new(m20260924_000001_retag_decision_kind::Migration),
+            Box::new(m20260924_000002_attribution_decision_kind::Migration),
         ]
     }
 }

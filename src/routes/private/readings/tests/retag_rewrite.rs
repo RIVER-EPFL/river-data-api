@@ -93,6 +93,56 @@ fn test_retag_scope_leaves_out_an_absent_source_system() {
     );
 }
 
+/// Scenario: a retag records each reading it moves on the ledger (Q118), read before the write.
+/// Expected behaviour: the ledger insert selects the same rows as the write, records the stored
+/// classification as `old` and the one the write gives as `new`, and names the job.
+#[test]
+fn test_the_retag_ledger_records_the_rows_the_retag_writes() {
+    let ids = vec![Uuid::nil()];
+    let job = Uuid::from_u128(7);
+
+    let fixed = retag_ledger(Some("spot"), &ids, &ids, Some("cnet"), Some(job))
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(
+        fixed.starts_with(r#"INSERT INTO "reading_decisions""#),
+        "{fixed}"
+    );
+    assert!(fixed.contains("'retag'"), "{fixed}");
+    assert!(fixed.contains(&job.to_string()), "{fixed}");
+    assert!(
+        fixed.contains(r#"jsonb_build_object('measurement_type', "readings"."measurement_type")"#),
+        "{fixed}"
+    );
+    assert!(
+        fixed.contains("jsonb_build_object('measurement_type', 'spot')"),
+        "{fixed}"
+    );
+    let (write, _) = retag_readings(Some("spot"), &ids, &ids, Some("cnet")).as_sql();
+    for predicate in [
+        r#""readings"."measurement_type" IS DISTINCT FROM 'spot'"#,
+        r#""readings"."sensor_id" IN"#,
+        r#""readings"."stream_id" IN"#,
+    ] {
+        assert!(write.contains(predicate), "{write}");
+        assert!(fixed.contains(predicate), "{fixed}");
+    }
+
+    let declared = retag_ledger(None, &ids, &ids, None, None)
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(
+        declared.contains(
+            r#"jsonb_build_object('measurement_type', "data_streams"."measurement_type")"#
+        ),
+        "{declared}"
+    );
+    assert!(
+        declared.contains(
+            r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#
+        ),
+        "{declared}"
+    );
+}
+
 /// The write's own SQL. The span query beside it is asserted on separately.
 fn build_update(spanned: &crate::common::bulk_write::Spanned) -> String {
     spanned.as_sql().0

@@ -119,6 +119,7 @@ fn a_recording_statement_inserts_only_where_a_written_column_differs() {
     let sql = rendered(record_moved(
         write,
         &["site_id", "deployment_id"],
+        &[],
         Some(Uuid::nil()),
     ));
     assert!(sql.contains("m.was_site_id IS DISTINCT FROM m.now_site_id"));
@@ -310,10 +311,15 @@ fn every_reprocess_step_records_what_it_moved() {
                  parameter a held pulse reads: {sql}"
             );
             assert!(
-                sql.ends_with(r#"AS "changed" FROM "moved" AS "m""#),
+                sql.contains(r#"AS "changed""#) && sql.ends_with(r#"FROM "moved" AS "m""#),
                 "{name} reports whether each visited row moved, which is what it announces: {sql}"
             );
         }
+        assert!(
+            rendered(steps.spot.clone())
+                .ends_with(r#"AS "changed", "m"."collection_event_id" FROM "moved" AS "m""#),
+            "the grab step reports the visit whose calculations read what it moved"
+        );
         assert!(
             rendered(steps.attribution.clone()).contains(r#""m"."was_site_id" AS "left_site_id""#),
             "a row the attribution moves off a site leaves that site's series stale too"
@@ -669,6 +675,43 @@ mod a_set_is_one_unit_of_work {
         with_curve[1].curve_slot = Some("doc".to_string());
         assert!(!runs_on_streams(&with_curve));
     }
+}
+
+/// Scenario: a continuous calculation's set cannot be evaluated at an instant, because an
+/// expression in it is one the engine cannot read.
+///
+/// Expected behaviour: every output the site fills reports its slot as unevaluable with the
+/// evaluator's error, so the run raises a finding for each rather than leaving the stored value
+/// standing with nothing said.
+#[test]
+fn test_an_unevaluable_set_reports_every_output_slot() {
+    let site = Uuid::from_u128(1);
+    let calculation = Uuid::from_u128(2);
+    let output = |slot: u128, code: &str| DerivedOutput {
+        site_param_id: Uuid::from_u128(slot),
+        parameter_id: Uuid::from_u128(slot + 10),
+        parameter_code: code.to_string(),
+    };
+    let item = DerivedWork {
+        calculation: crate::routes::private::tools::service::StreamCalculation {
+            id: calculation,
+            name: "broken".to_string(),
+            active_version_id: None,
+            formulas: Vec::new(),
+        },
+        derived_site_id: site,
+        outputs: vec![output(1, "k_half"), output(2, "k_tenth")],
+    };
+    let slot = |parameter: u128| DerivedSlot {
+        site_id: site,
+        parameter_id: Uuid::from_u128(parameter),
+        calculation_id: calculation,
+        pass: SlotPass::Unevaluable("unknown function 'lg'".to_string()),
+    };
+    assert_eq!(
+        unevaluable_slots(&item, "unknown function 'lg'"),
+        vec![slot(11), slot(12)]
+    );
 }
 
 // Scenario: a calculation on a high-frequency stream reads one input from the stream and one the

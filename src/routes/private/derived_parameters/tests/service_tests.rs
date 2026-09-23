@@ -131,6 +131,7 @@ fn test_a_calculation_cannot_declare_its_own_step() {
 // --- Refused instants, one finding per slot ---
 
 use crate::routes::private::sensor_calibrations::service::{DerivedSlot, SlotPass};
+use crate::routes::private::sync::models::HoldKind;
 
 fn pass(site: Uuid, parameter: Uuid, pass: SlotPass) -> DerivedSlot {
     DerivedSlot {
@@ -211,6 +212,44 @@ fn test_a_slot_that_computed_again_closes_its_finding_unless_it_also_refused() {
         run.holds().len(),
         1,
         "the partly refused slot still reports"
+    );
+}
+
+/// Scenario: a calculation's set cannot be evaluated at all, so every output it publishes stays on
+/// the value it last stored.
+///
+/// Expected behaviour: each output slot raises a finding naming the evaluator's error, as a divide
+/// by zero does, and the run does not count the slot as computed again.
+#[test]
+fn test_an_unevaluable_set_is_a_finding_per_slot_naming_the_error() {
+    let site = Uuid::from_u128(1);
+    let output = Uuid::from_u128(2);
+    let mut run = super::DerivedPass::default();
+    for hour in [9, 10] {
+        run.record(
+            &[pass(
+                site,
+                output,
+                SlotPass::Unevaluable("unknown function 'lg'".to_string()),
+            )],
+            instant(hour),
+        );
+    }
+    run.record(&[stored(site, output)], instant(11));
+
+    let holds = run.holds();
+    assert_eq!(
+        holds.len(),
+        1,
+        "one finding for the slot, not one per instant"
+    );
+    assert_eq!(holds[0].kind, HoldKind::SkippedOutput);
+    assert_eq!(holds[0].computed["instants"], 2);
+    let reason = holds[0].expected["reason"].as_str().expect("a reason");
+    assert!(reason.contains("unknown function 'lg'"), "{reason}");
+    assert!(
+        run.resolved().is_empty(),
+        "the slot still has instants with no value"
     );
 }
 

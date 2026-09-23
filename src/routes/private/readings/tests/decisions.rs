@@ -18,6 +18,8 @@ fn every_kind_round_trips_its_name() {
         Kind::Chain,
         Kind::Detach,
         Kind::Return,
+        Kind::Retag,
+        Kind::Attribution,
         Kind::Rollback,
     ] {
         assert_eq!(Kind::parse(k.as_str()), Some(k));
@@ -227,18 +229,21 @@ fn every_writer_is_classified_and_derivation_writers_append_nothing() {
         ),
         (Writer::ReprocessSensor, Kind::Reprocess, Origin::System),
         (Writer::ReprocessSlot, Kind::Reprocess, Origin::System),
+        (Writer::BackfillAttribution, Kind::Reprocess, Origin::System),
+        (Writer::MeasurementRetag, Kind::Retag, Origin::System),
+        (Writer::PairingBackfill, Kind::Attribution, Origin::System),
+        (Writer::AdoptClaim, Kind::Attribution, Origin::System),
+        (
+            Writer::DeploymentRollback,
+            Kind::Attribution,
+            Origin::System,
+        ),
     ];
     for (w, k, o) in curation {
         assert_eq!(w.decision(), Some((k, o)), "{w:?}");
     }
-    for w in [
-        Writer::CalibrationResolver,
-        Writer::BackfillAttribution,
-        Writer::PairingBackfill,
-        Writer::MeasurementRetag,
-    ] {
-        assert_eq!(w.decision(), None, "{w:?} derives, it does not decide");
-    }
+    // The resolver stamps a reading's first state as it arrives: nothing on the row moved.
+    assert_eq!(Writer::CalibrationResolver.decision(), None);
 }
 
 #[test]
@@ -694,6 +699,8 @@ fn a_kind_supersedes_its_own_family_and_a_family_less_kind_supersedes_nothing() 
         Kind::CurveRecompose,
         Kind::DerivedComputed,
         Kind::Reprocess,
+        Kind::Retag,
+        Kind::Attribution,
     ] {
         assert!(family_kinds(kind).is_empty(), "{kind:?}");
     }
@@ -931,6 +938,44 @@ fn the_supersedes_lookup_names_its_columns_and_reads_the_live_row_of_the_family(
     }
     assert!(
         sql.contains(r#"ORDER BY "d"."at" DESC, "d"."id" DESC LIMIT 1"#),
+        "{sql}"
+    );
+}
+
+/// Scenario: a write setting one reading column records each row it is about to move.
+/// Expected behaviour: the ledger selects the rows the condition names, records the column's
+/// stored value and the new one, the reason, and no job when none ran it.
+#[test]
+fn test_column_ledger_records_the_column_on_both_sides() {
+    use crate::routes::private::readings::models::Column;
+    use sea_orm::ColumnTrait;
+
+    let sql = super::column_ledger(
+        Kind::Attribution,
+        sea_orm::Condition::all().add(Column::DeploymentId.eq(uuid::Uuid::nil())),
+        Column::DeploymentId,
+        sea_orm::sea_query::Expr::val(Option::<uuid::Uuid>::None),
+        "deployment rolled back",
+    )
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(
+        sql.starts_with(r#"INSERT INTO "reading_decisions""#),
+        "{sql}"
+    );
+    assert!(sql.contains("'attribution'"), "{sql}");
+    assert!(sql.contains("'deployment rolled back'"), "{sql}");
+    assert!(
+        sql.contains(r#"jsonb_build_object('deployment_id', "readings"."deployment_id")"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("jsonb_build_object('deployment_id', NULL)"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(
+            r#"WHERE "readings"."deployment_id" = '00000000-0000-0000-0000-000000000000'"#
+        ),
         "{sql}"
     );
 }

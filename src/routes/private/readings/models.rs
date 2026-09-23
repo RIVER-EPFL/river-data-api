@@ -532,6 +532,13 @@ pub enum Kind {
     /// and calibration timelines (Q118, Q125, M160). Record only, and only where the run moved
     /// something: the bulk statements write the columns, this says what they were before.
     Reprocess,
+    /// A `measurement_retag` run moved a reading's classification, and with it the arm it is
+    /// served on and whether it rolls up (Q118, M363). Record only: the job's UPDATE writes it.
+    Retag,
+    /// A pairing, an adopt or swap, or a deployment rollback wrote a reading's site, parameter,
+    /// instrument or deployment (Q118, M364). Record only: the write sets the columns, this says
+    /// what they were before; `reason` names which of the three it was.
+    Attribution,
     Rollback,
 }
 
@@ -559,6 +566,8 @@ impl Kind {
             Self::CurveRecompose => "curve_recompose",
             Self::DerivedComputed => "derived_computed",
             Self::Reprocess => "reprocess",
+            Self::Retag => "retag",
+            Self::Attribution => "attribution",
             Self::Rollback => "rollback",
         }
     }
@@ -585,6 +594,8 @@ impl Kind {
             Self::CurveRecompose,
             Self::DerivedComputed,
             Self::Reprocess,
+            Self::Retag,
+            Self::Attribution,
             Self::Rollback,
         ]
         .into_iter()
@@ -618,6 +629,8 @@ impl Kind {
             | Self::CurveRecompose
             | Self::DerivedComputed
             | Self::Reprocess
+            | Self::Retag
+            | Self::Attribution
             | Self::Rollback => &[],
         }
     }
@@ -677,6 +690,9 @@ impl Kind {
             // Its own family: a re-derivation replaces neither a curation decision nor the
             // re-derivation before it, each of which moved the row from a different state.
             Self::Reprocess => Some("reprocess"),
+            // Its own family, for the same reason as a reprocess.
+            Self::Retag => Some("retag"),
+            Self::Attribution => Some("attribution"),
             Self::Rollback => None,
         }
     }
@@ -697,6 +713,14 @@ impl Kind {
                 "deployment_id",
                 "calibration_id",
                 "calibrated_value",
+            ],
+            Self::Retag => &["measurement_type"],
+            Self::Attribution => &[
+                "site_id",
+                "parameter_id",
+                "sensor_id",
+                "deployment_id",
+                "measurement_type",
             ],
             other => other.projected_columns(),
         }

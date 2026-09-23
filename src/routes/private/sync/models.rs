@@ -1159,8 +1159,10 @@ pub mod events {
         pub readings_skipped: i64,
         pub status_events_synced: i64,
         #[sea_orm(column_type = "JsonBinary", nullable)]
+        #[schema(value_type = Option<Vec<String>>)]
         pub errors: Option<serde_json::Value>,
         #[sea_orm(column_type = "JsonBinary", nullable)]
+        #[schema(value_type = Option<Vec<String>>)]
         pub log: Option<serde_json::Value>,
         #[crudcrate(sortable)]
         pub started_at: DateTimeWithTimeZone,

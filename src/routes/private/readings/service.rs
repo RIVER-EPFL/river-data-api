@@ -1030,15 +1030,12 @@ pub async fn validate_check_claim(
     Ok(())
 }
 
-/// Every code path that writes a curation column, and what it becomes under the record: a
-/// curation writer appends a decision of the given kind; a derivation writer appends nothing and
-/// must honour pins. A new writer declares itself here or the classification test fails.
-///
-/// The derivations that move a stored value are the exception (Q116, Q118, Q125): a recompute
-/// records the move, because the ledger is the one place a value's history is read from and a
-/// value that changed under a new formula version, under a curve the sweep repaired it to, or
-/// under the timelines a reprocess re-derives from, would otherwise leave no trace of having
-/// changed. A reprocess records only the readings it moved.
+/// Every code path that writes a curation column, and the decision it appends: a curation writer
+/// records the ruling, and a derivation writer that moves a stored reading records the move (Q116,
+/// Q118, Q125), because the ledger is the one place a reading's history is read from. A derivation
+/// records only the readings it moved and must honour pins; `None` is a writer that stamps a
+/// reading's first state as it arrives. A new writer declares itself here or the classification
+/// test fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writer {
     FlagRoute,
@@ -1064,6 +1061,8 @@ pub enum Writer {
     JanitorRecompose,
     DerivedGapFill,
     MeasurementRetag,
+    AdoptClaim,
+    DeploymentRollback,
     CurveRetirement,
     DerivedRecompute,
 }
@@ -1092,11 +1091,14 @@ impl Writer {
             Self::DerivedRecompute => Some((Kind::FormulaTransition, Origin::System)),
             Self::JanitorRecompose => Some((Kind::CurveRecompose, Origin::Janitor)),
             Self::DerivedGapFill => Some((Kind::DerivedComputed, Origin::System)),
-            Self::ReprocessSensor | Self::ReprocessSlot => Some((Kind::Reprocess, Origin::System)),
-            Self::CalibrationResolver
-            | Self::BackfillAttribution
-            | Self::PairingBackfill
-            | Self::MeasurementRetag => None,
+            Self::ReprocessSensor | Self::ReprocessSlot | Self::BackfillAttribution => {
+                Some((Kind::Reprocess, Origin::System))
+            }
+            Self::MeasurementRetag => Some((Kind::Retag, Origin::System)),
+            Self::PairingBackfill | Self::AdoptClaim | Self::DeploymentRollback => {
+                Some((Kind::Attribution, Origin::System))
+            }
+            Self::CalibrationResolver => None,
         }
     }
 }
@@ -1106,6 +1108,90 @@ impl Writer {
 /// noticed it; the per-writer columns (`reason`, `set_id`, `job_id`) follow this list.
 pub const DECISION_COLUMNS: &str =
     "stream_id, time, replicate_index, kind, old, new, actor, origin, supersedes";
+
+/// A JSON object of `(key, value)` pairs, for the `old` and `new` a statement builds per row.
+#[must_use]
+pub fn columns_object(pairs: Vec<(&str, Expr)>) -> Expr {
+    Expr::from(
+        Func::cust(Alias::new("jsonb_build_object")).args(
+            pairs
+                .into_iter()
+                .flat_map(|(key, value)| [Expr::val(key), value]),
+        ),
+    )
+}
+
+/// One ledger row per reading a derivation is about to move. `moving` selects `stream_id`, `time`,
+/// `replicate_index`, `old` and `new` for exactly the readings the write changes, and the insert
+/// runs on the writing transaction before the write. A pre-image rather than a `RETURNING`,
+/// because TimescaleDB holds every row a hypertable `RETURNING` emits in executor memory and these
+/// writes can reach a stream's whole history.
+#[must_use]
+pub fn derivation_ledger(
+    kind: Kind,
+    moving: sea_orm::sea_query::SelectStatement,
+    reason: Option<&str>,
+    job_id: Option<Uuid>,
+) -> sea_orm::sea_query::InsertStatement {
+    let m = Alias::new("m");
+    let column = |name: &str| Expr::col((m.clone(), Alias::new(name)));
+    let actor = crate::common::actor::current().unwrap_or_else(|| "system".to_string());
+    let select = Query::select()
+        .expr(column("stream_id"))
+        .expr(column("time"))
+        .expr(column("replicate_index"))
+        .expr(Expr::val(kind.as_str()))
+        .expr(column("old"))
+        .expr(column("new"))
+        .expr(Expr::val(actor))
+        .expr(Expr::val(Origin::System.as_str()))
+        .expr(supersedes(kind, &m))
+        .expr(Expr::val(reason.map(str::to_string)))
+        .expr(Expr::val(job_id))
+        .from_subquery(moving, m.clone())
+        .take();
+    Query::insert()
+        .into_table(decision_model::Entity)
+        .columns(
+            DECISION_COLUMNS
+                .split(", ")
+                .chain(["reason", "job_id"])
+                .map(Alias::new),
+        )
+        .select_from(select)
+        .expect("the ledger insert names one column per selected expression")
+        .take()
+}
+
+/// The ledger rows a write setting one reading column owes: one decision per reading `condition`
+/// selects, naming the column's stored value and `new`. `condition` is over `readings` and must
+/// select only rows the write changes.
+#[must_use]
+pub fn column_ledger(
+    kind: Kind,
+    condition: Condition,
+    column: readings::Column,
+    new: Expr,
+    reason: &str,
+) -> sea_orm::sea_query::InsertStatement {
+    let r = Alias::new("readings");
+    let moving = Query::select()
+        .column((r.clone(), readings::Column::StreamId))
+        .column((r.clone(), readings::Column::Time))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .expr_as(
+            columns_object(vec![(column.as_str(), Expr::col((r, column)))]),
+            Alias::new("old"),
+        )
+        .expr_as(
+            columns_object(vec![(column.as_str(), new)]),
+            Alias::new("new"),
+        )
+        .from(readings::Entity)
+        .cond_where(condition)
+        .to_owned();
+    derivation_ledger(kind, moving, Some(reason), None)
+}
 
 /// The reading, or the whole replicate group, a decision is about.
 #[derive(Debug, Clone, Copy)]
@@ -1492,43 +1578,36 @@ pub(super) fn state_object(alias: Option<&str>) -> Expr {
         Some(a) => Expr::col((Alias::new(a), c)),
         None => Expr::col(c),
     };
-    let pair = |name: &'static str, value: Expr| [Expr::val(name), value];
-    sea_orm::sea_query::Func::cust(Alias::new("jsonb_build_object"))
-        .args(
-            [
-                pair(
-                    "is_flagged",
-                    sea_orm::sea_query::Func::coalesce([
-                        col(readings::Column::IsFlagged),
-                        Expr::val(false),
-                    ])
-                    .into(),
-                ),
-                pair("flag_reason", col(readings::Column::FlagReason)),
-                pair("withdrawn_at", col(readings::Column::WithdrawnAt)),
-                pair("withdrawn_reason", col(readings::Column::WithdrawnReason)),
-                pair("standard_curve_id", col(readings::Column::StandardCurveId)),
-                pair("sensor_id", col(readings::Column::SensorId)),
-                pair("calibration_id", col(readings::Column::CalibrationId)),
-                pair("raw_value", col(readings::Column::RawValue)),
-                pair("calibrated_value", col(readings::Column::CalibratedValue)),
-                pair("unverified", col(readings::Column::Unverified)),
-                pair("ingested_at", col(readings::Column::IngestedAt)),
-                pair(
-                    "derived_version_id",
-                    col(readings::Column::DerivedVersionId),
-                ),
-                pair(
-                    "run_id",
-                    col(readings::Column::Provenance)
-                        .binary(PgBinOper::CastJsonField, Expr::val("run_id")),
-                ),
-                pair("site_id", col(readings::Column::SiteId)),
-                pair("parameter_id", col(readings::Column::ParameterId)),
-            ]
-            .concat(),
-        )
-        .into()
+    columns_object(vec![
+        (
+            "is_flagged",
+            sea_orm::sea_query::Func::coalesce([
+                col(readings::Column::IsFlagged),
+                Expr::val(false),
+            ])
+            .into(),
+        ),
+        ("flag_reason", col(readings::Column::FlagReason)),
+        ("withdrawn_at", col(readings::Column::WithdrawnAt)),
+        ("withdrawn_reason", col(readings::Column::WithdrawnReason)),
+        ("standard_curve_id", col(readings::Column::StandardCurveId)),
+        ("sensor_id", col(readings::Column::SensorId)),
+        ("calibration_id", col(readings::Column::CalibrationId)),
+        ("raw_value", col(readings::Column::RawValue)),
+        ("calibrated_value", col(readings::Column::CalibratedValue)),
+        ("unverified", col(readings::Column::Unverified)),
+        ("ingested_at", col(readings::Column::IngestedAt)),
+        (
+            "derived_version_id",
+            col(readings::Column::DerivedVersionId),
+        ),
+        (
+            "run_id",
+            col(readings::Column::Provenance).binary(PgBinOper::CastJsonField, Expr::val("run_id")),
+        ),
+        ("site_id", col(readings::Column::SiteId)),
+        ("parameter_id", col(readings::Column::ParameterId)),
+    ])
 }
 
 /// Which rows a keyed record decides.
@@ -8874,8 +8953,8 @@ pub(super) fn derived_timestamps(
 /// Enqueues the derived values a paired pass's instants feed, as a tracked `ingest_derived` job.
 /// Skipped where the site has no active derived parameter: that job would compute nothing, and was
 /// the dominant source of empty ones.
-pub(super) async fn enqueue_ingest_derived(
-    db: &DatabaseConnection,
+pub(super) async fn enqueue_ingest_derived<C: ConnectionTrait>(
+    db: &C,
     stream_id: Uuid,
     site_id: Option<Uuid>,
     effect: &IngestEffect,
@@ -8885,11 +8964,9 @@ pub(super) async fn enqueue_ingest_derived(
     let Some(site_id) = site_id.filter(|_| effect.moved() > 0) else {
         return Ok(());
     };
-    let active =
-        crate::routes::private::derived_parameters::flows::site_has_active_derived(db, site_id)
-            .await
-            .unwrap_or(true);
-    if !active {
+    if !crate::routes::private::derived_parameters::flows::site_has_active_derived(db, site_id)
+        .await?
+    {
         return Ok(());
     }
     crate::routes::private::reprocessing_jobs::service::enqueue(
@@ -8902,6 +8979,71 @@ pub(super) async fn enqueue_ingest_derived(
             "stream_id": stream_id,
             "timestamps": derived_timestamps(readings, diff),
         }),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The parameters a write's touched visits feed calculations from, sorted and once each. A visit
+/// the chain does not run at contributes none.
+pub(super) fn chained_parameters(touched_events: &[TouchedEvent]) -> Vec<Uuid> {
+    let mut touched: Vec<Uuid> = touched_events
+        .iter()
+        .filter(|e| crate::routes::private::collection_events::service::chain_may_run(&e.source))
+        .flat_map(|e| e.parameter_ids.iter().copied())
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    touched
+}
+
+/// Recomposes the values a batch overwrite replaced from the curves each row still names, in the
+/// batch's own transaction: an overwrite replaces the measurement, not the correction.
+pub(super) async fn recompose_batch_overwrite<C: ConnectionTrait>(
+    txn: &C,
+    models: &[super::models::ActiveModel],
+) -> AppResult<()> {
+    let mut stream_ids: Vec<Uuid> = models.iter().map(|m| *m.stream_id.as_ref()).collect();
+    stream_ids.sort_unstable();
+    stream_ids.dedup();
+    let times = || models.iter().map(|m| *m.time.as_ref());
+    let (Some(first), Some(last)) = (times().min(), times().max()) else {
+        return Ok(());
+    };
+    sensor_calibrations::service::recompose_from_own_curves(
+        txn,
+        Expr::cust("TRUE"),
+        "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
+        vec![stream_ids.into(), first.into(), last.into()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Enqueues the derived values a batch's instants feed, as one tracked `batch_derived` job over the
+/// sites with an active derived parameter; the others would compute nothing.
+pub(super) async fn enqueue_batch_derived<C: ConnectionTrait>(
+    txn: &C,
+    site_timestamps: &HashMap<Uuid, Vec<DateTime<Utc>>>,
+) -> AppResult<()> {
+    let mut derived = Vec::new();
+    for (site_id, timestamps) in site_timestamps {
+        if crate::routes::private::derived_parameters::flows::site_has_active_derived(txn, *site_id)
+            .await?
+        {
+            derived.push(serde_json::json!({ "site_id": site_id, "timestamps": timestamps }));
+        }
+    }
+    if derived.is_empty() {
+        return Ok(());
+    }
+    crate::routes::private::reprocessing_jobs::service::enqueue(
+        txn,
+        "batch_derived",
+        None,
+        None,
+        &serde_json::json!({ "site_timestamps": derived }),
         None,
     )
     .await?;

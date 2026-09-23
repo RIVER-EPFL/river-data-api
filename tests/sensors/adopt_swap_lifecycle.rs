@@ -87,6 +87,20 @@ async fn adopt_backfills_by_window() {
         assert_eq!(r.parameter_id, Some(temp), "adopt backfills parameter_id");
         assert!(r.deployment_id.is_some(), "adopt backfills deployment_id");
     }
+    assert_eq!(
+        crate::common::e2e::count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM reading_decisions \
+                 WHERE stream_id = '{stream}' AND kind = 'attribution' \
+                   AND old = '{{\"parameter_id\": null}}' \
+                   AND new = '{{\"parameter_id\": \"{temp}\"}}'"
+            ),
+        )
+        .await,
+        6,
+        "each reading the adopt gave a parameter records the claim"
+    );
 }
 
 #[tokio::test]

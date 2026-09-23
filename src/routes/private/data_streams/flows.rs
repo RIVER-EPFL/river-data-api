@@ -11,7 +11,9 @@
 //! the slot reprocess every caller enqueues on the pairing's own transaction.
 
 use async_trait::async_trait;
-use sea_orm::sea_query::{Alias, Expr, Func, PostgresQueryBuilder, Query, UpdateStatement};
+use sea_orm::sea_query::{
+    Alias, Expr, Func, InsertStatement, PostgresQueryBuilder, Query, UpdateStatement,
+};
 use sea_orm::{Condition, ConnectionTrait, DbErr, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
@@ -25,6 +27,7 @@ use crate::routes::private::collection_events::flows::{events_from_pairs, touche
 use crate::routes::private::collection_events::service::{EventSource, attach_collection_events};
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::models::Kind;
 use crate::routes::private::readings::service::materialise_samples;
 use crate::routes::private::readings::status_events::models as status_events;
 use crate::routes::private::reprocessing_jobs::flows::required_uuid;
@@ -61,58 +64,117 @@ fn scope_condition(scope: HoldScope) -> Expr {
     }
 }
 
-/// Attribute a newly paired stream's readings from the slot it now serves. A reading already
-/// attributed keeps what it has; the instrument and cadence fall back to the stream's own.
-fn attribute_readings(scope: HoldScope, deployment_id: Option<Uuid>) -> UpdateStatement {
+/// What a pairing writes on each reading it attributes: the slot's site and parameter, and the
+/// instrument, deployment and cadence where the reading holds none of its own.
+fn attributed_values(deployment_id: Option<Uuid>) -> Vec<(readings::Column, Expr)> {
     use sea_orm::sea_query::ExprTrait;
 
     let r = Alias::new("readings");
     let ds = Alias::new("data_streams");
     let sp = Alias::new("site_parameters");
-    Query::update()
-        .table(readings::Entity)
-        .value(
+    vec![
+        (
             readings::Column::SiteId,
             Expr::col((sp.clone(), site_parameters::Column::SiteId)),
-        )
-        .value(
+        ),
+        (
             readings::Column::ParameterId,
-            Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
-        )
-        .value(
+            Expr::col((sp, site_parameters::Column::ParameterId)),
+        ),
+        (
             readings::Column::SensorId,
             Func::coalesce([
                 Expr::col((ds.clone(), data_streams::Column::SensorId)),
                 Expr::col((r.clone(), readings::Column::SensorId)),
-            ]),
-        )
-        .value(
+            ])
+            .into(),
+        ),
+        (
             readings::Column::DeploymentId,
             Func::coalesce([
                 Expr::val(deployment_id).cast_as(Alias::new("uuid")),
                 Expr::col((r.clone(), readings::Column::DeploymentId)),
-            ]),
-        )
-        .value(
+            ])
+            .into(),
+        ),
+        (
             readings::Column::MeasurementType,
             Func::coalesce([
-                Expr::col((r.clone(), readings::Column::MeasurementType)),
-                Expr::col((ds.clone(), data_streams::Column::MeasurementType)),
-            ]),
-        )
-        .from(data_streams::Entity)
-        .from(site_parameters::Entity)
-        .and_where(
+                Expr::col((r, readings::Column::MeasurementType)),
+                Expr::col((ds, data_streams::Column::MeasurementType)),
+            ])
+            .into(),
+        ),
+    ]
+}
+
+/// The readings a pairing attributes: every unattributed reading on a stream in scope, joined to
+/// the slot the stream now serves. Statements over them name `data_streams` and `site_parameters`.
+fn unattributed_in_scope(scope: HoldScope) -> Condition {
+    use sea_orm::sea_query::ExprTrait;
+
+    let r = Alias::new("readings");
+    let ds = Alias::new("data_streams");
+    Condition::all()
+        .add(
             Expr::col((ds.clone(), data_streams::Column::SiteParameterId))
-                .equals((sp, site_parameters::Column::Id)),
+                .equals((Alias::new("site_parameters"), site_parameters::Column::Id)),
         )
-        .and_where(
+        .add(
             Expr::col((r.clone(), readings::Column::StreamId))
                 .equals((ds, data_streams::Column::Id)),
         )
-        .and_where(Expr::col((r, readings::Column::SiteId)).is_null())
-        .and_where(scope_condition(scope))
+        .add(Expr::col((r, readings::Column::SiteId)).is_null())
+        .add(scope_condition(scope))
+}
+
+/// Attribute a newly paired stream's readings from the slot it now serves. A reading already
+/// attributed keeps what it has; the instrument and cadence fall back to the stream's own.
+fn attribute_readings(scope: HoldScope, deployment_id: Option<Uuid>) -> UpdateStatement {
+    let mut update = Query::update();
+    update.table(readings::Entity);
+    for (column, value) in attributed_values(deployment_id) {
+        update.value(column, value);
+    }
+    update
+        .from(data_streams::Entity)
+        .from(site_parameters::Entity)
+        .cond_where(unattributed_in_scope(scope))
         .to_owned()
+}
+
+/// The ledger rows a pairing owes: one `attribution` decision per reading [`attribute_readings`] is
+/// about to attribute, naming each column it writes on both sides, inserted before the write.
+fn attribution_ledger(
+    scope: HoldScope,
+    deployment_id: Option<Uuid>,
+    job_id: Option<Uuid>,
+) -> InsertStatement {
+    use crate::routes::private::readings::service::{columns_object, derivation_ledger};
+    use sea_orm::IdenStatic;
+
+    let r = Alias::new("readings");
+    let values = attributed_values(deployment_id);
+    let old = values
+        .iter()
+        .map(|(column, _)| (column.as_str(), Expr::col((r.clone(), *column))))
+        .collect();
+    let new = values
+        .into_iter()
+        .map(|(column, value)| (column.as_str(), value))
+        .collect();
+    let moving = Query::select()
+        .column((r.clone(), readings::Column::StreamId))
+        .column((r.clone(), readings::Column::Time))
+        .column((r, readings::Column::ReplicateIndex))
+        .expr_as(columns_object(old), Alias::new("old"))
+        .expr_as(columns_object(new), Alias::new("new"))
+        .from(readings::Entity)
+        .from(data_streams::Entity)
+        .from(site_parameters::Entity)
+        .cond_where(unattributed_in_scope(scope))
+        .to_owned();
+    derivation_ledger(Kind::Attribution, moving, Some("paired"), job_id)
 }
 
 /// The same attribution for the non-numeric series, which carry no value to correct.
@@ -177,12 +239,14 @@ pub async fn backfill<C: ConnectionTrait>(
     conn: &C,
     scope: HoldScope,
     deployment_id: Option<Uuid>,
+    job_id: Option<Uuid>,
 ) -> AppResult<Backfilled> {
     let scoped = predicate(scope);
 
     // The backfill reaches chunks the compression policy has already closed.
     bulk_write::lift_decompression_cap(conn).await?;
 
+    bulk_write::mutation_rows(conn, attribution_ledger(scope, deployment_id, job_id)).await?;
     let readings =
         bulk_write::mutation_rows(conn, attribute_readings(scope, deployment_id)).await?;
 
@@ -254,7 +318,7 @@ pub async fn pair_entry_channel(
         if claimed == 0 {
             return Ok(());
         }
-        let done = backfill(txn, HoldScope::Stream(stream_id), None).await?;
+        let done = backfill(txn, HoldScope::Stream(stream_id), None, None).await?;
         enqueue_slot_reprocess(txn, stream_id, (sp.site_id, sp.parameter_id), done.readings)
             .await?;
         crate::routes::private::collection_events::flows::enqueue_for(

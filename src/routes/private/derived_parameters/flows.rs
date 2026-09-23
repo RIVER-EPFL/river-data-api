@@ -35,8 +35,8 @@ const IN_FLIGHT: [&str; 4] = ["queued", "pending", "running", "retrying"];
 /// the ingest/batch derived-compute jobs: when false, a derived recompute at that site would do
 /// nothing, so the job is skipped entirely (the dominant source of empty `ingest_derived` jobs).
 /// Anything genuinely needed is still caught by the periodic janitor gap scan.
-pub async fn site_has_active_derived(
-    db: &DatabaseConnection,
+pub async fn site_has_active_derived<C: ConnectionTrait>(
+    db: &C,
     site_id: Uuid,
 ) -> Result<bool, sea_orm::DbErr> {
     let row = site_parameters::Entity::find()

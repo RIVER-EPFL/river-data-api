@@ -1408,10 +1408,9 @@ pub async fn insert_batch_readings(
     // one; a sync service reaching the same route is recorded as sync.
     let origin = auth.origin();
     let span = batch_span(&site_timestamps_for_derived);
-    let touched_events;
+    let calculations;
     let tail;
-    let models;
-    (inserted, overwritten, touched_events, tail, models) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    (inserted, overwritten, calculations, tail) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let attributions = crate::routes::private::readings::service::lock_stream_attributions(
             txn,
             stream_cache.values().copied(),
@@ -1577,45 +1576,27 @@ pub async fn insert_batch_readings(
             touched_events.clone(),
         );
         crate::routes::private::readings::service::queue(txn, &tail.0, &tail.1).await?;
-        Ok((inserted, overwritten, touched_events, tail, models))
-    })
-    .await?;
-
-    // The values have landed; the calculations that read them run without anyone asking
-    // (ADR 0007). What they are is reported back alongside the counts.
-    let calculations = {
-        let mut touched: Vec<Uuid> = touched_events
-            .iter()
-            .filter(|e| {
-                crate::routes::private::collection_events::service::chain_may_run(&e.source)
-            })
-            .flat_map(|e| e.parameter_ids.iter().copied())
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
-        crate::routes::private::tools::service::calculations_fed_by(&state.db, &touched).await?
-    };
-
-    // An overwrite replaces the measurement, not the correction: the write keeps the stored curve
-    // references, so the value is recomputed from exactly those curves, the same as the CSV
-    // overwrite path. Without this the row carries a value its recorded curves did not produce
-    // until the janitor sweep catches it.
-    if conflict == ConflictMode::Overwrite && overwritten > 0 {
-        let mut stream_ids: Vec<Uuid> = models.iter().map(|m| *m.stream_id.as_ref()).collect();
-        stream_ids.sort_unstable();
-        stream_ids.dedup();
-        let times: Vec<chrono::DateTime<chrono::FixedOffset>> =
-            models.iter().map(|m| *m.time.as_ref()).collect();
-        if let (Some(first), Some(last)) = (times.iter().min(), times.iter().max()) {
-            sensor_calibrations::service::recompose_from_own_curves_guarded(
-                &state.db,
-                sea_orm::sea_query::Expr::cust("TRUE"),
-                "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
-                vec![stream_ids.into(), (*first).into(), (*last).into()],
+        // The calculations the values feed run without anyone asking (ADR 0007); what they are is
+        // reported back alongside the counts.
+        let calculations = crate::routes::private::tools::service::calculations_fed_by(
+            txn,
+            &crate::routes::private::readings::service::chained_parameters(&touched_events),
+        )
+        .await?;
+        if conflict == ConflictMode::Overwrite && overwritten > 0 {
+            crate::routes::private::readings::service::recompose_batch_overwrite(txn, &models)
+                .await?;
+        }
+        if inserted > 0 || overwritten > 0 {
+            crate::routes::private::readings::service::enqueue_batch_derived(
+                txn,
+                &site_timestamps_for_derived,
             )
             .await?;
         }
-    }
+        Ok((inserted, overwritten, calculations, tail))
+    })
+    .await?;
 
     tracing::debug!(
         total,
@@ -1623,39 +1604,6 @@ pub async fn insert_batch_readings(
         overwritten,
         "Batch readings insert complete"
     );
-
-    // Auto-compute derived values for affected sites, tracked as a job. Spawn-guard: keep only
-    // sites with an active derived parameter, others would compute nothing.
-    if inserted > 0 || overwritten > 0 {
-        let mut derived_sites: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
-        for (site_id, timestamps) in &site_timestamps_for_derived {
-            if crate::routes::private::derived_parameters::flows::site_has_active_derived(
-                &state.db, *site_id,
-            )
-            .await
-            .unwrap_or(true)
-            {
-                derived_sites.insert(*site_id, timestamps.clone());
-            }
-        }
-        if !derived_sites.is_empty() {
-            let site_timestamps: Vec<serde_json::Value> = derived_sites
-                .iter()
-                .map(|(site_id, timestamps)| {
-                    serde_json::json!({ "site_id": site_id, "timestamps": timestamps })
-                })
-                .collect();
-            crate::routes::private::reprocessing_jobs::service::enqueue(
-                &state.db,
-                "batch_derived",
-                None,
-                None,
-                &serde_json::json!({ "site_timestamps": site_timestamps }),
-                None,
-            )
-            .await?;
-        }
-    }
 
     crate::routes::private::readings::service::run(&state, &tail.0, &tail.1, &actor).await?;
 
@@ -1803,9 +1751,18 @@ pub async fn ingest_readings(
         diff,
         touched_events,
     } = pass.write(&txn).await?;
+    let effect = IngestEffect::of(&payload, sample_window, inserted, diff.as_ref());
+    enqueue_ingest_derived(
+        &txn,
+        payload.stream_id,
+        site_id,
+        &effect,
+        &payload.readings,
+        diff.as_ref(),
+    )
+    .await?;
     txn.commit().await?;
 
-    let effect = IngestEffect::of(&payload, sample_window, inserted, diff.as_ref());
     recompose_corrected_span(&state.db, payload.stream_id, &effect).await;
     let written_at = Slot {
         site_id,
@@ -1827,15 +1784,6 @@ pub async fn ingest_readings(
         diff.as_ref(),
     );
     record_stream_pass(&state.db, &stream, cursor, digest).await;
-    enqueue_ingest_derived(
-        &state.db,
-        payload.stream_id,
-        site_id,
-        &effect,
-        &payload.readings,
-        diff.as_ref(),
-    )
-    .await?;
     let outcome = funnel.outcome(payload.stream_id, paired, inserted);
     Ok(Json(classified_outcome(
         outcome,

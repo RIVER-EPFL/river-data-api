@@ -135,6 +135,16 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
         0,
         "spot rows drop out of the hourly rollup after the job's refresh"
     );
+    let recorded = format!(
+        "reading_decisions WHERE stream_id = '{stream_id}' AND kind = 'retag' AND job_id = '{id}' \
+         AND old = '{{\"measurement_type\": \"continuous\"}}' \
+         AND new = '{{\"measurement_type\": \"spot\"}}'"
+    );
+    assert_eq!(
+        count_where(&db, &recorded).await,
+        2,
+        "each moved reading records its classification on both sides and the run"
+    );
 
     // Idempotent rerun: nothing left to retag, still completes.
     let rerun = jobs::enqueue(
@@ -150,6 +160,11 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
     .expect("rerun enqueues");
     jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
     assert_eq!(job_status(&db, rerun).await, "completed");
+    assert_eq!(
+        count_where(&db, "reading_decisions WHERE kind = 'retag'").await,
+        2,
+        "a rerun that moves nothing records nothing"
+    );
 }
 
 /// The family guard holds inside the job body: a stored `measurement_retag` row replayed by

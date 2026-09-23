@@ -606,6 +606,7 @@ pub async fn pair_stream(
             txn,
             crate::routes::private::sync::service::HoldScope::Stream(stream_id),
             deployment_id,
+            None,
         )
         .await?;
         super::flows::enqueue_slot_reprocess(

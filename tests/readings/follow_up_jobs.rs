@@ -1,5 +1,5 @@
-//! Scenario: a write whose follow-up job (`derived_recompute`, `alarm_backfill`, the pin
-//! reprocess) cannot be queued, or whose rollup refresh fails.
+//! Scenario: a write whose follow-up job (`derived_recompute`, `alarm_backfill`, `batch_derived`,
+//! `ingest_derived`, the pin reprocess) cannot be queued, or whose rollup refresh fails.
 //!
 //! Expected behaviour: the answer matches whether the change committed. A follow-up job is queued
 //! in the writer's own transaction, so a refused enqueue writes nothing and a retry succeeds; a
@@ -421,6 +421,87 @@ async fn an_import_whose_alarm_backfill_cannot_be_queued_imports_nothing() {
         "an import that could not queue its episodes rebuild stores nothing: {}",
         crate::common::e2e::jobs_summary(&fx.db).await
     );
+
+    crate::common::cleanup_test_db(&fx.db).await;
+}
+
+/// An active derived slot at the site, so a write there queues its derived job.
+async fn derived_slot(db: &DatabaseConnection) {
+    let parameter = Uuid::new_v4();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO parameters (id, code, name, default_units, category) \
+             VALUES ('{parameter}', 'FollowUpDerived', 'Follow-up derived', 'x', 'measurement')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO site_parameters \
+                 (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode) \
+             VALUES ('{}', '{SITE1_ID}', '{parameter}', 'FollowUpDerived', 'FollowUpDerived', \
+                     true, 'tool')",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_batch_whose_derived_job_cannot_be_queued_stores_nothing() {
+    let fx = setup().await;
+    derived_slot(&fx.db).await;
+
+    refuse_enqueue(&fx.db, "batch_derived").await;
+    let (status, body) = batch(&fx).await;
+    restore_enqueue(&fx.db).await;
+
+    assert_ne!(status, 200, "the batch reports the failure: {body}");
+    assert_eq!(stored_at(&fx.db, AT).await, 0, "and stores nothing");
+
+    let (status, body) = batch(&fx).await;
+    assert_eq!(status, 200, "a retry stores the reading: {body}");
+    assert_eq!(stored_at(&fx.db, AT).await, 1);
+    assert_eq!(queued(&fx.db, "batch_derived").await, 1);
+
+    crate::common::cleanup_test_db(&fx.db).await;
+}
+
+async fn ingest(fx: &Fixture, stream: Uuid, at: &str) -> (u16, String) {
+    crate::common::post_json_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({
+            "stream_id": stream,
+            "readings": [{ "time": at, "raw_value": 12.5 }],
+        }),
+        &fx.token,
+    )
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn an_ingest_whose_derived_job_cannot_be_queued_stores_nothing() {
+    const LATER: &str = "2025-06-15T10:14:00Z";
+    let fx = setup().await;
+    let stream = continuous_reading(&fx.db).await;
+    derived_slot(&fx.db).await;
+
+    refuse_enqueue(&fx.db, "ingest_derived").await;
+    let (status, body) = ingest(&fx, stream, LATER).await;
+    restore_enqueue(&fx.db).await;
+
+    assert_ne!(status, 200, "the ingest reports the failure: {body}");
+    assert_eq!(stored_at(&fx.db, LATER).await, 0, "and stores nothing");
+
+    let (status, body) = ingest(&fx, stream, LATER).await;
+    assert_eq!(status, 200, "a retry stores the reading: {body}");
+    assert_eq!(stored_at(&fx.db, LATER).await, 1);
+    assert_eq!(queued(&fx.db, "ingest_derived").await, 1);
 
     crate::common::cleanup_test_db(&fx.db).await;
 }

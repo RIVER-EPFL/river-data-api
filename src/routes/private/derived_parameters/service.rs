@@ -1126,6 +1126,8 @@ pub struct DerivedPass {
 
 struct Tally {
     calculation_id: Uuid,
+    /// Why the slot stored nothing, as the first instant of the run to fail it said.
+    reason: String,
     instants: usize,
     first: chrono::DateTime<chrono::Utc>,
     last: chrono::DateTime<chrono::Utc>,
@@ -1135,26 +1137,30 @@ impl DerivedPass {
     pub fn record(&mut self, slots: &[DerivedSlot], time: chrono::DateTime<chrono::Utc>) {
         for slot in slots {
             let key = (slot.site_id, slot.parameter_id);
-            match slot.pass {
+            let reason = match &slot.pass {
                 SlotPass::Stored => {
                     self.stored.insert(key);
+                    continue;
                 }
-                SlotPass::Refused => {
-                    self.refused
-                        .entry(key)
-                        .and_modify(|tally| {
-                            tally.instants += 1;
-                            tally.first = Ord::min(tally.first, time);
-                            tally.last = Ord::max(tally.last, time);
-                        })
-                        .or_insert(Tally {
-                            calculation_id: slot.calculation_id,
-                            instants: 1,
-                            first: time,
-                            last: time,
-                        });
+                SlotPass::Refused => "the formula computed a value that is not finite".to_string(),
+                SlotPass::Unevaluable(error) => {
+                    format!("the calculation could not be evaluated: {error}")
                 }
-            }
+            };
+            self.refused
+                .entry(key)
+                .and_modify(|tally| {
+                    tally.instants += 1;
+                    tally.first = Ord::min(tally.first, time);
+                    tally.last = Ord::max(tally.last, time);
+                })
+                .or_insert(Tally {
+                    calculation_id: slot.calculation_id,
+                    reason,
+                    instants: 1,
+                    first: time,
+                    last: time,
+                });
         }
     }
 
@@ -1186,7 +1192,7 @@ impl DerivedPass {
                 },
                 kind: HoldKind::SkippedOutput,
                 expected: serde_json::json!({
-                    "reason": "the formula computed a value that is not finite",
+                    "reason": tally.reason,
                     "calculation_id": tally.calculation_id,
                 }),
                 computed: serde_json::json!({

@@ -9,18 +9,60 @@ fn test_paging_is_opt_in() {
     assert_eq!(paging(Some(0), Some(500)).unwrap().limit, MAX_PAGE_SIZE);
 }
 
+fn order_by_of(order: &[(Expr, Order)]) -> String {
+    let mut query = visits_where(Condition::all());
+    query.column((ce(), super::super::Column::Id));
+    for (expr, direction) in order {
+        query.order_by_expr(expr.clone(), direction.clone());
+    }
+    let sql = query.to_string(PostgresQueryBuilder);
+    sql[sql.find("ORDER BY").expect("an ORDER BY")..].to_string()
+}
+
 #[test]
 fn test_visit_list_order_defaults_and_refuses_unknown() {
     assert_eq!(
-        visit_list_order(None, None).unwrap(),
-        "ce.collected_at DESC, ce.collected_at DESC, ce.id"
+        order_by_of(&visit_list_order(None, None).unwrap()),
+        r#"ORDER BY "ce"."collected_at" DESC, "ce"."collected_at" DESC, "ce"."id" ASC"#
     );
     assert_eq!(
-        visit_list_order(Some("findings_open"), Some("asc")).unwrap(),
-        "findings_open ASC, ce.collected_at DESC, ce.id"
+        order_by_of(&visit_list_order(Some("findings_open"), Some("asc")).unwrap()),
+        r#"ORDER BY "findings_open" ASC, "ce"."collected_at" DESC, "ce"."id" ASC"#
     );
     assert!(visit_list_order(Some("notes"), None).is_err());
     assert!(visit_list_order(None, Some("random")).is_err());
+}
+
+#[test]
+fn test_visit_headers_bind_the_bounds_and_the_page() {
+    let site = Uuid::from_u128(7);
+    let start = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let window = paging(Some(3), Some(20)).unwrap();
+    let filter = visit_filter(
+        Some(site),
+        Some(vec![Uuid::from_u128(9)]),
+        Some(start),
+        None,
+    );
+    let (sql, values) = visit_headers(filter, Some(window)).build(PostgresQueryBuilder);
+    assert!(sql.contains(r#""ce"."site_id" = $1"#), "{sql}");
+    assert!(sql.contains(r#""s"."project_id" IN ($2)"#), "{sql}");
+    assert!(sql.contains(r#""ce"."collected_at" >= $3"#), "{sql}");
+    assert!(sql.ends_with("LIMIT $4 OFFSET $5"), "{sql}");
+    assert_eq!(values.0.len(), 5);
+}
+
+#[test]
+fn test_visit_headers_without_bounds_list_every_visit() {
+    let (sql, values) =
+        visit_headers(visit_filter(None, None, None, None), None).build(PostgresQueryBuilder);
+    assert!(
+        sql.ends_with(r#"ON "s"."id" = "ce"."site_id" WHERE TRUE"#),
+        "{sql}"
+    );
+    assert!(values.0.is_empty());
 }
 
 #[test]
@@ -155,4 +197,19 @@ fn test_newest_job_per_visit_keeps_the_latest_run_of_each() {
 #[test]
 fn test_newest_job_per_visit_of_no_runs_is_empty() {
     assert!(newest_job_per_visit([]).is_empty());
+}
+
+#[test]
+fn test_cell_curves_is_each_distinct_curve_in_replicate_order() {
+    let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let names =
+        std::collections::HashMap::from([(a, Some("Curve 2026-03".to_string())), (b, None)]);
+    let curves = cell_curves(&[b, a, b], &names);
+    let got: Vec<(Uuid, Option<&str>)> = curves.iter().map(|c| (c.id, c.name.as_deref())).collect();
+    assert_eq!(got, vec![(b, None), (a, Some("Curve 2026-03"))]);
+}
+
+#[test]
+fn test_cell_curves_is_empty_for_an_uncorrected_cell() {
+    assert!(cell_curves(&[], &std::collections::HashMap::new()).is_empty());
 }
