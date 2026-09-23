@@ -886,7 +886,10 @@ fn build_evaluation_order(work_items: &[DerivedWork]) -> Result<Vec<usize>, sea_
                 .enumerate()
                 .filter(|(_, other)| {
                     !std::ptr::eq(*other, item)
-                        && other.output_codes().iter().any(|code| sources.contains(code))
+                        && other
+                            .output_codes()
+                            .iter()
+                            .any(|code| sources.contains(code))
                 })
                 .map(|(index, _)| index)
                 .collect()
@@ -1077,8 +1080,11 @@ fn input_value_query(
             // The last instant this parameter was measured at, at or before the one being
             // computed. A parameter with nothing before it selects NULL and binds nothing, which
             // is what an input the instant holds no value for already does.
-            Expr::col((r.clone(), readings::Column::Time))
-                .in_subquery(last_measured_query(site_id, parameter_id, time))
+            Expr::col((r.clone(), readings::Column::Time)).in_subquery(last_measured_query(
+                site_id,
+                parameter_id,
+                time,
+            ))
         } else {
             Expr::col((r.clone(), readings::Column::Time)).eq(time)
         })
@@ -1218,7 +1224,12 @@ async fn resolve_set_inputs(
         .keys()
         .cloned()
         .chain(site_properties.iter().map(|(variable, _)| variable.clone()))
-        .chain(formulas.iter().filter(|f| f.intermediate).map(|f| f.code.clone()))
+        .chain(
+            formulas
+                .iter()
+                .filter(|f| f.intermediate)
+                .map(|f| f.code.clone()),
+        )
         .collect();
     let set_text = formulas
         .iter()

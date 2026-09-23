@@ -144,7 +144,9 @@ mod at_a_site {
             "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
              WHERE site_id = $1 AND parameter_id = $2 AND time = $3 LIMIT 1",
             [
-                Uuid::parse_str(crate::common::SITE1_ID).expect("a uuid").into(),
+                Uuid::parse_str(crate::common::SITE1_ID)
+                    .expect("a uuid")
+                    .into(),
                 parameter_id.into(),
                 time.into(),
             ],
@@ -230,7 +232,9 @@ mod at_a_site {
         )
         .await;
         assert!((200..300).contains(&status), "{definition}");
-        let output_id = definition["output_parameter_id"].as_str().expect("an output");
+        let output_id = definition["output_parameter_id"]
+            .as_str()
+            .expect("an output");
         let output = Uuid::parse_str(output_id).expect("a uuid");
 
         let source = definition["sources"]

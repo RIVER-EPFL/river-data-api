@@ -1,8 +1,6 @@
-//! Exact-value portal-parity tests for the analytical tools. Expected numbers come from the
-//! verbatim CNET/METALP portal R functions, which are seeded into every tool script as
-//! the vendored portal prelude and run by the tools runner. The same numbers are pinned as the
-//! stored version's own test cases, which is what a version has to reproduce
-//! before it can be activated.
+//! The tools list and `/tools/{name}/calculate`: the reference set is listed, retired tools answer
+//! 404, and `doc` runs. `doc`'s script returns nothing of its own, so its numbers are the engine's
+//! mean and sample sd over the replicates after the standard curve, not portal R arithmetic.
 
 use serial_test::serial;
 

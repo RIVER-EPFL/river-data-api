@@ -84,7 +84,10 @@ fn test_the_span_query_aggregates_the_callers_rows_and_returns_nothing() {
     let (span_sql, _) = span_query(spanned.rows.clone()).build(PostgresQueryBuilder);
     assert!(span_sql.contains("MIN(\"touched\".\"time\")"), "{span_sql}");
     assert!(span_sql.contains("MAX(\"touched\".\"time\")"), "{span_sql}");
-    assert!(span_sql.contains("FROM (SELECT \"time\" FROM \"readings\""), "{span_sql}");
+    assert!(
+        span_sql.contains("FROM (SELECT \"time\" FROM \"readings\""),
+        "{span_sql}"
+    );
     assert!(span_sql.contains("AS \"touched\""), "{span_sql}");
 
     let written = spanned.write.build();

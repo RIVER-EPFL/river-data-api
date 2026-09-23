@@ -392,7 +392,10 @@ async fn an_edited_step_reads_as_changed_and_an_unmoved_value_keeps_its_record()
     )
     .await;
     assert!((200..300).contains(&status), "edit ({status}): {body}");
-    let uri = format!("/api/actions/derived_parameters/{}/recompute", f.calculation);
+    let uri = format!(
+        "/api/actions/derived_parameters/{}/recompute",
+        f.calculation
+    );
     let (status, body) =
         crate::common::post_json_with_token(&f.app, &uri, &json!({}), &f.token).await;
     assert!((200..300).contains(&status), "recompute ({status}): {body}");

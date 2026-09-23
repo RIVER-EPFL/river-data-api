@@ -119,7 +119,10 @@ async fn a_route_refuses_a_kind_it_does_not_own() {
         )
         .await;
         assert_eq!(status, 400, "{path} ({status}): {body}");
-        assert!(body.contains("stale_output"), "the refusal names the kind: {body}");
+        assert!(
+            body.contains("stale_output"),
+            "the refusal names the kind: {body}"
+        );
     }
 
     let status_now: String = db
@@ -375,4 +378,3 @@ async fn the_list_breaks_pending_holds_down_by_kind() {
         "a kind with nothing pending is absent, not zero: {by_kind}"
     );
 }
-

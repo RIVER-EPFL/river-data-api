@@ -4362,7 +4362,11 @@ pub fn colliding_parameter_codes(entries: &[PlanEntry], catalog: &EntityCatalog)
     }
     let mut collisions: Vec<String> = Vec::new();
     for (code, group) in by_code {
-        if let Some(existing) = catalog.params.iter().find(|p| p.code.to_lowercase() == code) {
+        if let Some(existing) = catalog
+            .params
+            .iter()
+            .find(|p| p.code.to_lowercase() == code)
+        {
             collisions.push(format!(
                 "'{}' is already a catalog parameter; attach those columns to it or rename them",
                 existing.code

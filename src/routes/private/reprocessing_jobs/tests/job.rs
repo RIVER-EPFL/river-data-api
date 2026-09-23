@@ -135,7 +135,10 @@ fn a_walk_reports_its_ends_and_a_hundredth_of_what_is_between() {
 
     // A hundred steps of a thousand, plus the first item, which carries the length.
     let reported = (1..=100_000).filter(|d| reports_step(*d, 100_000)).count();
-    assert_eq!(reported, 101, "a long walk reports a hundred steps, not a hundred thousand");
+    assert_eq!(
+        reported, 101,
+        "a long walk reports a hundred steps, not a hundred thousand"
+    );
     assert!(reports_step(1, 100_000));
     assert!(reports_step(100_000, 100_000));
 }

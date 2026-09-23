@@ -26,9 +26,7 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .get_connection()
-            .execute_unprepared(
-                "DROP INDEX IF EXISTS public.idx_reading_decisions_derived_version",
-            )
+            .execute_unprepared("DROP INDEX IF EXISTS public.idx_reading_decisions_derived_version")
             .await?;
         Ok(())
     }

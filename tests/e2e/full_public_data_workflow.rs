@@ -294,11 +294,8 @@ async fn test_full_public_data_workflow() {
 
     // Units are the catalog's, so the public listing and the site's own report the same string
     // for every slot.
-    let (status, public_params) = crate::common::get_json(
-        &app,
-        "/api/public/e2e_river/sites/e2e_station/parameters",
-    )
-    .await;
+    let (status, public_params) =
+        crate::common::get_json(&app, "/api/public/e2e_river/sites/e2e_station/parameters").await;
     assert_eq!(status, 200, "public parameters: {public_params}");
     let (status, site_params) = crate::common::get_json_with_token(
         &app,

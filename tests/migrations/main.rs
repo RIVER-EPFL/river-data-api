@@ -9,4 +9,5 @@ mod common;
 mod blank_database;
 mod cutover_restore;
 mod entity_revisions;
+mod manifest_sd_estimator_strip;
 mod rollup_policies;

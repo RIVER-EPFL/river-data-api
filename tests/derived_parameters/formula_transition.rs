@@ -182,7 +182,15 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
     let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
     // The set-level save is the one act that mints a version (Q186), and a stored value names the
     // version that made it, so the move this story is about is a move between two of them.
-    save_set(&app, &token, calculation, &code, None, "Dissolved_O2 * 0.032").await;
+    save_set(
+        &app,
+        &token,
+        calculation,
+        &code,
+        None,
+        "Dissolved_O2 * 0.032",
+    )
+    .await;
     let (definition_id, output) = saved_formula(&db, &code).await;
 
     let (status, body) = crate::common::post_json_with_token(

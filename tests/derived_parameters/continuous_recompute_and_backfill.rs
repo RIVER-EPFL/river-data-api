@@ -561,11 +561,19 @@ async fn add_formula(
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "add {code} ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "add {code} ({status}): {body}"
+    );
     body
 }
 
-async fn declare_stream_slot(db: &DatabaseConnection, site_id: Uuid, parameter_id: Uuid, name: &str) {
+async fn declare_stream_slot(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    name: &str,
+) {
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO site_parameters \

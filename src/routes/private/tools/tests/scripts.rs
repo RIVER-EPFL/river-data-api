@@ -170,3 +170,25 @@ fn no_whitelisted_package_shares_a_name_with_a_forbidden_construct() {
         );
     }
 }
+
+/// jsonlite is installed in the runner image but is not a script-facing package, so the finding
+/// states the rule a script is held to rather than what the image holds.
+#[test]
+fn a_package_outside_the_script_set_is_refused_as_not_allowed() {
+    let called = findings_from_scan(&scan(vec![("jsonlite::toJSON", 2)], vec![], vec![]));
+    assert_eq!(
+        called[0].message, "package 'jsonlite' is not allowed in tool scripts",
+        "{called:?}"
+    );
+    let loaded = findings_from_scan(&scan(
+        vec![("library", 1)],
+        vec![],
+        vec![arg("library", "", "jsonlite", "string", 1)],
+    ));
+    assert!(
+        loaded
+            .iter()
+            .any(|f| f.message == "package 'jsonlite' is not allowed in tool scripts"),
+        "{loaded:?}"
+    );
+}

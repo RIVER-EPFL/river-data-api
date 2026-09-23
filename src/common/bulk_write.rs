@@ -177,7 +177,6 @@ impl Dml {
         };
         Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
     }
-
 }
 
 /// A hypertable write and the query naming the rows it is about to touch, from the same table on
@@ -281,7 +280,6 @@ pub async fn mutation_rows<C: ConnectionTrait>(
         .await?
         .rows_affected())
 }
-
 
 #[cfg(test)]
 #[path = "tests/bulk_write_tests.rs"]

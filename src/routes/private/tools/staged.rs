@@ -19,8 +19,8 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::service::{CurveClaim, admit_standard_curves};
-use crate::routes::private::sensor_calibrations::service::{Curve, apply_curves};
 use crate::routes::private::sensor_calibrations::resolver;
+use crate::routes::private::sensor_calibrations::service::{Curve, apply_curves};
 use crate::routes::private::site_parameters::models as site_parameters;
 
 /// A grab is spot by construction, so a staged cell is admitted under the spot arm.
@@ -149,8 +149,7 @@ impl StagedVisit {
     /// here rather than read from the stored `samples` row.
     #[must_use]
     pub fn touches(&self, parameter_id: Uuid) -> bool {
-        self.retracted.contains(&parameter_id)
-            || self.cells.keys().any(|(p, _)| *p == parameter_id)
+        self.retracted.contains(&parameter_id) || self.cells.keys().any(|(p, _)| *p == parameter_id)
     }
 
     /// Whether a calculation cleared this parameter's output at the visit, retracting whatever the

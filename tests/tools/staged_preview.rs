@@ -12,9 +12,7 @@ use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
 
-use crate::common::{
-    GLOBAL_PARAM_COND_ID, GLOBAL_PARAM_DO_ID, GLOBAL_PARAM_TEMP_ID, SITE1_ID,
-};
+use crate::common::{GLOBAL_PARAM_COND_ID, GLOBAL_PARAM_DO_ID, GLOBAL_PARAM_TEMP_ID, SITE1_ID};
 use river_db::routes::private::tools::flows::{preview_event, recompute_event};
 use river_db::routes::private::tools::staged::StagedCell;
 
@@ -151,6 +149,16 @@ async fn visit_with_family(values: &[(i16, f64)]) -> Visit {
     crate::common::seed_test_data(&db).await;
     let token = crate::common::seed_token_full(&db).await;
     let (app, state) = crate::common::build_test_app_with_state(db.clone());
+    // The chain's outputs are visit calculations: a high-cadence slot is computed on its stream.
+    for parameter_id in [GLOBAL_PARAM_DO_ID, GLOBAL_PARAM_COND_ID] {
+        exec(
+            &db,
+            "UPDATE site_parameters SET cadence = 'low' \
+             WHERE site_id = $1::uuid AND parameter_id = $2::uuid",
+            vec![SITE1_ID.into(), parameter_id.into()],
+        )
+        .await;
+    }
 
     let (status, text) = crate::common::post_json_with_token(
         &app,
@@ -218,7 +226,10 @@ async fn stored_value(db: &DatabaseConnection, parameter_id: &str) -> Option<f64
     .and_then(|row| row.try_get::<Option<f64>>("", "v").expect("v"))
 }
 
-fn output(preview: &river_db::routes::private::tools::models::EventPreview, key: &str) -> Option<f64> {
+fn output(
+    preview: &river_db::routes::private::tools::models::EventPreview,
+    key: &str,
+) -> Option<f64> {
     preview
         .outputs
         .iter()
@@ -496,7 +507,11 @@ async fn a_per_replicate_output_is_read_as_a_statistic_by_the_next_stage() {
         .filter(|o| o.output == "out_a")
         .map(|o| o.value)
         .collect();
-    assert_eq!(published, vec![Some(8.0), Some(16.0)], "each repeat doubled");
+    assert_eq!(
+        published,
+        vec![Some(8.0), Some(16.0)],
+        "each repeat doubled"
+    );
     assert_eq!(
         output(&preview, "out_b"),
         Some(13.0),
@@ -588,7 +603,10 @@ async fn a_refused_output_is_reported_and_files_nothing() {
     .await
     .expect("the preview runs");
     assert!(
-        preview.calculations[0].refused.iter().any(|r| r == "StagedRefused"),
+        preview.calculations[0]
+            .refused
+            .iter()
+            .any(|r| r == "StagedRefused"),
         "the division by zero is refused: {:?}",
         preview.calculations[0]
     );
@@ -724,7 +742,13 @@ async fn a_formula_calculation_previews_the_value_its_save_stores() {
         preview.skipped
     );
 
-    save_family(&v.app, &v.token, GLOBAL_PARAM_TEMP_ID, &[(0, 4.0), (1, 8.0)]).await;
+    save_family(
+        &v.app,
+        &v.token,
+        GLOBAL_PARAM_TEMP_ID,
+        &[(0, 4.0), (1, 8.0)],
+    )
+    .await;
     recompute_event(&v.state, v.event_id, "test")
         .await
         .expect("the recompute runs");

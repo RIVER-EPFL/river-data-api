@@ -289,7 +289,8 @@ impl Job for AttributePlanSlots {
             .all(ctx.db())
             .await?;
         let total = i32::try_from(slots.len()).unwrap_or(i32::MAX);
-        ctx.info(&format!("Attributing {} slot(s)", slots.len())).await;
+        ctx.info(&format!("Attributing {} slot(s)", slots.len()))
+            .await;
 
         let mut results = Vec::with_capacity(slots.len());
         for (done, (site_id, parameter_id)) in slots.into_iter().enumerate() {

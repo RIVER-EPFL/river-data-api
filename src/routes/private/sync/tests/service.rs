@@ -1063,7 +1063,10 @@ fn test_a_plan_attributes_only_the_slots_holding_readings() {
     let sql = plan_slots_holding_readings(Uuid::nil())
         .build(sea_orm::DatabaseBackend::Postgres)
         .to_string();
-    assert!(sql.contains("EXISTS"), "a slot with no reading is skipped: {sql}");
+    assert!(
+        sql.contains("EXISTS"),
+        "a slot with no reading is skipped: {sql}"
+    );
     assert!(
         sql.contains(r#"FROM "readings""#),
         "the test is against the readings: {sql}"

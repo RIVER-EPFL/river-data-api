@@ -793,7 +793,10 @@ async fn the_backfill_floor_is_the_site_s_own_earliest_reading() {
     );
 
     // Two decades of pressure land under the station's stream.
-    let archive = points(Utc.with_ymd_and_hms(2004, 2, 1, 0, 0, 0).unwrap(), &[915.0; 3]);
+    let archive = points(
+        Utc.with_ymd_and_hms(2004, 2, 1, 0, 0, 0).unwrap(),
+        &[915.0; 3],
+    );
     let refs: Vec<&Point> = archive.iter().collect();
     river_db::routes::private::meteoswiss::service::insert(
         &db, stream_id, site_id, parameter, sensor_id, &refs,

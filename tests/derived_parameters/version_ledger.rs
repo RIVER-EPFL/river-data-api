@@ -118,7 +118,15 @@ async fn each_version_lists_the_readings_it_computed_and_the_span_they_cover() {
 
     let code = format!("vledger_{}", Uuid::new_v4().simple());
     let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
-    save_set(&app, &token, calculation, &code, None, "Dissolved_O2 * 0.032").await;
+    save_set(
+        &app,
+        &token,
+        calculation,
+        &code,
+        None,
+        "Dissolved_O2 * 0.032",
+    )
+    .await;
     let (formula_id, parameter) = saved_formula(&db, &code).await;
 
     // A version that has computed nothing is a row of zeros, not an absence. Read before the slot

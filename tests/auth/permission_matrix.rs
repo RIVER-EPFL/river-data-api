@@ -837,9 +837,18 @@ fn table() -> Table {
         &[
             ("GET", "/api/sync/replicate_audit_holds"),
             ("POST", "/api/sync/replicate_audit_holds/{id}/release_brake"),
-            ("POST", "/api/sync/replicate_audit_holds/{id}/dismiss_finding"),
-            ("POST", "/api/sync/replicate_audit_holds/{id}/accept_identity"),
-            ("POST", "/api/sync/replicate_audit_holds/{id}/accept_correction"),
+            (
+                "POST",
+                "/api/sync/replicate_audit_holds/{id}/dismiss_finding",
+            ),
+            (
+                "POST",
+                "/api/sync/replicate_audit_holds/{id}/accept_identity",
+            ),
+            (
+                "POST",
+                "/api/sync/replicate_audit_holds/{id}/accept_correction",
+            ),
             ("POST", "/api/sync/replicate_audit_holds/{id}/resolve"),
             ("POST", "/api/sync/replicate_audit_holds/{id}/reopen"),
             ("POST", "/api/sync/change_proposals/decide"),
@@ -901,6 +910,7 @@ fn table() -> Table {
                 "/api/tool_scripts/{id}/versions/{version_id}/activate",
             ),
             ("GET", "/api/tool_scripts/{id}/activations"),
+            ("GET", "/api/tool_scripts/{id}/version_usage"),
         ],
     );
 
@@ -1403,12 +1413,13 @@ fn every_row_names_a_route_that_still_exists() {
 
 /// The source files whose `.route("…")` literals the two coverage scans read, each with the prefix
 /// it is mounted under. A component collapse that moves the literals moves the entry here too.
-const ROUTE_SOURCES: [(&str, &str); 5] = [
+const ROUTE_SOURCES: [(&str, &str); 6] = [
     ("src/routes/service/mod.rs", "/api"),
     ("src/routes/private/sync/views.rs", "/api/sync"),
     ("src/routes/private/projects/views.rs", "/api/projects"),
     ("src/routes/private/sites/views.rs", "/api/sites"),
     ("src/routes/private/api_tokens/views.rs", "/api"),
+    ("src/routes/private/tools/views.rs", "/api"),
 ];
 
 /// Every route [`ROUTE_SOURCES`] declares, paired with the file it came from, and the entries that

@@ -7915,6 +7915,65 @@ fn check_saved_input(
     ))
 }
 
+/// Whether a reading saved as a run's input or output is of the parameter the pinned manifest
+/// binds that name to. A name the manifest binds to nothing keeps the requested parameter, which
+/// is then the only source there is.
+fn check_bound_parameter(
+    tool_name: &str,
+    kind: &str,
+    name: &str,
+    bound: Option<(Uuid, &str)>,
+    parameter_id: Uuid,
+) -> Result<(), String> {
+    match bound {
+        Some((id, code)) if id != parameter_id => Err(format!(
+            "This {tool_name} run's manifest binds {kind} '{name}' to {code} ({id}); a reading of \
+             parameter {parameter_id} is not a measurement of it"
+        )),
+        _ => Ok(()),
+    }
+}
+
+type Bindings = std::collections::HashMap<String, (Uuid, String)>;
+
+/// The catalog parameter the pinned manifest binds each input name and each output key to, where
+/// it binds one that resolves.
+async fn manifest_bindings(
+    db: &DatabaseConnection,
+    pinned: Option<&crate::routes::private::tools::models::Manifest>,
+) -> Result<(Bindings, Bindings), AppError> {
+    use crate::routes::private::tools::service as engine;
+    let Some(manifest) = pinned else {
+        return Ok(Default::default());
+    };
+    let catalog = engine::load_parameter_catalog(db, std::iter::once(manifest)).await?;
+    let mut inputs = Bindings::new();
+    for p in manifest.params.iter().filter(|p| p.kind == "replicates") {
+        if let Some(row) = p
+            .parameter_code
+            .as_deref()
+            .and_then(|c| catalog.resolve_code(c))
+        {
+            inputs.insert(p.name.clone(), (row.id, row.code));
+        }
+    }
+    for e in &manifest.event_inputs {
+        if let Some(row) = catalog.resolve_code(&e.parameter_code) {
+            inputs.insert(e.param.clone(), (row.id, row.code));
+        }
+    }
+    let outputs = manifest
+        .outputs
+        .iter()
+        .filter_map(|o| {
+            catalog
+                .resolve(o)
+                .map(|row| (o.key.clone(), (row.id, row.code)))
+        })
+        .collect();
+    Ok((inputs, outputs))
+}
+
 pub(super) async fn resolve_tool_run_provenance(
     db: &DatabaseConnection,
     tool_run_id: Option<Uuid>,
@@ -8017,6 +8076,9 @@ pub(super) async fn resolve_tool_run_provenance(
         .as_ref()
         .map(|m| m.event_inputs.iter().map(|e| e.param.clone()).collect())
         .unwrap_or_default();
+    // The parameter each saved name is a measurement of, as the manifest binds it: a replicates
+    // param's code, an event input's code, an output's catalog reference.
+    let (bound_inputs, bound_outputs) = manifest_bindings(db, pinned.as_ref()).await?;
 
     let run_applied_curves = curves.as_array().is_some_and(|c| !c.is_empty());
     let mut saved: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -8038,6 +8100,11 @@ pub(super) async fn resolve_tool_run_provenance(
                 r.replicate_index,
             )
             .map_err(AppError::BadRequest)?;
+            let bound = bound_inputs
+                .get(input)
+                .map(|(id, code)| (*id, code.as_str()));
+            check_bound_parameter(&tool_name, "input", input, bound, r.parameter_id)
+                .map_err(AppError::BadRequest)?;
             match saved_inputs.get(input) {
                 Some(existing) if existing != &serde_json::json!(r.parameter_id) => {
                     return Err(AppError::BadRequest(format!(
@@ -8075,6 +8142,11 @@ pub(super) async fn resolve_tool_run_provenance(
                 r.value
             )));
         }
+        let bound = bound_outputs
+            .get(output)
+            .map(|(id, code)| (*id, code.as_str()));
+        check_bound_parameter(&tool_name, "output", output, bound, r.parameter_id)
+            .map_err(AppError::BadRequest)?;
         if run_applied_curves && r.standard_curve_id.is_some() {
             return Err(AppError::BadRequest(format!(
                 "'{output}' was computed with a standard curve already applied; stamping \

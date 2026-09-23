@@ -727,7 +727,8 @@ fn retag_readings(
 
     // What the write changes and what the span reads are the same rows, so the predicate is built
     // once: the `declared` arm joins `data_streams` to compare against each stream's own value.
-    let changing = || match target {
+    let changing = || {
+        match target {
         // sea-query has no IS DISTINCT FROM, and a NULL measurement_type reads as continuous, so
         // the comparison cannot be a plain inequality.
         Some(value) => sea_query::Condition::all().add(sea_query::Expr::cust(format!(
@@ -742,6 +743,7 @@ fn retag_readings(
             .add(sea_query::Expr::cust(
                 r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#,
             )),
+    }
     };
 
     let mut update = sea_query::Query::update();

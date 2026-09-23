@@ -24,7 +24,6 @@ use super::models::{
     StageEventRequest, StageEventsRequest, StageVisitRow, StagedEvent, VisitCell, VisitListQuery,
     VisitListRow, VisitReplicate, VisitRow, VisitsQuery, VisitsResponse,
 };
-use crate::routes::private::tools::models::EventPreview;
 use super::service::{
     self, limit_clause, paging, range_clause, visit_count_columns, visit_list_order,
 };
@@ -40,6 +39,7 @@ use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::sensors::models::{self as sensors, InstrumentKind};
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::models::HoldStatus;
+use crate::routes::private::tools::models::EventPreview;
 use crate::routes::resolve_site;
 
 /// Recompute a collection event's tool outputs on demand: the chain executor runs every active

@@ -715,8 +715,8 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
                 .from(slot.rows.table_ref())
                 .cond_where(on_source.clone())
                 .take();
-            let touched = bulk_write::mutation(conn, bulk_write::Spanned::new(moving, statement))
-                .await?;
+            let touched =
+                bulk_write::mutation(conn, bulk_write::Spanned::new(moving, statement)).await?;
             if slot.feeds_rollups {
                 moved.touched = moved.touched.merge(touched);
             }

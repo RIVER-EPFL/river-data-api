@@ -531,7 +531,12 @@ mod a_set_is_one_unit_of_work {
 
     fn set() -> Vec<PinnedFormula> {
         vec![
-            formula("water_k", "WTW_Temp_degC_1 + 273.15", &["WTW_Temp_degC_1"], true),
+            formula(
+                "water_k",
+                "WTW_Temp_degC_1 + 273.15",
+                &["WTW_Temp_degC_1"],
+                true,
+            ),
             formula("k_half", "water_k / 2", &[], false),
             formula("k_tenth", "water_k / 10", &[], false),
         ]

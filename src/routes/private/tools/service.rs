@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::flows::dependency_order;
-use super::staged::StagedVisit;
 use super::models::script::{self, ToolScript};
 use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
@@ -32,6 +31,7 @@ use super::models::{
     Subject, ToolScriptOperations, TraceCell, TraceReduction, TraceStep, ValidateResponse,
     kind_accepts, parse_manifest,
 };
+use super::staged::StagedVisit;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::change_audit::service::{entity_revision, entity_revisions};
@@ -1323,7 +1323,15 @@ pub async fn run_tool_body(
     constants_override: Option<&serde_json::Map<String, serde_json::Value>>,
     missing_constant: MissingConstant,
 ) -> AppResult<RunOutcome> {
-    let resolved = resolve_run(state, tool, body, constants_override, missing_constant, None).await?;
+    let resolved = resolve_run(
+        state,
+        tool,
+        body,
+        constants_override,
+        missing_constant,
+        None,
+    )
+    .await?;
     execute_resolved(state, tool, resolved).await
 }
 
@@ -1471,8 +1479,9 @@ pub async fn resolve_run(
         &mut consumed,
     )
     .await?;
-    event_inputs
-        .extend(resolve_replicate_inputs(&state.db, manifest, visit, &mut body, &mut consumed).await?);
+    event_inputs.extend(
+        resolve_replicate_inputs(&state.db, manifest, visit, &mut body, &mut consumed).await?,
+    );
 
     // Defaults land before requiredness so a condition reads the same values the runner will,
     // whatever order the params are declared in.
@@ -3498,7 +3507,9 @@ pub async fn version_ledger(
             vec![script_id.into()],
         ))
         .await?;
-    let instant = |row: &sea_orm::QueryResult, column: &str| -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
+    let instant = |row: &sea_orm::QueryResult,
+                   column: &str|
+     -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
         Ok(row
             .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", column)?
             .map(|t| t.with_timezone(&chrono::Utc)))
@@ -4771,9 +4782,9 @@ impl CRUDOperations for ToolScriptOperations {
 /// A page big enough for a catalogue of calculations; the surface is a dozen rows, not a feed.
 pub(super) const LIST_LIMIT: u64 = 500;
 
-/// Packages a script may load or reach into with `::`. Mirrors the runner image's installed set
-/// plus the runner's own package; anything else fails at run time anyway, the lint just says so
-/// earlier.
+/// Packages a script may load or reach into with `::`: `riverdata.tools`' `SCRIPT_PACKAGES`, the
+/// calculation packages in its `Suggests` (pracma, signal, bigleaf), base R and the runner's own
+/// package. The image installs more than this, and none of the rest is a script's to reach.
 pub(super) const LIBRARY_WHITELIST: &[&str] = &[
     "dplyr",
     "tidyr",
@@ -4972,7 +4983,7 @@ pub(super) fn push_name_findings(findings: &mut Vec<LintFinding>, reference: &Sc
         if !LIBRARY_WHITELIST.contains(&package) {
             findings.push(LintFinding {
                 line: line_of(reference.line),
-                message: format!("package '{package}' is not in the runner image"),
+                message: format!("package '{package}' is not allowed in tool scripts"),
             });
         }
         if let Some(why) = forbidden_reason(function) {
@@ -5012,7 +5023,7 @@ pub(super) fn findings_from_scan(scan: &ScriptScan) -> Vec<LintFinding> {
         {
             findings.push(LintFinding {
                 line: line_of(arg.line),
-                message: format!("package '{}' is not in the runner image", arg.value),
+                message: format!("package '{}' is not allowed in tool scripts", arg.value),
             });
         }
         // A string in either position is a function name R will resolve, so it is read as the

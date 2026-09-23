@@ -186,14 +186,16 @@ fn test_partition_calculation_separates_missing_inputs_from_outputs_to_mint() {
     let suva = (Uuid::from_u128(12), "suva".to_string());
     let held = [doc.0, a254.0].into_iter().collect();
 
-    let partition = super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &held);
+    let partition =
+        super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &held);
     assert_eq!(partition.inputs_present, vec![doc.clone(), a254.clone()]);
     assert!(partition.inputs_missing.is_empty());
     assert!(partition.outputs_existing.is_empty());
     assert_eq!(partition.outputs_to_create, vec![suva.clone()]);
 
     let without_a254 = [doc.0].into_iter().collect();
-    let partition = super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &without_a254);
+    let partition =
+        super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &without_a254);
     assert_eq!(partition.inputs_missing, vec![a254.clone()]);
     assert_eq!(partition.outputs_to_create, vec![suva.clone()]);
 
@@ -208,8 +210,11 @@ fn test_partition_calculation_separates_missing_inputs_from_outputs_to_mint() {
 #[test]
 fn test_partition_calculation_counts_a_repeated_parameter_once() {
     let suva = (Uuid::from_u128(12), "suva".to_string());
-    let partition =
-        super::partition_calculation(&[], &[suva.clone(), suva.clone()], &std::collections::HashSet::new());
+    let partition = super::partition_calculation(
+        &[],
+        &[suva.clone(), suva.clone()],
+        &std::collections::HashSet::new(),
+    );
     assert_eq!(partition.outputs_to_create, vec![suva]);
 }
 
@@ -238,12 +243,19 @@ fn test_a_held_input_does_not_decide_the_arm() {
     let inputs = [oxygen.clone(), alkalinity.clone()];
 
     let deciding = super::cadence_deciding(&inputs, &["alkalinity".to_string()]);
-    assert_eq!(deciding, vec![&oxygen], "the code matches whatever its case");
+    assert_eq!(
+        deciding,
+        vec![&oxygen],
+        "the code matches whatever its case"
+    );
 
     assert_eq!(super::cadence_deciding(&inputs, &[]).len(), 2);
     assert!(
-        super::cadence_deciding(&inputs, &["dissolved_o2".to_string(), "alkalinity".to_string()])
-            .is_empty(),
+        super::cadence_deciding(
+            &inputs,
+            &["dissolved_o2".to_string(), "alkalinity".to_string()]
+        )
+        .is_empty(),
         "a set holding everything it reads decides nothing, and takes the visit arm"
     );
 }

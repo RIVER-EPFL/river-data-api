@@ -86,8 +86,12 @@ pub async fn seed_base_entities(db: &DatabaseConnection) {
         .map(|p| {
             format!(
                 "('{id}', '{site}', '{param}', '{name}', '{st}', {dp}, 600, true)",
-                id = p.site_param_id, site = p.site_id, param = p.global_param_id,
-                name = p.name, st = p.sensor_type, dp = p.decimal_places,
+                id = p.site_param_id,
+                site = p.site_id,
+                param = p.global_param_id,
+                name = p.name,
+                st = p.sensor_type,
+                dp = p.decimal_places,
             )
         })
         .collect();

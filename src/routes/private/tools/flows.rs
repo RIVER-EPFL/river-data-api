@@ -15,13 +15,13 @@ use super::models::{
     MissingConstant, PreviewedValue, RecomputeOutcome, RecomputeScope, RunOutcome, RunTrace,
     ToolCalculation, ToolResult, parse_manifest, run,
 };
-use super::staged::{StagedCell, StagedVisit};
 use super::service::{
     ParameterCatalog, ResolvedRun, VisitContext, build, evaluate_with_trace, execute_resolved,
     formula_bindings, list_active_tools, load_parameter_catalog, numbers_by_name, parse_pinned,
     resolve_event_inputs, resolve_replicate_inputs, resolve_run, resolve_site_inputs,
     run_active_tool, run_fingerprint, runner_runtime, served_spot_value_expr, stored_curves,
 };
+use super::staged::{StagedCell, StagedVisit};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::collection_events::models as collection_events;
@@ -546,9 +546,11 @@ pub async fn recompute_event(
 ) -> AppResult<RecomputeOutcome> {
     let event = load_event(&state.db, event_id).await?;
     let mut staged = StagedVisit::default();
-    Ok(walk_event(state, &event, &mut staged, &Pass::Save { actor })
-        .await?
-        .outcome)
+    Ok(
+        walk_event(state, &event, &mut staged, &Pass::Save { actor })
+            .await?
+            .outcome,
+    )
 }
 
 /// The same chain over the same visit, run against what the operator has typed and not saved, and
@@ -790,14 +792,10 @@ async fn walk_event(
 
         let readings: Vec<GrabSampleReading> = owned_outputs
             .iter()
-            .flat_map(
-                |(key, parameter_id)| match calculation.results.get(key) {
-                    Some(value) => {
-                        readings_for_output(key, *parameter_id, value, event.collected_at)
-                    }
-                    None => Vec::new(),
-                },
-            )
+            .flat_map(|(key, parameter_id)| match calculation.results.get(key) {
+                Some(value) => readings_for_output(key, *parameter_id, value, event.collected_at),
+                None => Vec::new(),
+            })
             .collect();
         if readings.is_empty() {
             let reason = "run produced no savable output".to_string();
@@ -1346,14 +1344,7 @@ pub(super) async fn inputs_exist(
         &mut consumed,
     )
     .await?;
-    resolve_replicate_inputs(
-        &state.db,
-        &tool.manifest,
-        visit,
-        &mut body,
-        &mut consumed,
-    )
-    .await?;
+    resolve_replicate_inputs(&state.db, &tool.manifest, visit, &mut body, &mut consumed).await?;
     for p in &tool.manifest.params {
         if !p.required {
             continue;

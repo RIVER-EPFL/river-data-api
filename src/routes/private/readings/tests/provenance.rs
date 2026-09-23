@@ -121,3 +121,39 @@ mod saved_inputs {
         assert!(err.contains("is not a replicates input"), "{err}");
     }
 }
+
+mod bound_parameters {
+    use super::super::check_bound_parameter;
+    use uuid::Uuid;
+
+    const DOC_PPB: Uuid = Uuid::from_u128(1);
+    const TEMP: Uuid = Uuid::from_u128(2);
+
+    #[test]
+    fn test_a_replicate_saved_under_another_parameter_is_refused_naming_both() {
+        let err = check_bound_parameter("doc", "input", "DOC", Some((DOC_PPB, "DOC_ppb")), TEMP)
+            .unwrap_err();
+        assert!(err.contains("DOC_ppb"), "{err}");
+        assert!(err.contains(&TEMP.to_string()), "{err}");
+    }
+
+    #[test]
+    fn test_a_reading_of_the_bound_parameter_is_accepted() {
+        assert!(
+            check_bound_parameter("doc", "input", "DOC", Some((DOC_PPB, "DOC_ppb")), DOC_PPB)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_an_output_saved_under_another_parameter_is_refused() {
+        let err = check_bound_parameter("doc", "output", "suva", Some((DOC_PPB, "DOC_ppb")), TEMP)
+            .unwrap_err();
+        assert!(err.contains("output 'suva'"), "{err}");
+    }
+
+    #[test]
+    fn test_a_name_the_manifest_binds_to_nothing_keeps_the_requested_parameter() {
+        assert!(check_bound_parameter("doc", "output", "suva", None, TEMP).is_ok());
+    }
+}

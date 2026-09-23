@@ -241,7 +241,8 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     assert!(
         warnings
             .iter()
-            .any(|w| w["kind"] == "catalog_match" && w["existing"]["id"] == serde_json::json!(temp_id)),
+            .any(|w| w["kind"] == "catalog_match"
+                && w["existing"]["id"] == serde_json::json!(temp_id)),
         "the parameter the typed name belongs to is named, got {warnings:?}"
     );
 

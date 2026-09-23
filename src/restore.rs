@@ -105,7 +105,10 @@ const CARRIED: &[Carried] = &[
             ("calibration_id", Reference::Natural("sensor_calibrations")),
             ("deployment_id", Reference::Natural("sensor_deployments")),
             ("standard_curve_id", Reference::Natural("standard_curves")),
-            ("derived_version_id", Reference::Natural("tool_script_versions")),
+            (
+                "derived_version_id",
+                Reference::Natural("tool_script_versions"),
+            ),
             (
                 "collection_event_id",
                 Reference::Natural("collection_events"),

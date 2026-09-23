@@ -146,6 +146,14 @@ async fn setup(temperature: f64) -> (DatabaseConnection, river_db::common::AppSt
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     install_tool(&db).await;
+    // The output is a visit calculation: a high-cadence slot is computed on its stream instead.
+    exec(
+        &db,
+        "UPDATE site_parameters SET cadence = 'low' \
+         WHERE site_id = $1::uuid AND parameter_id = $2::uuid",
+        vec![SITE1_ID.into(), GLOBAL_PARAM_DO_ID.into()],
+    )
+    .await;
     let event_id = seed_visit(&db, temperature).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
     (db, state, event_id)

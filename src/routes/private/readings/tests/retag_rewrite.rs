@@ -54,8 +54,14 @@ fn test_the_span_query_selects_the_rows_the_retag_writes() {
     let ids = vec![Uuid::nil()];
 
     let (write, rows) = retag_readings(Some("spot"), &ids, &ids, Some("cnet")).as_sql();
-    assert!(rows.starts_with(r#"SELECT "time" FROM "readings""#), "{rows}");
-    assert!(!rows.contains(r#"FROM "readings", "data_streams""#), "{rows}");
+    assert!(
+        rows.starts_with(r#"SELECT "time" FROM "readings""#),
+        "{rows}"
+    );
+    assert!(
+        !rows.contains(r#"FROM "readings", "data_streams""#),
+        "{rows}"
+    );
     for predicate in [
         r#""readings"."measurement_type" IS DISTINCT FROM 'spot'"#,
         r#""readings"."sensor_id" IN"#,

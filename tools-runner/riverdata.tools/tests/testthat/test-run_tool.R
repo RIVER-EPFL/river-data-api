@@ -41,3 +41,13 @@ test_that("a syntax error is a tool error too, so an author sees it in the same 
   err <- tryCatch(run_tool("tool <- function( {"), error = function(e) conditionMessage(e))
   expect_equal(jsonlite::fromJSON(err)$error, "tool_error")
 })
+
+test_that("a bench field arriving empty reads as the portal's empty cell", {
+  df <- row_df(list(a = NULL, b = character(0), c = 2.5, d = "VAD"))
+  expect_equal(nrow(df), 1L)
+  expect_equal(names(df), c("a", "b", "c", "d"))
+  expect_true(is.na(df$a))
+  expect_true(is.na(df$b))
+  expect_equal(df$c, 2.5)
+  expect_equal(df$d, "VAD")
+})

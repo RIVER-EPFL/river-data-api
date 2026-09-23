@@ -489,7 +489,9 @@ fn derived_instants(
                     sea_query::Expr::col((sp.clone(), site_parameters::Column::EntryMode))
                         .eq("tool"),
                 )
-                .add(sea_query::Expr::col((sp.clone(), site_parameters::Column::Cadence)).eq("high"))
+                .add(
+                    sea_query::Expr::col((sp.clone(), site_parameters::Column::Cadence)).eq("high"),
+                )
                 .add(
                     sea_query::Expr::col((sp, site_parameters::Column::ParameterId))
                         .equals((o, definition::Column::OutputParameterId)),
@@ -529,9 +531,7 @@ fn instants_a_calculation_reads(calculation_id: Uuid, site_id: Uuid) -> sea_quer
             sea_query::Expr::col((f.clone(), definition::Column::Id))
                 .equals((dps, source::Column::DerivedDefinitionId)),
         )
-        .and_where(
-            sea_query::Expr::col((f, definition::Column::ToolScriptId)).eq(calculation_id),
-        )
+        .and_where(sea_query::Expr::col((f, definition::Column::ToolScriptId)).eq(calculation_id))
         .and_where(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
         .order_by((r, readings::Column::Time), sea_query::Order::Asc)
         .to_owned()
@@ -677,7 +677,10 @@ impl Job for DerivedAssignment {
 
         let rows = ctx
             .db()
-            .query_all_raw(build(&instants_a_calculation_reads(calculation_id, site_id)))
+            .query_all_raw(build(&instants_a_calculation_reads(
+                calculation_id,
+                site_id,
+            )))
             .await?;
 
         let mut filled = 0i64;

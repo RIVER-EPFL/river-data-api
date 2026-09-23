@@ -74,13 +74,17 @@ async fn a_low_cadence_tool_slot_is_no_work_for_the_stream_side() {
 
     declare_slot(&db, site_id, output, "low").await;
     assert!(
-        !site_has_active_derived(&db, site_id).await.expect("a query"),
+        !site_has_active_derived(&db, site_id)
+            .await
+            .expect("a query"),
         "a slot the lab fills at a visit is the chain's, so an ingest spawns no stream recompute"
     );
 
     set_cadence(&db, site_id, output, "high").await;
     assert!(
-        site_has_active_derived(&db, site_id).await.expect("a query"),
+        site_has_active_derived(&db, site_id)
+            .await
+            .expect("a query"),
         "the same slot declared on the stream arm is work the ingest must enqueue"
     );
 }

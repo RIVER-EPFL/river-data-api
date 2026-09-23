@@ -86,11 +86,7 @@ async fn slot_count(db: &DatabaseConnection, parameter_id: &str) -> i64 {
     .expect("n")
 }
 
-async fn add_formula(
-    f: &crate::common::Fixture,
-    script_id: &str,
-    formula: &str,
-) -> (u16, String) {
+async fn add_formula(f: &crate::common::Fixture, script_id: &str, formula: &str) -> (u16, String) {
     crate::common::save_formula_set(
         &f.app,
         &f.token,
@@ -163,7 +159,10 @@ async fn applying_a_calculation_mints_its_output_slots_and_leaves_the_second_app
     let (status, dry) = apply(&f, &script_id, true).await;
     assert_eq!(status, 200, "the dry run: {dry}");
     assert_eq!(codes(&dry["inputs_missing"]), Vec::<String>::new());
-    assert_eq!(codes(&dry["outputs_created"]), vec![OUTPUT_CODE.to_string()]);
+    assert_eq!(
+        codes(&dry["outputs_created"]),
+        vec![OUTPUT_CODE.to_string()]
+    );
     assert!(
         !codes(&dry["inputs_present"]).is_empty(),
         "the input the site declares is reported: {dry}"
@@ -231,9 +230,10 @@ async fn applying_a_calculation_mints_its_output_slots_and_leaves_the_second_app
         exec(&db, &sql).await;
     }
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
-    let outcome = river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
-        .await
-        .expect("the run");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("the run");
     assert_eq!(
         outcome.not_applicable,
         Vec::<String>::new(),
@@ -360,8 +360,10 @@ async fn a_held_input_does_not_pull_the_output_onto_the_visit_arm() {
     .await;
     exec(
         &db,
-        &format!("UPDATE derived_parameter_sources SET alignment = 'hold' \
-                   WHERE parameter_id = '{lab}'"),
+        &format!(
+            "UPDATE derived_parameter_sources SET alignment = 'hold' \
+                   WHERE parameter_id = '{lab}'"
+        ),
     )
     .await;
     let (status, text) = add_formula(&f, &script_id, "Dissolved_O2 * Held_lab_value").await;

@@ -1481,7 +1481,16 @@ pub async fn enqueue<C: ConnectionTrait>(
     params: &serde_json::Value,
     dedupe_key: Option<&str>,
 ) -> Result<Option<Uuid>, sea_orm::DbErr> {
-    enqueue_under(db, trigger_type, sensor_id, trigger_id, params, dedupe_key, None).await
+    enqueue_under(
+        db,
+        trigger_type,
+        sensor_id,
+        trigger_id,
+        params,
+        dedupe_key,
+        None,
+    )
+    .await
 }
 
 /// Enqueue the work a running job hands on, naming that job as the parent. The panel shows the

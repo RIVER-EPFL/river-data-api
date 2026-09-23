@@ -30,8 +30,17 @@ async fn setup() -> (
         &db,
         &format!(
             "INSERT INTO parameters (id, code, name, category, default_units) \
-             VALUES ('{DOC_PARAM}', 'DOC', 'DOC', 'measurement', 'ppb')"
+             VALUES ('{DOC_PARAM}', 'DOC_ppb', 'DOC', 'measurement', 'ppb')"
         ),
+    )
+    .await;
+    e2e::declare_site_slots(
+        &db,
+        &app,
+        &token,
+        crate::common::SITE1_ID,
+        "doc",
+        &[DOC_PARAM],
     )
     .await;
     let sensor_id = e2e::create_sensor(&app, &token, DOC_PARAM, "TOC-DOC-1").await;

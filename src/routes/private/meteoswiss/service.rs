@@ -1099,11 +1099,7 @@ fn station_publishes(
     Err(unpublished(&typed, declared, listed))
 }
 
-fn unpublished(
-    typed: &str,
-    declared: &Variable,
-    listed: &[station::Model],
-) -> crudcrate::ApiError {
+fn unpublished(typed: &str, declared: &Variable, listed: &[station::Model]) -> crudcrate::ApiError {
     let publishing: Vec<&station::Model> = listed
         .iter()
         .filter(|station| publishes(declared, station))
