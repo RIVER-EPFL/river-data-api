@@ -71,8 +71,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
         // Every rejection comes before the recall. A refused create must leave the sensor deployed
-        // exactly where it was: the recall used to run first, so a 400 still closed the open
-        // deployment and the next reprocess un-attributed everything logged after it.
+        // exactly where it was, or the next reprocess un-attributes everything logged after it.
         //
         // One sensor per (site, parameter) at a time is hard-enforced by the
         // `excl_deployment_site_param_slot` constraint. The check names the blocking row so the

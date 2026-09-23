@@ -3609,7 +3609,7 @@ pub fn edit_options(p: &RowProvenance) -> Vec<EditOption> {
             options.push(EditOption::EditCalibration);
         }
         // With no deployment the fix is to create one, so the surface points at the deployment
-        // either way rather than falling silent where a pin used to be offered.
+        // either way rather than falling silent.
         options.push(EditOption::EditDeployment);
     }
     options.push(if p.is_flagged {
@@ -3712,9 +3712,16 @@ pub(super) fn classification(source_system: &str) -> String {
 pub(super) async fn inspect_rows<C: ConnectionTrait>(
     conn: &C,
     selection: &Selection,
+    within: Option<&[Uuid]>,
 ) -> AppResult<Vec<InspectedRow>> {
+    let mut rows_where = selection.condition()?;
+    if let Some(sites) = within {
+        rows_where = rows_where.add(
+            Expr::col((Alias::new("r"), readings::Column::SiteId)).is_in(sites.iter().copied()),
+        );
+    }
     let (sql, values) = stored_rows()
-        .cond_where(selection.condition()?)
+        .cond_where(rows_where)
         .order_by((Alias::new("r"), readings::Column::Time), Order::Asc)
         .order_by((Alias::new("r"), readings::Column::StreamId), Order::Asc)
         .order_by(
@@ -3964,7 +3971,7 @@ pub(super) async fn refuse_unrouted<C: ConnectionTrait>(
     selection: &Selection,
     option: EditOption,
 ) -> AppResult<()> {
-    for row in inspect_rows(conn, selection).await? {
+    for row in inspect_rows(conn, selection, None).await? {
         if !row.options.contains(&option) {
             return Err(AppError::BadRequest(format!(
                 "the reading at {} replicate {} is not corrected here: {}",
@@ -3990,6 +3997,109 @@ pub(super) fn authorise(auth: &AuthContext, option: EditOption) -> AppResult<()>
         "that edit requires {}",
         option.capability()
     )))
+}
+
+/// The sites a restricted caller must hold to edit readings at these sites. A reading paired to no
+/// site belongs to no project, so a restricted caller is refused it rather than let through.
+pub(super) fn sites_to_confine(
+    scope: &AccessScope,
+    sites: &[Option<Uuid>],
+) -> AppResult<Vec<Uuid>> {
+    if scope.is_restricted() && sites.iter().any(Option::is_none) {
+        return Err(AppError::Forbidden(
+            "A reading paired to no site is outside your project access".to_string(),
+        ));
+    }
+    Ok(sites.iter().flatten().copied().collect())
+}
+
+/// Refuse an edit reaching a site outside the caller's projects.
+pub(super) async fn require_edit_in_scope(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    sites: &[Option<Uuid>],
+) -> AppResult<()> {
+    enforce_project_scope_for_sites(db, scope, &sites_to_confine(scope, sites)?).await
+}
+
+/// The sites of the readings a selection names, NULL for an unpaired one.
+pub(super) async fn selected_sites<C: ConnectionTrait>(
+    conn: &C,
+    rows: Condition,
+) -> AppResult<Vec<Option<Uuid>>> {
+    let r = Alias::new("r");
+    let (sql, values) = readings_joined(r.clone())
+        .distinct()
+        .column((r, readings::Column::SiteId))
+        .cond_where(rows)
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    sites_of(conn, sql, values).await
+}
+
+/// The sites of the readings the decisions whose `column` is `id` stand on (one decision by its
+/// id, or a set by its `set_id`), NULL for an unpaired one.
+pub(super) async fn decided_sites<C: ConnectionTrait>(
+    conn: &C,
+    column: decision_model::Column,
+    id: Uuid,
+) -> AppResult<Vec<Option<Uuid>>> {
+    let r = Alias::new("r");
+    let d = Alias::new("d");
+    let (sql, values) = Query::select()
+        .distinct()
+        .column((r.clone(), readings::Column::SiteId))
+        .from_as(decision_model::Entity, d.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            readings::Entity,
+            r.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((r.clone(), readings::Column::StreamId))
+                        .equals((d.clone(), decision_model::Column::StreamId)),
+                )
+                .add(
+                    Expr::col((r.clone(), readings::Column::Time))
+                        .equals((d.clone(), decision_model::Column::Time)),
+                )
+                .add(
+                    Condition::any()
+                        .add(
+                            Expr::col((d.clone(), decision_model::Column::ReplicateIndex))
+                                .is_null(),
+                        )
+                        .add(
+                            Expr::col((d, decision_model::Column::ReplicateIndex))
+                                .equals((r, readings::Column::ReplicateIndex)),
+                        ),
+                ),
+        )
+        .and_where(Expr::col((Alias::new("d"), column)).eq(id))
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    sites_of(conn, sql, values).await
+}
+
+async fn sites_of<C: ConnectionTrait>(
+    conn: &C,
+    sql: String,
+    values: sea_orm::sea_query::Values,
+) -> AppResult<Vec<Option<Uuid>>> {
+    #[derive(FromQueryResult)]
+    struct SiteRow {
+        site_id: Option<Uuid>,
+    }
+    Ok(SiteRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .all(conn)
+    .await?
+    .into_iter()
+    .map(|row| row.site_id)
+    .collect())
 }
 
 /// What every edit owes after its transaction commits, forward or inverted: the rollups over the
@@ -4567,6 +4677,27 @@ fn provenance_rows() -> sea_orm::Select<readings::Entity> {
     readings::Entity::find()
         .select_only()
         .columns(PROVENANCE_ROW_COLUMNS)
+}
+
+/// Refuse a scoped caller the reading at `stream_id` and `time` when it is outside its projects,
+/// as not-found, by the same rows the provenance record reads.
+pub async fn require_reading_in_scope(
+    db: &sea_orm::DatabaseConnection,
+    scope: &crate::common::authz::AccessScope,
+    stream_id: Uuid,
+    time: DateTime<Utc>,
+) -> AppResult<()> {
+    if !scope.is_restricted() {
+        return Ok(());
+    }
+    let key = ProvenanceQuery {
+        time,
+        stream_id: Some(stream_id),
+        site_id: None,
+        parameter_id: None,
+        measurement_type: None,
+    };
+    rows_at(db, &key, scope).await.map(|_| ())
 }
 
 /// The replicate group at the instant, by either key form, refused to a scoped caller who may not
@@ -5962,11 +6093,17 @@ pub(super) async fn slot_identity(
 /// than this is told to re-upload rather than given half a file.
 pub const IMPORT_SESSION_RETENTION_MINUTES: i64 = 60;
 
-/// The session a chunk names has to be one this upload opened, so a typo in a session id starts
-/// no second file under it.
-pub async fn require_open_session<C: ConnectionTrait>(db: &C, session_id: Uuid) -> AppResult<()> {
+/// The session a chunk names has to be one this caller opened, so a typo in a session id starts
+/// no second file under it and a session id someone else learns reaches nothing. Another caller's
+/// session reads as not found, which says nothing about whether it exists.
+pub async fn require_open_session<C: ConnectionTrait>(
+    db: &C,
+    session_id: Uuid,
+    opener: &str,
+) -> AppResult<()> {
     let held = import_chunk::Entity::find()
         .filter(import_chunk::Column::SessionId.eq(session_id))
+        .filter(import_chunk::Column::OpenedBy.eq(opener))
         .count(db)
         .await?;
     if held == 0 {
@@ -5982,6 +6119,7 @@ pub async fn require_open_session<C: ConnectionTrait>(db: &C, session_id: Uuid) 
 pub async fn append_chunk<C: ConnectionTrait>(
     db: &C,
     session_id: Uuid,
+    opener: &str,
     chunk: &str,
 ) -> AppResult<usize> {
     let seq = import_chunk::Entity::find()
@@ -5997,6 +6135,7 @@ pub async fn append_chunk<C: ConnectionTrait>(
         session_id: Set(session_id),
         seq: Set(seq),
         chunk: Set(chunk.to_string()),
+        opened_by: Set(opener.to_string()),
         ..Default::default()
     }
     .insert(db)
@@ -6019,10 +6158,15 @@ async fn staged_size<C: ConnectionTrait>(db: &C, session_id: Uuid) -> AppResult<
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
-/// The file a session holds, its chunks in the order they arrived.
-pub async fn staged_text<C: ConnectionTrait>(db: &C, session_id: Uuid) -> AppResult<String> {
+/// The file a session holds, its chunks in the order they arrived. Only its opener reads it.
+pub async fn staged_text<C: ConnectionTrait>(
+    db: &C,
+    session_id: Uuid,
+    opener: &str,
+) -> AppResult<String> {
     let rows = import_chunk::Entity::find()
         .filter(import_chunk::Column::SessionId.eq(session_id))
+        .filter(import_chunk::Column::OpenedBy.eq(opener))
         .order_by_asc(import_chunk::Column::Seq)
         .all(db)
         .await?;
@@ -7216,9 +7360,8 @@ pub(super) async fn insert_reading_chunks<C: ConnectionTrait>(
 /// the claims as the source made them, `computed` what was stored instead.
 ///
 /// A stripped claim explains a statistics disagreement at the same instant rather than sitting
-/// beside it, so raising this hold supersedes a live `replicate_stats` hold there. That precedence
-/// used to fall out of the two sharing one upsert key; the key now carries `kind`, so it is stated
-/// here instead of happening by accident.
+/// beside it, so raising this hold supersedes a live `replicate_stats` hold there. The upsert key
+/// carries `kind`, so the precedence is stated here rather than falling out of the key.
 pub(super) async fn upsert_curve_claim_hold<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
@@ -9817,7 +9960,7 @@ mod tail;
 #[path = "tests/batch.rs"]
 mod batch;
 
-// --- Statements the handlers and job bodies used to spell ---
+// --- Statements the handlers and job bodies share ---
 
 /// The readings whose stored curation columns disagree with what their decision record asserts,
 /// newest first. A reading outside the caller's projects is not theirs to see, and an unpaired one

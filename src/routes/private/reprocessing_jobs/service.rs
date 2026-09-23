@@ -1163,7 +1163,7 @@ pub fn next_run_after(
 
 // --- The recurring-service scheduler ---
 //
-// DB-backed recurring-Service scheduler (ADR 0001, Wave 2).
+// DB-backed recurring-Service scheduler (ADR 0001).
 //
 // Every replica runs this tick loop, but each due Service fires exactly once per scheduled slot
 // across the whole fleet. Two layers guarantee that at 2-3 k8s replicas:

@@ -1,9 +1,7 @@
 //! Auth edge cases: malformed headers, race conditions, revocation timing, bypass attempts.
 //!
-//! Goal: catch class-of-bugs we don't think to add explicit tests for. Each case here is
-//! either (a) a pre-existing security property the unified tier inherits and must not
-//! regress, or (b) a property newly enforced by `require_admin` that needs explicit
-//! coverage.
+//! Each case is a security property of the unified tier: one it holds by construction, or one
+//! `require_admin` enforces.
 
 use chrono::{Duration, Utc};
 use serial_test::serial;

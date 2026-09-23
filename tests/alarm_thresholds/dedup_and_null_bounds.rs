@@ -59,8 +59,7 @@ async fn test_global_plus_site_specific_threshold_no_duplicate_rows() {
     if let Some(temp) = temp_param {
         let severities = temp["severities"].as_array().unwrap();
 
-        // Each timestamp should appear at most ONCE per parameter.
-        // Before the fix, the JOIN would produce duplicate rows.
+        // Each timestamp should appear at most ONCE per parameter, however many thresholds join.
         // Count non-zero severities
         let violation_count: usize = severities
             .iter()

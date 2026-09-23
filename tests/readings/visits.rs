@@ -385,7 +385,10 @@ async fn a_stream_keyed_hold_marks_the_visit_it_lands_at() {
 
     let (status, detail) = crate::common::get_json_with_token(
         &app,
-        &format!("/api/collection_events/{}/detail", row["id"].as_str().unwrap()),
+        &format!(
+            "/api/collection_events/{}/detail",
+            row["id"].as_str().unwrap()
+        ),
         &token,
     )
     .await;
@@ -576,8 +579,8 @@ async fn a_replicate_says_what_kind_of_instrument_it_names() {
     );
 }
 
-/// Fifty-five empty visits on top of the two with readings, so the default page size the list
-/// used to apply would truncate the answer.
+/// Fifty-five empty visits on top of the two with readings, more than a default page size would
+/// hold.
 async fn stage_many_visits(db: &DatabaseConnection) {
     crate::common::exec(
         db,

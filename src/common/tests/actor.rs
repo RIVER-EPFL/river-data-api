@@ -14,9 +14,8 @@ fn keycloak(email: Option<&str>) -> AuthContext {
     }
 }
 
-/// One label for one caller, whatever route recorded it: four copies of this used to disagree,
-/// two writing the literal "keycloak" where the other two wrote the subject, so the same person
-/// appeared under two names depending on which endpoint they used.
+/// One label for one caller, whatever route recorded it, so the same person never appears under
+/// two names depending on which endpoint they used.
 #[test]
 fn every_caller_has_exactly_one_name() {
     assert_eq!(label(&keycloak(Some("evan@epfl.ch"))), "evan@epfl.ch");

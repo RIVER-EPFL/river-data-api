@@ -21,8 +21,7 @@
 //! and two things can put a guard somewhere this scan does not look: the whole `/api` router is
 //! mounted behind `service_auth_middleware` at the mount point, and a handler may refuse a caller
 //! itself (`/me` refuses an API token, which has no user sub). Every component that owns routes
-//! now carries their layers in the block that declares them, so a guard applied at a nest site is
-//! no longer one of them. The genuinely open surface is `/healthz`, `/readyz`, `/enroll`, which
+//! carries their layers in the block that declares them, so no guard is applied at a nest site. The genuinely open surface is `/healthz`, `/readyz`, `/enroll`, which
 //! authenticates on body credentials, and the public API under `/{project_code}`.
 //!
 //! A path can hold more than one row: the table is keyed on the path as declared, so `/services`

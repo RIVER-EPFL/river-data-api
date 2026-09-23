@@ -42,7 +42,7 @@ async fn deployed_until(
         .map(|t| t.with_timezone(&chrono::Utc))
 }
 
-/// H8/H9, a multi-channel instrument holds one open deployment per parameter. Deploying a second
+/// A multi-channel instrument holds one open deployment per parameter. Deploying a second
 /// channel (a different parameter) at the same site must NOT auto-recall the first channel: the recall
 /// is scoped to the parameter being deployed.
 #[tokio::test]

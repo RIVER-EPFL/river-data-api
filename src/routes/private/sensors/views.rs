@@ -282,7 +282,7 @@ pub async fn adopt_sensor(
         .exec(&txn)
         .await?;
 
-    // Insert the deployment, authoring parameter_id (the derive-from-sensor trigger was dropped);
+    // Insert the deployment, authoring parameter_id (nothing derives it from the sensor);
     // the excl_deployment_site_param_slot constraint is the atomic cross-sensor guard.
     let dep_id = Uuid::new_v4();
     let dep_type = payload
@@ -1024,7 +1024,7 @@ struct SeriesParameterRow {
 /// The parameter this response is about, and the units that go with it.
 ///
 /// One resolution step feeds both the reported identity and every query's predicate, so the
-/// series can no longer hold a different quantity from the one the response names. A sensor with
+/// series cannot hold a different quantity from the one the response names. A sensor with
 /// no deployment and no explicit request resolves to `None`, and the series is then unfiltered,
 /// which keeps a never-deployed instrument's plot from coming back empty.
 async fn resolve_series_parameter(

@@ -51,8 +51,8 @@ fn a_formula_reading_its_own_output_is_refused() {
     assert!(err.contains("its own output parameter"), "{err}");
 }
 
-/// Depth is not a limit (Q96): a chain that orders is runnable however deep it runs. Four
-/// stages is past the cap this used to enforce.
+/// Depth is not a limit (Q96): a chain that orders is runnable however deep it runs, four stages
+/// included.
 #[test]
 fn a_deep_chain_is_allowed() {
     let outputs: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();

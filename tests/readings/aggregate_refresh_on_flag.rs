@@ -1,7 +1,7 @@
-//! H13, flagging a reading must refresh the continuous aggregates so the flagged value stops being
-//! served from the rollups. The refresh window is widened to a full bucket; before the fix a
-//! single-reading `[t, t+1s)` window was narrower than every aggregate's bucket and TimescaleDB
-//! rejected it, leaving the rollup either stale or (as here) never materialised.
+//! Flagging a reading must refresh the continuous aggregates so the flagged value stops being
+//! served from the rollups. The refresh window is widened to a full bucket: a single-reading
+//! `[t, t+1s)` window is narrower than every aggregate's bucket and TimescaleDB rejects it,
+//! leaving the rollup either stale or (as here) never materialised.
 //!
 //! Run: cargo test --test readings aggregate_refresh_on_flag -- --test-threads=1
 
@@ -67,7 +67,7 @@ async fn flagging_a_reading_refreshes_the_hourly_aggregate() {
     assert_eq!(status, 200, "flag: {body}");
 
     // The flag endpoint's aggregate refresh must have materialised the bucket excluding the flagged
-    // reading. Before the fix the refresh CALL failed (window too small) and this row never appeared.
+    // reading.
     let (avg, count) = hourly(&db, "2025-06-15T10:00:00Z")
         .await
         .expect("hourly bucket must exist after the flag-triggered refresh");

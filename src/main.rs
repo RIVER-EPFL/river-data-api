@@ -124,9 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The background loops (derived janitor, alarm sweeper, notification dispatcher,
-    // identity reconciliation, channel health) are now recurring Services run through the DB-backed
-    // scheduler: each fires as a Job claimed by exactly one replica per scheduled tick, so they no
-    // longer double-fire at 2-3 k8s replicas. The registry carries their cadence from Config; the
+    // identity reconciliation, channel health) are recurring Services run through the DB-backed
+    // scheduler: each fires as a Job claimed by exactly one replica per scheduled tick, so none
+    // double-fires at 2-3 k8s replicas. The registry carries their cadence from Config; the
     // scheduler seeds a `schedules` row per Service on first start and ticks them thereafter.
     let mut registry = river_db::routes::private::reprocessing_jobs::service::build_registry();
     river_db::routes::private::reprocessing_jobs::service::register_scheduled_services(

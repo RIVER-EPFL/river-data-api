@@ -129,7 +129,7 @@ async fn record(db: &DatabaseConnection, d: Decision) -> Uuid {
         .expect("decision recorded")
 }
 
-/// Insert a decision of a kind nothing records any more (Q117), which is how a stored one exists:
+/// Insert a decision of a kind nothing records (Q117), which is how a stored one exists:
 /// the trigger projects it and the drift report folds it exactly as when a route wrote it.
 async fn record_historical(db: &DatabaseConnection, d: &Decision) {
     crate::common::exec(
@@ -1331,8 +1331,7 @@ async fn the_drift_report_folds_every_column_a_decision_asserts() {
     );
 }
 
-/// Scenario: `ingested_at` is the row's first arrival, and the correction arm used to re-stamp it
-/// with the clock whenever the raw value moved (Q86).
+/// Scenario: `ingested_at` is the row's first arrival, and a correction moves the raw value (Q86).
 ///
 /// Expected behaviour: no decision moves the column, so a correction and a rollback of one both
 /// leave it exactly where the row's own ingest put it.

@@ -475,8 +475,7 @@ impl DerivedGraph {
 ///
 /// The question is the one every engine asks of its own graph, so it is asked here through
 /// `common::dependency` rather than walked again: build the graph this save would create, and
-/// order it. Depth is not a question any more (Q96): a chain that orders is runnable however deep
-/// it is.
+/// order it. Depth is not a question (Q96): a chain that orders is runnable however deep it is.
 fn validate_dependency_chain(
     graph: &DerivedGraph,
     output_parameter_id: Option<Uuid>,

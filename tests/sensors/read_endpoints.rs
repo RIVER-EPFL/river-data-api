@@ -1,4 +1,4 @@
-//! The Phase 4 read substrate that drives the sensor-aware plot overlays: per-sensor series,
+//! The read substrate that drives the sensor-aware plot overlays: per-sensor series,
 //! deployment bands, the calibration-window points, and the per-site sensor-identity (bands +
 //! calibration markers keyed by parameter). Exercised over the real HTTP surface with a seeded token.
 //!

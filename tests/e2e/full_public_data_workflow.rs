@@ -92,7 +92,7 @@ async fn test_full_public_data_workflow() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    // 1. Project (public).
+    // Project (public).
     let (status, project) = crate::common::post_json_parse_with_token(
         &app,
         "/api/projects",
@@ -112,7 +112,7 @@ async fn test_full_public_data_workflow() {
     );
     let project_id = id_of(&project);
 
-    // 2. Site.
+    // Site.
     let (status, site) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sites",
@@ -132,7 +132,7 @@ async fn test_full_public_data_workflow() {
     );
     let site_id = id_of(&site);
 
-    // 3. Raw parameters (global catalog).
+    // Raw parameters (global catalog).
     let (_s, do_param) = crate::common::post_json_parse_with_token(
         &app,
         "/api/parameters",
@@ -156,7 +156,7 @@ async fn test_full_public_data_workflow() {
     .await;
     let temp_param_id = id_of(&temp_param);
 
-    // 4. Assign raw parameters to the site.
+    // Assign raw parameters to the site.
     for (pid, name) in [(&do_param_id, "DO"), (&temp_param_id, "Temp")] {
         let (status, sp) = crate::common::post_json_with_token(
             &app,
@@ -174,7 +174,7 @@ async fn test_full_public_data_workflow() {
         );
     }
 
-    // 5. Sensor + its bench calibration (part of station setup).
+    // Sensor + its bench calibration (part of station setup).
     let (_s, sensor) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sensors",
@@ -201,7 +201,7 @@ async fn test_full_public_data_workflow() {
         "create calibration ({status}): {cal}"
     );
 
-    // 6. Derived parameter DOmgL = dissolved_oxygen * 0.032 (after-create hook makes the output param).
+    // Derived parameter DOmgL = dissolved_oxygen * 0.032 (after-create hook makes the output param).
     let calculation = crate::common::seed_formula_calculation(&db, "domgl_set").await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &app,
@@ -220,7 +220,7 @@ async fn test_full_public_data_workflow() {
     );
     let derived_param_id = def["output_parameter_id"].as_str().unwrap().to_string();
 
-    // 7. Assign the derived parameter to the site.
+    // Assign the derived parameter to the site.
     let (status, sp) = crate::common::post_json_with_token(
         &app,
         "/api/site_parameters",
@@ -236,7 +236,7 @@ async fn test_full_public_data_workflow() {
         "assign derived ({status}): {sp}"
     );
 
-    // 8. Mark the site_parameters as public.
+    // Mark the site_parameters as public.
     {
         use sea_orm::{ConnectionTrait, Statement};
         db.execute_raw(Statement::from_string(
@@ -247,7 +247,7 @@ async fn test_full_public_data_workflow() {
         .expect("mark site_parameters public");
     }
 
-    // 9. Ingest historical data via the CSV import endpoint (client wide-CSV format).
+    // Ingest historical data via the CSV import endpoint (client wide-CSV format).
     let (status, body) = crate::common::post_json_with_token(
         &app,
         "/api/readings/import_csv",
@@ -270,7 +270,7 @@ async fn test_full_public_data_workflow() {
         .expect("expected a derived job id");
     crate::common::e2e::poll_job(&app, &token, job_id, 30).await;
 
-    // 10. Public discovery + sites list reflect the new project/site.
+    // Public discovery + sites list reflect the new project/site.
     let (status, discovery) = crate::common::get_json(&app, "/api/public").await;
     assert_eq!(status, 200);
     assert!(
@@ -318,7 +318,7 @@ async fn test_full_public_data_workflow() {
         );
     }
 
-    // 11. Public readings reproduce the real raw data exactly AND the recomputed derived value.
+    // Public readings reproduce the real raw data exactly AND the recomputed derived value.
     // Public parameters are keyed by their short `code`: "dissolved_oxygen", "temperature", "DOmgL".
     let to_iso = |s: &str| s.replace(' ', "T") + "Z";
     let readings_uri = format!(
@@ -356,7 +356,7 @@ async fn test_full_public_data_workflow() {
         );
     }
 
-    // 12. Hourly aggregate over the first hour equals the mean of that hour's real readings.
+    // Hourly aggregate over the first hour equals the mean of that hour's real readings.
     let hour0: Vec<f64> = rows
         .iter()
         .filter(|(dt, _, _)| &dt[11..13] == "00")

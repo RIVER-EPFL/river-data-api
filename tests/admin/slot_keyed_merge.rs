@@ -1,7 +1,6 @@
 //! Scenario: two slots at one site describe the same measurement and an operator merges them.
 //!
-//! Expected behaviour: every table keyed by (site, parameter) travels to the survivor, not only the
-//! two the merge used to know about; and a move that would collide on a survivor's unique
+//! Expected behaviour: every table keyed by (site, parameter) travels to the survivor; and a move that would collide on a survivor's unique
 //! constraint is refused whole rather than half-applied.
 //!
 //! Run: cargo test --test admin slot_keyed_merge -- --test-threads=1

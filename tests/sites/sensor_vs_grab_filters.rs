@@ -70,7 +70,7 @@ async fn flagged_and_replicate_rows_are_excluded_from_the_sensor_average() {
     assert_eq!(status, 200, "grab entry ({status}): {body}");
 
     // Window is [T+2h, T+6h]: two clean points and one flagged spike. The export's
-    // `replicate_index = 0` predicate has no probe here any more: no write path admits a non-zero
+    // `replicate_index = 0` predicate has no probe here: no write path admits a non-zero
     // index on a non-spot reading and a table CHECK refuses one, so it covers only rows that
     // predate both.
     let stream = make_stream(&db).await;

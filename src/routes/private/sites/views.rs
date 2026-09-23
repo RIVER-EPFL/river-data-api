@@ -2269,7 +2269,7 @@ pub async fn get_site_sensor_identity(
 
     // Calibration markers: calibrations (overlapping the window) of the sensors deployed at this
     // site over the window, grouped by the sensor's parameter.
-    // Markers use the calibration's own parameter (the sensor no longer carries one), so a
+    // Markers use the calibration's own parameter (a sensor carries none), so a
     // calibration whose parameter is not resolved yet has no series to sit on and is not a
     // plottable marker. Lab curves cannot appear here at all: they live in `standard_curves`,
     // which has no window to plot.

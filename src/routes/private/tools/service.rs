@@ -664,6 +664,27 @@ pub async fn find_active_tool_by_id(db: &DatabaseConnection, id: Uuid) -> AppRes
     row_to_active(&row)
 }
 
+/// A stored run, refused to a scoped caller as not-found when its site is outside the caller's
+/// projects. A run computed at no site belongs to no project and is refused the same way.
+pub async fn find_run_in_scope(
+    db: &DatabaseConnection,
+    scope: &crate::common::authz::AccessScope,
+    id: Uuid,
+) -> AppResult<super::models::run::Model> {
+    use crate::common::scope::{RowProject, Unowned, project_of_site, require_row_in_scope};
+    let what = format!("Tool run {id}");
+    let run = super::models::run::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{what} not found")))?;
+    let project = match run.site_id {
+        Some(site_id) => project_of_site(db, site_id).await?,
+        None => RowProject::Unresolved,
+    };
+    require_row_in_scope(scope, &project, Unowned::Deny, &what)?;
+    Ok(run)
+}
+
 pub(super) async fn resolve_curve(
     db: &DatabaseConnection,
     slot: &ManifestCurve,
@@ -4976,10 +4997,8 @@ pub(super) async fn active_calculations<C: ConnectionTrait>(
 
 /// Every parameter a manifest names exists in the catalog.
 ///
-/// It used to also require each one to be a member of the calculation's own group in the role the
-/// member declared. Q135 retired that: roles are read off the calculations and a group is a way to
-/// list many parameters together, so a calculation reads any catalog parameter. What is left is
-/// that a code it names must resolve to one.
+/// A calculation reads any catalog parameter, whatever group it is in (Q135): roles are read off
+/// the calculations, and a group is a way to list many parameters together.
 pub async fn check_manifest_codes_resolve<C: ConnectionTrait>(
     db: &C,
     name: &str,

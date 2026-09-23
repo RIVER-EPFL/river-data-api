@@ -182,3 +182,34 @@ mod cadence_filter {
         }
     }
 }
+
+mod sites_to_confine {
+    use uuid::Uuid;
+
+    use super::super::sites_to_confine;
+    use crate::common::authz::AccessScope;
+
+    #[test]
+    fn test_a_restricted_caller_is_held_to_every_site_the_edit_reaches() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let sites = sites_to_confine(&AccessScope::one(Uuid::from_u128(9)), &[Some(a), Some(b)])
+            .expect("the sites are checked against the grant, not refused here");
+        assert_eq!(sites, vec![a, b]);
+    }
+
+    /// An unpaired reading resolves to no project, so a restricted caller fails closed on it.
+    #[test]
+    fn test_a_restricted_caller_is_refused_a_reading_paired_to_no_site() {
+        let refused = sites_to_confine(
+            &AccessScope::one(Uuid::from_u128(9)),
+            &[Some(Uuid::from_u128(1)), None],
+        );
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn test_an_unrestricted_caller_edits_an_unpaired_reading() {
+        let sites = sites_to_confine(&AccessScope::Unrestricted, &[None]).expect("unrestricted");
+        assert!(sites.is_empty());
+    }
+}

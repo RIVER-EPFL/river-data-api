@@ -3145,7 +3145,7 @@ pub fn resolve_instrument(
 
     // An instrument the stream already names is an attribution somebody made: a declaration on the
     // descriptor, a pairing, or an operator's repoint. Registration mints none (M172), so there is
-    // no default to see through here any more.
+    // no default to see through here.
     if let Some(id) = stream_sensor_id {
         let (name, source_key) = catalog
             .by_id
@@ -7073,8 +7073,8 @@ pub(super) async fn apply_instrument_updates(
             }
             // Naming an instrument proposes one; picking from the inventory attaches one. So a
             // name arriving at an entry that holds an existing instrument returns it to a
-            // proposal, rather than doing nothing (which is what an operator undoing a mis-click
-            // used to get) or renaming the inventory row (which this route never does).
+            // proposal, so an operator can undo a mis-click, rather than renaming the inventory row
+            // (which this route never does).
             if let Some(name) = &update.instrument_name
                 && repointed.is_none()
                 && !name.trim().is_empty()

@@ -99,7 +99,7 @@ async fn deployed_until_null_filter_returns_only_open() {
 ///
 /// Expected behaviour: a deployment binds a sensor to one parameter at a site, so a create without
 /// `parameter_id` is refused and the same body carrying it succeeds. Nothing derives the parameter
-/// from the sensor any more, so a client that omits it has no deployment.
+/// from the sensor, so a client that omits it has no deployment.
 #[tokio::test]
 #[serial]
 async fn a_deployment_create_without_a_parameter_is_refused() {

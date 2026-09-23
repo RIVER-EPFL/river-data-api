@@ -238,3 +238,63 @@ async fn the_prune_removes_an_abandoned_upload_and_keeps_a_live_one() {
         "the live session is untouched ({status}): {resp}"
     );
 }
+
+/// Scenario: a second caller with `write_data` learns the id of an upload someone else opened.
+///
+/// Expected behaviour: the session is the opener's alone, so neither an append nor an import
+/// naming it reaches the file, and the opener's own upload still imports whole.
+#[tokio::test]
+#[serial]
+async fn a_session_is_refused_to_anyone_but_its_opener() {
+    let (db, app, token) = setup().await;
+    let stranger = crate::common::seed::seed_token_full(&db).await;
+
+    let (status, opened) = chunk(
+        &app,
+        &token,
+        &serde_json::json!({ "chunk": "DateTime,Dissolved_O2\n2025-08-07 00:00:00,250\n" }),
+    )
+    .await;
+    assert_eq!(status, 200, "first chunk ({status}): {opened}");
+    let session_id = opened["session_id"].as_str().unwrap().to_string();
+
+    let (status, body) = chunk(
+        &app,
+        &stranger,
+        &serde_json::json!({
+            "session_id": session_id,
+            "chunk": "2025-08-07 00:10:00,999\n"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a stranger's append is refused ({status}): {body}"
+    );
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "session_id": session_id, "dry_run": true }),
+        &stranger,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a stranger's import is refused ({status}): {body}"
+    );
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "session_id": session_id, "dry_run": true }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the opener imports ({status}): {resp}");
+    assert_eq!(
+        resp["row_count"].as_u64().unwrap(),
+        1,
+        "the stranger's row never joined the file: {resp}"
+    );
+}

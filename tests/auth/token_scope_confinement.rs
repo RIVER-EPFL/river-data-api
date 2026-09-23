@@ -24,6 +24,11 @@ const SENSOR_B_ID: &str = "00000000-0000-4000-b000-0000000000ff";
 const CALIB_B_ID: &str = "00000000-0000-4000-b000-000000000301";
 const CURVE_B_ID: &str = "00000000-0000-4000-b000-000000000303";
 const REPROC_B_ID: &str = "00000000-0000-4000-b000-000000000302";
+const VISIT_B_ID: &str = "00000000-0000-4000-b000-000000000401";
+const RUN_B_ID: &str = "00000000-0000-4000-b000-000000000402";
+const RECEIPT_B_ID: &str = "00000000-0000-4000-b000-000000000403";
+const MUTE_B_ID: &str = "00000000-0000-4000-b000-000000000404";
+const SUBSCRIPTION_B_ID: &str = "00000000-0000-4000-b000-000000000405";
 // A project-A note, to prove the scoped key still reaches its own project.
 const NOTE_A_ID: &str = "00000000-0000-4000-a000-000000000901";
 
@@ -72,6 +77,21 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
         ),
         format!(
             "INSERT INTO data_streams (id, source_system, source_key, site_parameter_id, is_active) VALUES ('{STREAM_B_ID}', 'test-b', 'b-stream-1', '{SP_B_ID}', true)"
+        ),
+        format!(
+            "INSERT INTO collection_events (id, site_id, collected_at) VALUES ('{VISIT_B_ID}', '{SITE_B_ID}', '2026-01-01T00:00:00Z')"
+        ),
+        format!(
+            "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, outputs, created_by, site_id, collected_at) VALUES ('{RUN_B_ID}', 'doc', '{{}}', '{{}}', '{{}}', '[]', '{{}}', 'tester', '{SITE_B_ID}', '2026-01-01T00:00:00Z')"
+        ),
+        format!(
+            "INSERT INTO ingest_receipts (id, stream_id, submitted, new_rows, changed, unchanged, retained, rejected_total, rejected, dropped, withdrawn) VALUES ('{RECEIPT_B_ID}', '{STREAM_B_ID}', 0, 0, 0, 0, 0, 0, '[]', 0, 0)"
+        ),
+        format!(
+            "INSERT INTO notification_mutes (id, site_id, parameter_id) VALUES ('{MUTE_B_ID}', '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}')"
+        ),
+        format!(
+            "INSERT INTO meteoswiss_subscriptions (id, site_id, station_abbr, variable, parameter_id) VALUES ('{SUBSCRIPTION_B_ID}', '{SITE_B_ID}', 'SIO', 'prestas0', '{GLOBAL_PARAM_TEMP_ID}')"
         ),
     ] {
         crate::common::db::exec(&db, &sql).await;
@@ -122,6 +142,11 @@ async fn scoped_key_confined_on_crud_reads() {
         ("/api/sensor_calibrations", CALIB_B_ID),
         ("/api/standard_curves", CURVE_B_ID),
         ("/api/reprocessing_jobs", REPROC_B_ID),
+        ("/api/collection_events", VISIT_B_ID),
+        ("/api/tool_runs", RUN_B_ID),
+        ("/api/ingest_receipts", RECEIPT_B_ID),
+        ("/api/notification_mutes", MUTE_B_ID),
+        ("/api/meteoswiss_subscriptions", SUBSCRIPTION_B_ID),
     ];
 
     for (path, b_id) in cases {
@@ -146,6 +171,74 @@ async fn scoped_key_confined_on_crud_reads() {
         let (s, _) =
             crate::common::get_with_token(&app, &format!("{path}/{b_id}"), &unscoped).await;
         assert_eq!(s, 200, "unscoped key must reach the {path} row, got {s}");
+    }
+}
+
+/// The subjects of change-audit rows `path` returns to `token`, filtered to one subject.
+async fn audit_subjects(app: &axum::Router, subject: &str, token: &str) -> Vec<String> {
+    let filter = crate::common::e2e::percent_encode(&format!(r#"{{"subject":"{subject}"}}"#));
+    let path = format!("/api/change_audit_entries?filter={filter}");
+    let (status, body) = crate::common::get_json_with_token(app, &path, token).await;
+    assert_eq!(status, 200, "list {path} should be 200, body: {body}");
+    body.as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["subject"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The change trail carries whole rows, so a site-bearing subject is read where its row is, through
+/// the entity list and the subject-keyed reader alike, while a catalog subject is read by anyone.
+#[tokio::test]
+#[serial]
+async fn scoped_key_confined_on_the_change_trail() {
+    let (db, app) = setup().await;
+    let scoped =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID))
+            .await;
+    let unscoped =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+
+    for subject in [
+        format!("site:{SITE_B_ID}"),
+        format!("site_parameter:{SP_B_ID}"),
+        format!("sensor_calibration:{CALIB_B_ID}"),
+        format!("standard_curve:{CURVE_B_ID}"),
+    ] {
+        assert!(
+            audit_subjects(&app, &subject, &scoped).await.is_empty(),
+            "scoped key leaked {subject} via /change_audit_entries"
+        );
+        assert!(
+            !audit_subjects(&app, &subject, &unscoped).await.is_empty(),
+            "unscoped key should see {subject}"
+        );
+        let path = format!("/api/change_audit?subject={subject}");
+        let (status, body) = crate::common::get_json_with_token(&app, &path, &scoped).await;
+        assert_eq!(status, 200, "{path}: {body}");
+        assert_eq!(
+            body,
+            serde_json::json!([]),
+            "scoped key leaked {subject} via {path}"
+        );
+        let (_, body) = crate::common::get_json_with_token(&app, &path, &unscoped).await;
+        assert_ne!(
+            body,
+            serde_json::json!([]),
+            "unscoped key should see {subject} via {path}"
+        );
+    }
+
+    for subject in [
+        format!("site:{SITE1_ID}"),
+        format!("parameter:{GLOBAL_PARAM_TEMP_ID}"),
+    ] {
+        assert!(
+            !audit_subjects(&app, &subject, &scoped).await.is_empty(),
+            "scoped key should see {subject}"
+        );
     }
 }
 
@@ -359,4 +452,79 @@ async fn a_scoped_token_cannot_reach_another_projects_curve() {
         (200..300).contains(&s),
         "and removable while no reading has used it"
     );
+}
+
+/// One reading and one tool run in project B. A key scoped to project A reads neither's history,
+/// replay, inspection, reload or trace; the unscoped key reaches all of them.
+#[tokio::test]
+#[serial]
+async fn a_scoped_token_cannot_read_another_projects_reading_history() {
+    let (db, app) = setup().await;
+    let scoped =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID))
+            .await;
+    let unscoped =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+
+    let time = "2026-01-01T12:00:00Z";
+    let run_b = uuid::Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO readings (stream_id, site_id, parameter_id, time, replicate_index, raw_value, measurement_type) \
+             VALUES ('{STREAM_B_ID}', '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', '{time}', 0, 4.2, 'continuous')"
+        ),
+        format!(
+            "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, outputs, created_by, source, site_id) \
+             VALUES ('{run_b}', 'doc', '{{}}', '{{}}', '{{}}', '[]', '{{}}', 'test', 'interactive', '{SITE_B_ID}')"
+        ),
+    ] {
+        crate::common::db::exec(&db, &sql).await;
+    }
+
+    let decisions = format!("/api/readings/decisions?stream_id={STREAM_B_ID}&time={time}");
+    let (s, _) = crate::common::get_with_token(&app, &decisions, &scoped).await;
+    assert_eq!(s, 404, "a scoped key reads no foreign reading's decisions");
+    let (s, _) = crate::common::get_with_token(&app, &decisions, &unscoped).await;
+    assert_eq!(s, 200, "the unscoped key does");
+
+    let replay = format!("/api/readings/replay?stream_id={STREAM_B_ID}&time={time}");
+    let (s, body) = crate::common::get_with_token(&app, &replay, &scoped).await;
+    assert_eq!(s, 404, "a scoped key replays no foreign reading");
+    assert!(body.contains("No reading at that instant"), "{body}");
+    let (_, body) = crate::common::get_with_token(&app, &replay, &unscoped).await;
+    assert!(
+        !body.contains("No reading at that instant"),
+        "the unscoped key finds the reading: {body}"
+    );
+
+    let inspect = serde_json::json!({ "selection": { "stream_id": STREAM_B_ID } });
+    let (s, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits/inspect",
+        &inspect,
+        &scoped,
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(
+        body["rows"].as_array().map(Vec::len),
+        Some(0),
+        "a scoped key inspects no foreign row: {body}"
+    );
+    let (_, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits/inspect",
+        &inspect,
+        &unscoped,
+    )
+    .await;
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(1), "{body}");
+
+    for route in ["reload", "trace"] {
+        let path = format!("/api/tool_runs/{run_b}/{route}");
+        let (s, _) = crate::common::get_with_token(&app, &path, &scoped).await;
+        assert_eq!(s, 404, "a scoped key cannot {route} a foreign tool run");
+        let (s, _) = crate::common::get_with_token(&app, &path, &unscoped).await;
+        assert_ne!(s, 404, "the unscoped key reaches the run's {route}");
+    }
 }

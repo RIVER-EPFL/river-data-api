@@ -230,11 +230,10 @@ pub(crate) fn build(query: &sea_query::SelectStatement) -> Statement {
     Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
 }
 
-// ── Recurring Services (Wave 2) ──────────────────────────────────────────────────────────────────
+// ── Recurring Services ───────────────────────────────────────────────────────────────────────────
 //
-// The background loops formerly spawned in `main.rs` are now `Job` impls the DB-backed scheduler
-// enqueues on cadence (so exactly one replica fires each tick). Each `run` calls the SAME loop body
-// the periodic task called, once. Each `default_schedule` returns the cadence from `Config` so the
+// The background loops are `Job` impls the DB-backed scheduler enqueues on cadence (so exactly one
+// replica fires each tick). Each `run` calls its loop body once. Each `default_schedule` returns the cadence from `Config` so the
 // scheduler can seed a `schedules` row on first start; the seconds are captured at registry-build
 // time. Services that need config / shared in-process services beyond `db`+`params` read the
 // process-global `AppState` (`crate::common::global_app_state`), the same set-once handle pattern

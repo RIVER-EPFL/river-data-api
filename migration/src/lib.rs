@@ -31,6 +31,7 @@ mod m20260922_000006_drop_slot_units;
 mod m20260922_000007_source_alignment;
 mod m20260923_000001_reraise_unverified_entries;
 mod m20260923_000002_slot_cadence_backfill;
+mod m20260923_000003_import_session_opener;
 
 pub struct Migrator;
 
@@ -82,6 +83,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260922_000007_source_alignment::Migration),
             Box::new(m20260923_000001_reraise_unverified_entries::Migration),
             Box::new(m20260923_000002_slot_cadence_backfill::Migration),
+            Box::new(m20260923_000003_import_session_opener::Migration),
         ]
     }
 }

@@ -14,6 +14,7 @@ use serde::Deserialize;
 use super::models::ChangeEntry;
 use super::service::entries_for;
 use crate::common::AppState;
+use crate::common::middleware::ProjectScope;
 use crate::error::AppResult;
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -22,7 +23,8 @@ pub struct ChangeAuditQuery {
     pub subject: String,
 }
 
-/// The change trail of one subject, newest first. Requires `read_metadata`.
+/// The change trail of one subject, newest first, confined to the caller's projects the way
+/// `/change_audit_entries` is. Requires `read_metadata`.
 #[utoipa::path(
     get,
     path = "/api/change_audit",
@@ -32,7 +34,8 @@ pub struct ChangeAuditQuery {
 )]
 pub async fn list_change_audit(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Query(q): Query<ChangeAuditQuery>,
 ) -> AppResult<Json<Vec<ChangeEntry>>> {
-    Ok(Json(entries_for(&state.db, &q.subject).await?))
+    Ok(Json(entries_for(&state.db, &scope, &q.subject).await?))
 }

@@ -1,4 +1,4 @@
-//! Adopt vs Swap (Phase 2): an instrument that owns a stream's readings but no site is explicitly
+//! Adopt vs Swap: an instrument that owns a stream's readings but no site is explicitly
 //! adopted to a site slot (which backfills its readings by window), the slot is single-occupancy,
 //! and a swap ends one sensor and starts another at the same instant.
 //!

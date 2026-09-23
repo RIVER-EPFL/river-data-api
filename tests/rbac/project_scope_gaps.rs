@@ -160,7 +160,7 @@ async fn provision_two_projects(app: &Router, admin: &str) -> Scene {
 /// a reading that names its own sensor skips slot-owner resolution, so no curve is applied to it.
 ///
 /// The unattributed row is seeded in SQL with the instrument rule lifted, because no write path
-/// produces one any more: every channel carries an instrument and stamps what it writes. Rows of
+/// produces one: every channel carries an instrument and stamps what it writes. Rows of
 /// that shape are exactly the history `backfill_attribution` exists for.
 async fn seed_claimable_history(
     db: &sea_orm::DatabaseConnection,

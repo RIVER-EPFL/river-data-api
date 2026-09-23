@@ -52,8 +52,7 @@ async fn deployment_count(db: &DatabaseConnection, sensor: &str) -> i64 {
 
 /// Scenario: a second instrument already holds the slot the operator is deploying into.
 /// Expected behaviour: the request is refused AND the instrument being deployed is still deployed
-/// where it was. The recall used to run ahead of the check, so a 400 closed the open deployment
-/// anyway and the next reprocess un-attributed everything logged after it.
+/// where it was, or the next reprocess un-attributes everything logged after it.
 #[tokio::test]
 #[serial]
 async fn a_refused_create_leaves_the_open_deployment_open() {

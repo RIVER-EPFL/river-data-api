@@ -1,4 +1,4 @@
-//! The Phase 1 sync-parity acceptance story, driven exactly as the sync service drives the API:
+//! The sync-parity acceptance story, driven exactly as the sync service drives the API:
 //! a replicate family registers with a pinned spec, a sparse group lands at its source indexes
 //! with a disagreeing portal audit, pairing materialises the samples that serve the slot, a
 //! resync is a no-op, an upstream column reorder changes nothing, a flag resolution moves the

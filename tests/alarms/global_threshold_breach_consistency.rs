@@ -1,7 +1,7 @@
 //! Keystone: with ONLY the parameter's global threshold (no site row anywhere), a breaching value
 //! must be seen as an alarm by EVERY path, the resolution endpoint, `/alarms/active`,
 //! `/sites/{id}/alarms`, `readings?alarms=true`, `aggregates?alarms=true`, and the sweeper. Guards
-//! against any consumer dropping the global tier (all now share the one alarm engine).
+//! against any consumer dropping the global tier (all share the one alarm engine).
 //!
 //! Run: cargo test --test alarms -- --test-threads=1
 
@@ -56,7 +56,7 @@ async fn every_path_agrees_on_a_global_threshold_breach() {
 
     let win = "start=2025-02-01T00:00:00Z&end=2025-02-01T01:00:00Z";
 
-    // 1. Resolution endpoint: resolves from the parameter's global threshold.
+    // Resolution endpoint: resolves from the parameter's global threshold.
     let (s, b) = crate::common::get_json_with_token(
         &app,
         &format!("/api/alarms/thresholds?site_id={site}&parameter_id={turb}"),
@@ -77,7 +77,7 @@ async fn every_path_agrees_on_a_global_threshold_breach() {
     );
     assert_eq!(row["alarm_max"].as_f64(), Some(500.0));
 
-    // 2. /alarms/active → severity 2.
+    // /alarms/active → severity 2.
     let (s, b) = crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
     assert_eq!(s, 200, "active: {b}");
     let a = b["alarms"]
@@ -88,7 +88,7 @@ async fn every_path_agrees_on_a_global_threshold_breach() {
         .expect("active breach from the global threshold");
     assert_eq!(a["severity"].as_i64(), Some(2), "active severity: {a}");
 
-    // 3. /sites/{id}/alarms → a severity-2 violation in the window.
+    // /sites/{id}/alarms → a severity-2 violation in the window.
     let (s, b) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sites/{site}/alarms?{win}"),
@@ -111,7 +111,7 @@ async fn every_path_agrees_on_a_global_threshold_breach() {
         "site alarms severity 2 from the global threshold: {tp}"
     );
 
-    // 4. readings?alarms=true → severity 2 present (the path that was broken).
+    // Readings?alarms=true → severity 2 present.
     let (s, b) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sites/{site}/readings?alarms=true&{win}"),
@@ -134,7 +134,7 @@ async fn every_path_agrees_on_a_global_threshold_breach() {
         "readings severity 2 from the global threshold: {rp}"
     );
 
-    // 5. aggregates?alarms=true → severity 2 in a bucket (the other broken path). Refresh the CAGG
+    // Aggregates?alarms=true → severity 2 in a bucket. Refresh the CAGG
     //    so the injected reading is bucketed.
     crate::common::refresh_continuous_aggregates(&db).await;
     let (s, b) = crate::common::get_json_with_token(
@@ -161,7 +161,7 @@ async fn every_path_agrees_on_a_global_threshold_breach() {
         );
     }
 
-    // 6. Sweeper → opens an alarm event at severity 2.
+    // Sweeper → opens an alarm event at severity 2.
     let stats = alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert!(
         stats.opened >= 1,

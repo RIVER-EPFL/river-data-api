@@ -2942,6 +2942,9 @@ pub mod import_chunk {
         #[crudcrate(primary_key)]
         pub seq: i32,
         pub chunk: String,
+        /// The caller who opened the upload, as `AuthContext::label` names them; nobody else may
+        /// append to it or import it.
+        pub opened_by: String,
         #[crudcrate(exclude(create, update))]
         pub created_at: chrono::DateTime<chrono::Utc>,
     }

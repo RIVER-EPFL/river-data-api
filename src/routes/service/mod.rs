@@ -588,7 +588,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
-    // Operator actions previously on /api/admin/: calibration recalc, sensor reprocess, derived
+    // Operator actions: calibration recalc, sensor reprocess, derived
     // recompute, merges, job rerun/cancel, schedule control. MANAGER for humans (operators run
     // these); the write_metadata token bit is preserved for automation scripts. Scoped tokens are
     // denied (a logger key has no reason to trigger a global reprocess/merge).
@@ -683,6 +683,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .nest("/sync", sync_views::read_routes())
         .with_state(state.clone());
 
+    let sync_plan_read = Router::new()
+        .nest("/sync", sync_views::plan_read_routes())
+        .with_state(state.clone());
+
     let sync_admin_write = Router::new()
         .nest("/sync", sync_views::write_routes())
         .with_state(state.clone());
@@ -767,6 +771,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .merge(operator_action_routes)
         .merge(catalog_merge_routes)
         .merge(sync_admin_read)
+        .merge(sync_plan_read)
         .merge(sync_admin_write)
         .merge(sync_admin_manage)
         .merge(sync_admin_admin);

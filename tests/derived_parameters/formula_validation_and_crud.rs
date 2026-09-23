@@ -95,9 +95,8 @@ async fn cleanup_derived_param(app: &axum::Router, token: &str, id: &str) {
 }
 
 // =============================================================================
-// GET by id must populate `sources` via the join (regression guard for the
-// fk_column fix, the create response built sources in-memory, but the GET path
-// loads them through CrudCrate's join, which previously returned []).
+// GET by id must populate `sources` via the join: the create response builds sources in memory,
+// but the GET path loads them through CrudCrate's join.
 // =============================================================================
 
 #[tokio::test]
@@ -158,7 +157,7 @@ async fn test_get_derived_parameter_populates_sources() {
 }
 
 // =============================================================================
-// 1. Create with valid formula, sources auto-populated
+// Create with valid formula, sources auto-populated
 // =============================================================================
 
 #[tokio::test]
@@ -220,7 +219,7 @@ async fn test_create_derived_parameter_valid_formula() {
 }
 
 // =============================================================================
-// 2. Create with invalid formula, 400
+// Create with invalid formula, 400
 // =============================================================================
 
 #[tokio::test]
@@ -235,7 +234,7 @@ async fn test_create_derived_parameter_invalid_formula() {
 }
 
 // =============================================================================
-// 3. Create with constants only, sources is empty
+// Create with constants only, sources is empty
 // =============================================================================
 
 #[tokio::test]
@@ -263,7 +262,7 @@ async fn test_create_derived_parameter_constants_only() {
 }
 
 // =============================================================================
-// 4. Update formula, sources change
+// Update formula, sources change
 // =============================================================================
 
 #[tokio::test]
@@ -394,7 +393,7 @@ async fn a_refused_update_stores_neither_the_formula_nor_its_sources() {
 }
 
 // =============================================================================
-// 5. Preview derived with nonexistent site, graceful error, not 500
+// Preview derived with nonexistent site, graceful error, not 500
 // =============================================================================
 
 #[tokio::test]
@@ -426,7 +425,7 @@ async fn test_preview_derived_missing_site() {
 }
 
 // =============================================================================
-// 6. Preview derived with invalid formula, 400
+// Preview derived with invalid formula, 400
 // =============================================================================
 
 #[tokio::test]
@@ -452,7 +451,7 @@ async fn test_preview_derived_invalid_formula() {
 }
 
 // =============================================================================
-// 7. Formula referencing nonexistent parameter, strict validation returns 400
+// Formula referencing nonexistent parameter, strict validation returns 400
 // =============================================================================
 
 #[tokio::test]
@@ -471,7 +470,7 @@ async fn test_formula_nonexistent_parameter_returns_400() {
 }
 
 // =============================================================================
-// 8. Formula injection attempts, rejected by strict validation or meval
+// Formula injection attempts, rejected by strict validation or meval
 // =============================================================================
 
 #[tokio::test]
@@ -508,7 +507,7 @@ async fn test_formula_injection_attempt() {
 }
 
 // =============================================================================
-// 9. Boundary: sqrt of negative, meval returns NaN, does not crash
+// Boundary: sqrt of negative, meval returns NaN, does not crash
 // =============================================================================
 
 #[test]
@@ -529,7 +528,7 @@ fn test_formula_boundary_sqrt_negative() {
 }
 
 // =============================================================================
-// 10. Boundary: division by zero, meval returns Inf, does not crash
+// Boundary: division by zero, meval returns Inf, does not crash
 // =============================================================================
 
 #[test]

@@ -14634,7 +14634,7 @@
             ]
           },
           "skipped": {
-            "description": "The review left this curve behind: it is not stored and the readings naming it are dropped\nat the source. A skipped curve no longer blocks the apply.",
+            "description": "The review left this curve behind: it is not stored and the readings naming it are dropped\nat the source. A skipped curve does not block the apply.",
             "type": "boolean"
           },
           "skipped_by": {
@@ -44970,6 +44970,9 @@
           "400": {
             "description": "The site does not declare every parameter the calculation reads"
           },
+          "403": {
+            "description": "The site is outside the caller's projects"
+          },
           "404": {
             "description": "No site or no calculation with this id"
           },
@@ -45371,6 +45374,9 @@
               }
             },
             "description": ""
+          },
+          "403": {
+            "description": "The site is outside the caller's projects"
           },
           "404": {
             "description": "No site or no parameter group with this id"
@@ -47746,7 +47752,7 @@
             "description": "Array of pairing plans without their entries"
           }
         },
-        "summary": "List pairing plans, newest first, optionally narrowed to one source system or one status\n(draft/applying/applied/reverting/reverted/superseded). Requires `read_metadata`.",
+        "summary": "List pairing plans, newest first, optionally narrowed to one source system or one status\n(draft/applying/applied/reverting/reverted/superseded). Requires Administrator or `write_metadata`.",
         "tags": [
           "sync"
         ]
@@ -47811,7 +47817,7 @@
             "description": "Plan not found"
           }
         },
-        "summary": "Get a single pairing plan with its full pairing list. Requires `read_metadata`.",
+        "summary": "Get a single pairing plan with its full pairing list. Requires Administrator or `write_metadata`.",
         "tags": [
           "sync"
         ]
@@ -47957,7 +47963,7 @@
             "description": "Plan not found"
           }
         },
-        "summary": "The instrument picture of a pairing plan: every instrument the plan binds, and the parameters\nstill without one. Requires `read_metadata`.",
+        "summary": "The instrument picture of a pairing plan: every instrument the plan binds, and the parameters\nstill without one. Requires Administrator or `write_metadata`.",
         "tags": [
           "sync"
         ]
@@ -48035,7 +48041,7 @@
             "description": "Plan not found"
           }
         },
-        "summary": "Get site metadata enrichment for a pairing plan: latitudes, longitudes, glacier names,\nstream counts. Used by the pairing UI to display context. Requires `read_metadata`.",
+        "summary": "Get site metadata enrichment for a pairing plan: latitudes, longitudes, glacier names,\nstream counts. Used by the pairing UI to display context. Requires Administrator or `write_metadata`.",
         "tags": [
           "sync"
         ]
@@ -51902,7 +51908,7 @@
     },
     "/api/tool_scripts/{id}/versions/{version_id}/activate": {
       "post": {
-        "description": "A version has to have been validated by hand, **and its cases are run again here** rather than\nread off `validated_at`. The stamp says the cases passed at a time, and what a case runs\nagainst outlives it: the constants table and the standard curves a case resolves are shared,\neditable state, so a version validated in March can be wrong by June without anything about\nthe version changing. Activation is the moment it starts answering\n`POST /tools/{name}/calculate`, which is the moment worth spending a case run on. The stamp\nstill gates the workflow, so an author cannot skip seeing the cases pass; it is no longer the\nonly thing standing between a failing version and production.\n\nThe price is that activation needs the runner: with the sidecar down there is no rollback, and\nno tool is calculating anything either way.\n\nThe manifest is re-checked against the catalog and the findings come back in `lint`. Those do\nnot block: a version whose outputs still resolve serves correctly, and refusing to activate it\nwould leave the operator with no way to put the repaired version live either. Requires\nAdministrator.",
+        "description": "A version has to have been validated by hand, **and its cases are run again here** rather than\nread off `validated_at`. The stamp says the cases passed at a time, and what a case runs\nagainst outlives it: the constants table and the standard curves a case resolves are shared,\neditable state, so a version validated in March can be wrong by June without anything about\nthe version changing. Activation is the moment it starts answering\n`POST /tools/{name}/calculate`, which is the moment worth spending a case run on. The stamp\nstill gates the workflow, so an author cannot skip seeing the cases pass; it is not the only\nthing standing between a failing version and production.\n\nThe price is that activation needs the runner: with the sidecar down there is no rollback, and\nno tool is calculating anything either way.\n\nThe manifest is re-checked against the catalog and the findings come back in `lint`. Those do\nnot block: a version whose outputs still resolve serves correctly, and refusing to activate it\nwould leave the operator with no way to put the repaired version live either. Requires\nAdministrator.",
         "operationId": "activate_version",
         "parameters": [
           {

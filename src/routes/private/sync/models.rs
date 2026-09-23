@@ -981,7 +981,7 @@ pub struct PlanHeldCurve {
     #[schema(required)]
     pub attached: Option<PlanHeldCurveTarget>,
     /// The review left this curve behind: it is not stored and the readings naming it are dropped
-    /// at the source. A skipped curve no longer blocks the apply.
+    /// at the source. A skipped curve does not block the apply.
     pub skipped: bool,
     #[schema(required)]
     pub skipped_by: Option<String>,

@@ -572,3 +572,42 @@ async fn untargeted_actions_are_refused_to_anyone_confined_to_a_project_set() {
          {body}"
     );
 }
+
+// The site-addressed applies: a site in the path is a target like any other
+
+#[tokio::test]
+#[serial]
+async fn site_applies_confine_to_the_sites_project() {
+    let Some(scene) = scene().await else { return };
+    let manager = member(&scene.db, "manager1", "riverdata-manager", &[PROJECT_ID]).await;
+
+    for (route, payload) in [
+        ("parameter_groups", json!({ "group_id": ABSENT_ID })),
+        ("calculations", json!({ "calculation_id": ABSENT_ID })),
+    ] {
+        let (status, body) = crate::common::post_json_with_token(
+            &scene.app,
+            &format!("/api/sites/{SITE_B_ID}/{route}"),
+            &payload,
+            &manager,
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "applying {route} at a site of the other project is refused: {body}"
+        );
+
+        // Inside the grant the same request passes the scope and meets the absent target.
+        let (status, body) = crate::common::post_json_with_token(
+            &scene.app,
+            &format!("/api/sites/{SITE1_ID}/{route}"),
+            &payload,
+            &manager,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "applying {route} at a site in the grant reaches the target lookup: {body}"
+        );
+    }
+}

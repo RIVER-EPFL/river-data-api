@@ -1,7 +1,7 @@
 //! End-to-end observability surfaces: ingest device-health status events and read them back
 //! (US-2.1/2.3), cross-entity search (US-9.2), CSV/NDJSON export of readings (US-8.1), and grabs
-//! tagged alongside continuous readings (US-8.2). The comparison export the same story used to
-//! drive is covered, with its edges, by `tools_grab_export.rs`.
+//! tagged alongside continuous readings (US-8.2). The comparison export is covered, with its
+//! edges, by `tools_grab_export.rs`.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 

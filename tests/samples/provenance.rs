@@ -121,9 +121,8 @@ async fn a_tool_save_builds_the_blob_from_the_stored_run() {
     );
 }
 
-/// Expected behaviour: the `provenance` field no longer exists on the request, and an unknown
-/// field is refused rather than dropped, so an old client's self-authored blob cannot slip
-/// through as ignored noise.
+/// Expected behaviour: the request carries no `provenance` field, and an unknown field is refused
+/// rather than dropped, so a client's self-authored blob cannot slip through as ignored noise.
 #[tokio::test]
 #[serial]
 async fn a_client_authored_blob_is_refused() {

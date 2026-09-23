@@ -278,7 +278,7 @@ async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
     assert_eq!(status, 422, "a client-authored blob is refused: {resp}");
 }
 
-/// S1's Phase 3 half: a manifest declares `site_inputs` that the engine resolves from the site
+/// A manifest declares `site_inputs` that the engine resolves from the site
 /// at calculate time; a site missing a declared property is refused naming it, and the resolved
 /// value lands in the run and its blob.
 #[tokio::test]
@@ -476,7 +476,7 @@ async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused()
     );
 }
 
-/// S1's Phase 3 half, under Q98: a site declares which calculations apply to it by holding their
+/// Under Q98, a site declares which calculations apply to it by holding their
 /// output slots, so a save landing on a slot the site does not carry is refused and the same save
 /// succeeds once the slot exists. A mint here would create the declaration it is checked against.
 #[tokio::test]

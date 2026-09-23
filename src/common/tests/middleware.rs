@@ -47,6 +47,11 @@ fn test_the_entities_with_no_project_dimension_are_the_ones_a_scoped_token_is_re
             "constants",
             "schedules",
             "collection_events",
+            "tool_runs",
+            "ingest_receipts",
+            "change_audit_entries",
+            "notification_mutes",
+            "meteoswiss_subscriptions",
         ] {
             if crud_scope_condition(entity, &projects, direction).is_none() {
                 names.push(entity);
@@ -56,28 +61,67 @@ fn test_the_entities_with_no_project_dimension_are_the_ones_a_scoped_token_is_re
     };
     assert_eq!(
         none_for(Direction::Read),
-        ["parameters", "constants", "schedules", "collection_events"],
+        ["parameters", "constants", "schedules"],
         "a read is confined for every entity whose rows carry a project"
     );
-    let expected = [
+    let member = vec![
         "projects",
         "sensors",
         "reprocessing_jobs",
         "parameters",
         "constants",
         "schedules",
-        "collection_events",
     ];
-    for direction in [Direction::MemberWrite, Direction::TokenWrite] {
+    let mut token = member.clone();
+    token.push("meteoswiss_subscriptions");
+    for (direction, mut want) in [
+        (Direction::MemberWrite, member),
+        (Direction::TokenWrite, token),
+    ] {
         let mut got = none_for(direction);
         got.sort_unstable();
-        let mut want = expected;
         want.sort_unstable();
         assert_eq!(
             got, want,
             "the shared inventory is written as catalog, not as a project's"
         );
     }
+}
+
+/// An audit row is read where the row it records is: a site-bearing subject by its site, a
+/// catalog subject by anyone, and a subject of any other kind by nobody confined.
+#[test]
+fn test_change_audit_confines_site_bearing_subjects_and_passes_catalog_ones() {
+    let sql = format!(
+        "{:?}",
+        crud_scope_condition("change_audit_entries", &[Uuid::nil()], Direction::Read)
+            .expect("change_audit_entries is project-bound")
+    );
+    for prefix in [
+        "site:",
+        "site_parameter:",
+        "sensor_calibration:",
+        "standard_curve:",
+    ] {
+        assert!(
+            sql.contains(prefix),
+            "{prefix} subjects are confined by their site: {sql}"
+        );
+    }
+    for prefix in [
+        "parameter:",
+        "constant:",
+        "calculation_formula:",
+        "derived_parameter_source:",
+        "parameter_group:",
+        "schedule:",
+    ] {
+        assert!(sql.contains(prefix), "{prefix} subjects are catalog: {sql}");
+    }
+    assert!(
+        !sql.contains("push_subscriptions"),
+        "a person's device trail is no project's"
+    );
 }
 
 /// The bench instrument is the one row a member may write and may not read, so the asymmetry is

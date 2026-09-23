@@ -9,7 +9,7 @@ fn test_family_suggestion_strips_only_the_structural_avg_segment() {
 
 #[test]
 fn test_a_units_bearing_column_never_resolves_onto_a_shorter_code() {
-    // The suggestion no longer reads the catalog at all: a catalog holding `DOC` is not a
+    // The suggestion does not read the catalog: a catalog holding `DOC` is not a
     // reason to export a `DOC` header where the portal wrote `DOC_avg_ppb`.
     assert_eq!(family_parameter_suggestion("DOC_ppb"), "DOC_ppb");
     assert_eq!(family_parameter_suggestion("DOC"), "DOC");

@@ -40,6 +40,7 @@ use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::common::scope::Unowned;
 use crate::common::scope::project_of_site_parameter;
+use crate::common::scope::require_sites_in_scope;
 use crate::common::scope::require_target_in_scope;
 use crate::error::AppError;
 use crate::error::AppResult;
@@ -53,15 +54,18 @@ use crate::routes::private::tools;
     request_body = ApplyGroupRequest,
     responses(
         (status = 200, body = ApplyGroupResponse),
+        (status = 403, description = "The site is outside the caller's projects"),
         (status = 404, description = "No site or no parameter group with this id"),
     ),
     tag = "site_parameters"
 )]
 pub async fn apply_group(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(site_id): Path<Uuid>,
     Json(payload): Json<ApplyGroupRequest>,
 ) -> AppResult<Json<ApplyGroupResponse>> {
+    require_sites_in_scope(&state.db, &scope, &[site_id]).await?;
     let site = crate::routes::private::sites::models::Entity::find_by_id(site_id)
         .one(&state.db)
         .await?
@@ -196,6 +200,7 @@ pub async fn apply_group(
     responses(
         (status = 200, body = ApplyCalculationResponse),
         (status = 400, description = "The site does not declare every parameter the calculation reads"),
+        (status = 403, description = "The site is outside the caller's projects"),
         (status = 404, description = "No site or no calculation with this id"),
         (status = 409, description = "The calculation is switched off"),
     ),
@@ -203,9 +208,11 @@ pub async fn apply_group(
 )]
 pub async fn apply_calculation(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(site_id): Path<Uuid>,
     Json(payload): Json<ApplyCalculationRequest>,
 ) -> AppResult<Json<ApplyCalculationResponse>> {
+    require_sites_in_scope(&state.db, &scope, &[site_id]).await?;
     let site = crate::routes::private::sites::models::Entity::find_by_id(site_id)
         .one(&state.db)
         .await?
@@ -362,8 +369,8 @@ pub async fn merge_site_parameters_handler(
         require_target_in_scope(&scope, &row, Unowned::Deny, "site parameter")?;
     }
 
-    // Background the multi-table move on the worker pool; the job's `detail` carries the counts the
-    // UI used to read synchronously. Alarm reconcile runs on job completion (central lifecycle).
+    // Background the multi-table move on the worker pool; the job's `detail` carries the counts.
+    // Alarm reconcile runs on job completion (central lifecycle).
     let trigger_id = payload.source_site_parameter_id;
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,

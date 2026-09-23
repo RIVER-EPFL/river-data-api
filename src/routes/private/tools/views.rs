@@ -27,15 +27,15 @@ use super::models::{
     FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse, LintFinding,
     MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula,
     ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse,
-    VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest, run as tool_run,
+    VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
 };
 use super::service::{
     FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
     calculations_fed_by_subject, canonical_hash, check_engine, check_manifest_against_catalog,
     check_manifest_codes_resolve, closure_subject, codes_held_elsewhere, coverage_for,
-    find_active_tool, formula_codes_held_elsewhere, insert_version, lint_script, list_active_tools,
-    load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
-    mint_formula_version, normalise_name, normalised_json, plan_formula_set, render,
+    find_active_tool, find_run_in_scope, formula_codes_held_elsewhere, insert_version, lint_script,
+    list_active_tools, load_parameter_catalog, load_script, load_version, manifest_finding,
+    manifest_json, mint_formula_version, normalise_name, normalised_json, plan_formula_set, render,
     replicated_for, run_stored_cases, run_tool_body, runner_runtime, stored_version_content,
     take_back_steps,
 };
@@ -145,12 +145,10 @@ pub async fn preview_tool(
 )]
 pub async fn trace_run(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RunTrace>> {
-    let run = tool_run::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Tool run {id} not found")))?;
+    let run = find_run_in_scope(&state.db, &scope, id).await?;
     Ok(Json(replay_trace(&state.db, &run).await?))
 }
 
@@ -714,8 +712,8 @@ pub async fn validate_version(
 /// editable state, so a version validated in March can be wrong by June without anything about
 /// the version changing. Activation is the moment it starts answering
 /// `POST /tools/{name}/calculate`, which is the moment worth spending a case run on. The stamp
-/// still gates the workflow, so an author cannot skip seeing the cases pass; it is no longer the
-/// only thing standing between a failing version and production.
+/// still gates the workflow, so an author cannot skip seeing the cases pass; it is not the only
+/// thing standing between a failing version and production.
 ///
 /// The price is that activation needs the runner: with the sidecar down there is no rollback, and
 /// no tool is calculating anything either way.
@@ -1086,10 +1084,14 @@ pub fn script_routes() -> Router<AppState> {
 /// A formula calculation is arithmetic over the catalog, not remote code, and its rows are CRUD
 /// under `write_metadata` (Q196). Minting the set's version is the same act, so the save takes the
 /// same callers; `created_by` on the version is the token's label, which resolves to the
-/// administrator who minted the token.
+/// administrator who minted the token. A calculation belongs to no project, so a project-scoped
+/// token is refused, as the formula rows' CRUD refuses it.
 fn formula_set_route() -> Router<AppState> {
     Router::new()
         .route("/tool_scripts/{id}/formulas", post(save_formula_set))
+        .layer(middleware::from_fn(
+            crate::common::middleware::deny_scoped_token,
+        ))
         .layer(middleware::from_fn(
             crate::common::middleware::require_admin_or_token_write_metadata,
         ))

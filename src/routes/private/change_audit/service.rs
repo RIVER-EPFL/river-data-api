@@ -2,22 +2,32 @@
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, NotSet, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    QuerySelect, QueryTrait, Set,
 };
 use uuid::Uuid;
 
 use super::models::{self, ChangeEntry};
+use crate::common::authz::AccessScope;
+use crate::common::middleware::scoped_change_audit_condition;
 use crate::error::AppResult;
 
 /// The newest edits returned for one subject. A trail is read to answer a question about a
 /// specific thing, so the cap is a page size rather than a limit anyone pages past.
 const LIMIT: u64 = 100;
 
-/// Up to the 100 newest changes recorded against `subject`, newest first. An unknown subject is an
-/// empty list, not a 404: nothing having been done to a thing is an answer.
-pub async fn entries_for<C: ConnectionTrait>(db: &C, subject: &str) -> AppResult<Vec<ChangeEntry>> {
+/// Up to the 100 newest changes recorded against `subject` that `scope` may read, newest first. An
+/// unknown subject is an empty list, not a 404: nothing having been done to a thing is an answer,
+/// and a subject outside the caller's projects reads the same.
+pub async fn entries_for<C: ConnectionTrait>(
+    db: &C,
+    scope: &AccessScope,
+    subject: &str,
+) -> AppResult<Vec<ChangeEntry>> {
     Ok(models::Entity::find()
         .filter(models::Column::Subject.eq(subject))
+        .apply_if(scope.project_ids(), |query, projects| {
+            query.filter(scoped_change_audit_condition(&projects))
+        })
         .order_by_desc(models::Column::ChangedAt)
         .limit(LIMIT)
         .all(db)

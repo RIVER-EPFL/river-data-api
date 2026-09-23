@@ -31,6 +31,7 @@ use crate::common::middleware::enforce_project_scope_for_sites;
 use crate::common::middleware::require_admin;
 use crate::common::middleware::require_read_data;
 use crate::common::middleware::require_write_data;
+use crate::common::middleware::scope_site_ids;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::collection_events::flows;
@@ -65,7 +66,6 @@ use crate::routes::private::standard_curves;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
-use crate::routes::private::tools::models::run as tool_run;
 use crate::routes::resolve_site_with_project;
 use crate::routes::service::ACTION_BODY_LIMIT;
 use crate::routes::service::DATA_BODY_LIMIT;
@@ -445,8 +445,10 @@ pub async fn return_output(
 )]
 pub async fn list_decisions(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Query(q): Query<DecisionsQuery>,
 ) -> AppResult<Json<Vec<DecisionRow>>> {
+    require_reading_in_scope(&state.db, &scope, q.stream_id, q.time).await?;
     let key = DecisionKey {
         stream_id: q.stream_id,
         time: q.time,
@@ -471,8 +473,10 @@ pub async fn list_decisions(
 )]
 pub async fn replay_derived(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Query(q): Query<DecisionsQuery>,
 ) -> AppResult<Json<ReplayResponse>> {
+    require_reading_in_scope(&state.db, &scope, q.stream_id, q.time).await?;
     let key = DecisionKey {
         stream_id: q.stream_id,
         time: q.time,
@@ -569,10 +573,12 @@ pub async fn get_reading_ledger(
 )]
 pub async fn inspect(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(req): Json<InspectRequest>,
 ) -> AppResult<Json<InspectResponse>> {
+    let sites = scope_site_ids(&state.db, &scope).await?;
     Ok(Json(InspectResponse {
-        rows: inspect_rows(&state.db, &req.selection).await?,
+        rows: inspect_rows(&state.db, &req.selection, sites.as_deref()).await?,
     }))
 }
 
@@ -590,14 +596,17 @@ pub async fn inspect(
 pub async fn preview(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Json(req): Json<EditRequest>,
 ) -> AppResult<Json<PreviewResponse>> {
     let actor = label(&auth);
     let kind = req.decision.parsed()?;
     let (_, option) = req.decision.assertion_over(kind, &req.selection)?;
     authorise(&auth, option)?;
-    refuse_unrouted(&state.db, &req.selection, option).await?;
     let rows_where = req.selection.condition()?;
+    let sites = selected_sites(&state.db, rows_where.clone()).await?;
+    require_edit_in_scope(&state.db, &scope, &sites).await?;
+    refuse_unrouted(&state.db, &req.selection, option).await?;
     let parameters = touched_parameters(&state.db, rows_where.clone()).await?;
 
     // The transaction is the preview: the decision is applied, the numbers are read back from the
@@ -667,12 +676,15 @@ pub async fn preview(
 pub async fn commit(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Json(req): Json<EditRequest>,
 ) -> AppResult<Json<EditResponse>> {
     let actor = label(&auth);
     let kind = req.decision.parsed()?;
     let (_, option) = req.decision.assertion_over(kind, &req.selection)?;
     authorise(&auth, option)?;
+    let sites = selected_sites(&state.db, req.selection.condition()?).await?;
+    require_edit_in_scope(&state.db, &scope, &sites).await?;
     let expected = preview_id(&req.selection, &req.decision)?;
     match req.preview_id {
         Some(id) if id == expected => {}
@@ -721,9 +733,12 @@ pub async fn commit(
 pub async fn rollback(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackResponse>> {
     let actor = label(&auth);
+    let sites = decided_sites(&state.db, decision_model::Column::Id, id).await?;
+    require_edit_in_scope(&state.db, &scope, &sites).await?;
     let (rollback_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         crate::routes::private::readings::service::rollback(
             txn,
@@ -758,9 +773,12 @@ pub async fn rollback(
 pub async fn rollback_edit_set(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     axum::extract::Path(set_id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackSetResponse>> {
     let actor = label(&auth);
+    let sites = decided_sites(&state.db, decision_model::Column::SetId, set_id).await?;
+    require_edit_in_scope(&state.db, &scope, &sites).await?;
     let (rolled_back, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         crate::routes::private::readings::service::rollback_set(
             txn,
@@ -794,12 +812,11 @@ pub async fn rollback_edit_set(
 )]
 pub async fn reload_run(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<ReloadResponse>> {
-    let run = tool_run::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Tool run {id} not found")))?;
+    let run =
+        crate::routes::private::tools::service::find_run_in_scope(&state.db, &scope, id).await?;
     let context = run.context.unwrap_or(serde_json::Value::Null);
     let mut body = run.inputs.as_object().cloned().unwrap_or_default();
     // The reserved context fields the calculate body takes, so the reopened run resolves its
@@ -3589,27 +3606,34 @@ pub async fn insert_grab_samples(
 )]
 pub async fn import_csv_chunk(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<ImportChunkRequest>,
 ) -> AppResult<Json<ImportChunkResponse>> {
+    let opener = auth.label();
     let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
     if req.session_id.is_some() {
-        require_open_session(&state.db, session_id).await?;
+        require_open_session(&state.db, session_id, &opener).await?;
     }
-    let bytes = append_chunk(&state.db, session_id, &req.chunk).await?;
+    let bytes = append_chunk(&state.db, session_id, &opener, &req.chunk).await?;
     Ok(Json(ImportChunkResponse { session_id, bytes }))
 }
 
 /// The file this request is about: the body's own text, or the chunks a prior upload staged.
 /// Either way the text is in `csv_import_chunks` under the returned session id, so a commit that
 /// re-sends the id imports exactly the file the plan was built from, on whichever replica takes it.
-async fn staged_csv(state: &AppState, req: &ImportCsvRequest) -> AppResult<(Arc<String>, Uuid)> {
+async fn staged_csv(
+    state: &AppState,
+    auth: &crate::common::middleware::AuthContext,
+    req: &ImportCsvRequest,
+) -> AppResult<(Arc<String>, Uuid)> {
+    let opener = auth.label();
     if let Some(csv) = req.csv.as_deref() {
         let sid = Uuid::new_v4();
-        append_chunk(&state.db, sid, csv).await?;
+        append_chunk(&state.db, sid, &opener, csv).await?;
         return Ok((Arc::new(csv.to_owned()), sid));
     }
     if let Some(sid) = req.session_id {
-        let text = staged_text(&state.db, sid).await?;
+        let text = staged_text(&state.db, sid, &opener).await?;
         return Ok((Arc::new(text), sid));
     }
     Err(AppError::BadRequest(
@@ -3944,7 +3968,7 @@ pub async fn import_csv(
     ProjectScope(scope): ProjectScope,
     Json(req): Json<ImportCsvRequest>,
 ) -> AppResult<Json<ImportCsvResponse>> {
-    let (csv_text, session_id) = staged_csv(&state, &req).await?;
+    let (csv_text, session_id) = staged_csv(&state, &auth, &req).await?;
     let target = resolve_site_with_project(&state.db, &req.site).await?.0;
     let split = split_by_site(&state.db, &csv_text, req.site_column.as_deref(), target.id).await?;
     let Some(split) = split else {
@@ -3964,7 +3988,7 @@ async fn import_one_site(
         req.measurement_type.as_deref(),
     )?;
 
-    let (csv_text, session_id) = staged_csv(&state, &req).await?;
+    let (csv_text, session_id) = staged_csv(&state, &auth, &req).await?;
 
     let tz_offset =
         chrono::Duration::milliseconds((req.tz_offset_hours.unwrap_or(0.0) * 3_600_000.0) as i64);
@@ -4546,8 +4570,8 @@ async fn import_one_site(
         || (overlap_differing > 0 && req.conflict == ConflictMode::Overwrite);
 
     // --- Stage the parsed readings and enqueue the worker job ---------------------------------
-    // The readings are externalised to `csv_import_staging` so any replica can run the import (the
-    // parsed `Vec` no longer lives only in this handler's memory). The job reads them back by token.
+    // The readings are externalised to `csv_import_staging` so any replica can run the import. The
+    // job reads them back by token.
     let derived_job_id = if has_work {
         let import_token = Uuid::new_v4();
         stage_import_rows(&state.db, import_token, &staged).await?;

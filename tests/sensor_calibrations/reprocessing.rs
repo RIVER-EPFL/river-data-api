@@ -309,11 +309,11 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
     cleanup_test_db(&db).await;
 }
 
-/// H7 regression, pinned against a data shape rather than a code path: a parameter-less curve
+/// Pinned against a data shape rather than a code path: a parameter-less curve
 /// (`parameter_id = NULL`, a wildcard) with an open window overlaps a later parameter-specific
 /// curve, because `recompute_valid_until` partitions by parameter_id and so never closes it.
 /// Reprocess must deterministically apply the parameter-specific curve to that parameter's
-/// readings. Nothing creates such rows any more, but they are still in the database.
+/// readings. Nothing creates such rows, but a database may still hold them.
 #[tokio::test]
 #[serial]
 async fn reprocess_prefers_a_parameter_specific_curve_over_an_open_wildcard() {

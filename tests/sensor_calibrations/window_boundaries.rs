@@ -736,8 +736,8 @@ async fn deleting_a_curve_a_reading_is_pinned_to_reports_the_pin() {
     let at = "2025-06-02T09:00:00Z";
     upload_history(&fx, &[(depth.as_str(), at, 10.0, sensor.as_str())]).await;
 
-    // Nothing records a pin any more (Q117), so the one this guard protects is a stored row: the
-    // projection trigger writes it onto the reading exactly as the removed route did.
+    // Nothing records a pin (Q117), so the one this guard protects is a stored row, which the
+    // projection trigger writes onto the reading.
     let stream = stream_carrying(&fx, &sensor).await;
     crate::common::exec(
         &fx.db,

@@ -1,12 +1,7 @@
 //! One table projection for every series endpoint, and the single point where the response format
 //! is decided.
 //!
-//! Each series endpoint used to encode its rows three times, with the format chosen below the
-//! handler's early returns. That is why an annotation the caller opted into appeared in JSON and
-//! not in CSV, why one endpoint filled a non-violating cell with `0.0` while its siblings used
-//! `null`, and why an empty result answered as JSON whatever `?format` said.
-//!
-//! A handler now builds one [`Table`] (the shared time axis plus the export columns) and hands it,
+//! A handler builds one [`Table`] (the shared time axis plus the export columns) and hands it,
 //! together with its JSON arm, to [`respond`]. [`respond`] is the only way these handlers return,
 //! the empty path included, so format parity is structural rather than remembered.
 //!

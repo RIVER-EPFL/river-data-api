@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::authz::{self, AccessScope, Capability, Role, TokenAccess};
-// Re-exported so `common::middleware::TokenPermissions` keeps resolving for existing call sites;
-// the definition now lives with the rest of the policy in `authz`.
+// Re-exported for the call sites that name `common::middleware::TokenPermissions`; the definition
+// lives with the rest of the policy in `authz`.
 pub use crate::common::authz::TokenPermissions;
 use crate::error::AppError;
 use crate::routes::private::api_tokens::service::validate_bearer_token;
@@ -672,6 +672,90 @@ pub(crate) fn scoped_stream_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::
         .into_query()
 }
 
+/// The `change_audit` subjects of the rows of `E` that `confine` admits, keyed `{prefix}:{id}` as
+/// the audit trigger writes them.
+fn audit_subjects_query<E: sea_orm::EntityTrait>(
+    prefix: &str,
+    id: E::Column,
+    confine: sea_orm::Condition,
+) -> sea_orm::sea_query::SelectStatement {
+    use sea_orm::sea_query::extension::postgres::PgExpr;
+    use sea_orm::sea_query::{Expr, ExprTrait};
+    use sea_orm::{QueryFilter, QuerySelect, QueryTrait};
+    E::find()
+        .select_only()
+        .expr(Expr::val(format!("{prefix}:")).concat(Expr::col((E::default(), id)).cast_as("text")))
+        .filter(confine)
+        .into_query()
+}
+
+/// The subjects whose rows every member reads: the catalog entities [`crud_scope_condition`]
+/// leaves unconfined. A subject of any other kind is shown to a confined caller only through its
+/// site, so a new kind of trail is hidden until it is named here or given a site.
+const CATALOG_AUDIT_SUBJECTS: [&str; 6] = [
+    "parameter",
+    "constant",
+    "calculation_formula",
+    "derived_parameter_source",
+    "parameter_group",
+    "schedule",
+];
+
+/// The `change_audit` rows a caller confined to `projects` may read: those recording a row of a
+/// granted site, a slot, calibration or curve there, or a catalog row. Shared by the entity list
+/// and the subject-keyed reader.
+pub(crate) fn scoped_change_audit_condition(projects: &[Uuid]) -> sea_orm::Condition {
+    use crate::routes::private::{
+        change_audit::models as audit, sensor_calibrations, site_parameters, sites, standard_curves,
+    };
+    use sea_orm::{ColumnTrait, Condition};
+    let catalog = CATALOG_AUDIT_SUBJECTS
+        .iter()
+        .fold(Condition::any(), |any, prefix| {
+            any.add(audit::Column::Subject.starts_with(format!("{prefix}:")))
+        });
+    Condition::any()
+        .add(
+            audit::Column::Subject.in_subquery(audit_subjects_query::<sites::Entity>(
+                "site",
+                sites::Column::Id,
+                Condition::all().add(sites::Column::ProjectId.is_in(projects.iter().copied())),
+            )),
+        )
+        .add(audit::Column::Subject.in_subquery(
+            audit_subjects_query::<site_parameters::Entity>(
+                "site_parameter",
+                site_parameters::Column::Id,
+                Condition::all().add(
+                    site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
+                ),
+            ),
+        ))
+        .add(
+            audit::Column::Subject.in_subquery(
+                audit_subjects_query::<sensor_calibrations::Entity>(
+                    "sensor_calibration",
+                    sensor_calibrations::Column::Id,
+                    Condition::all().add(
+                        sensor_calibrations::Column::SensorId
+                            .in_subquery(scoped_sensor_ids_query(projects)),
+                    ),
+                ),
+            ),
+        )
+        .add(
+            audit::Column::Subject.in_subquery(audit_subjects_query::<standard_curves::Entity>(
+                "standard_curve",
+                standard_curves::Column::Id,
+                Condition::all().add(
+                    standard_curves::Column::SensorId
+                        .in_subquery(scoped_sensor_ids_query(projects)),
+                ),
+            )),
+        )
+        .add(catalog)
+}
+
 /// Which side of a CRUD route [`crud_scope_condition`] is answering for. Almost every entity gives
 /// one answer to all three; the exceptions are the rows whose project is derived from where an
 /// instrument has been deployed, and they are named in the match.
@@ -723,11 +807,13 @@ fn crud_scope_condition(
 ) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
         alarms::models as alarm_thresholds, alarms::models::alarm_event as alarm_events,
-        annotations, data_streams, notes, projects as projects_entity, projects::subprojects,
+        annotations, collection_events::models as collection_events, data_streams,
+        data_streams::models::receipts as ingest_receipts, meteoswiss::models::subscription, notes,
+        notifications::models::mutes, projects as projects_entity, projects::subprojects,
         readings::decision_model as reading_decisions, readings::models as readings,
         readings::models::change_proposal as change_proposals, readings::samples,
         reprocessing_jobs, sensor_calibrations, sensor_deployments, sensors, site_parameters,
-        sites, standard_curves, sync::hold_model as holds,
+        sites, standard_curves, sync::hold_model as holds, tools::models::run as tool_runs,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
@@ -752,6 +838,22 @@ fn crud_scope_condition(
         }
         "alarm_events" => alarm_events::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
+        "collection_events" => {
+            collection_events::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
+        }
+        // A run computed at no visit names no site and is nobody's project's, as with readings.
+        "tool_runs" => tool_runs::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
+        "ingest_receipts" => {
+            ingest_receipts::Column::StreamId.in_subquery(scoped_stream_ids_query(projects))
+        }
+        "change_audit_entries" => return Some(scoped_change_audit_condition(projects)),
+        "notification_mutes" => mutes::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
+        // Creating a subscription mints the catalog parameter its variable lands on, which a
+        // project-scoped token never writes.
+        "meteoswiss_subscriptions" if direction == Direction::TokenWrite => return None,
+        "meteoswiss_subscriptions" => {
+            subscription::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
+        }
         // A reading is confined the way its statistics row is: by the site the pairing attributed
         // it to. An unattributed reading names no site and is nobody's project's.
         "readings" => readings::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),

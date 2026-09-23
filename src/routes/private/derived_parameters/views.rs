@@ -545,8 +545,8 @@ pub async fn recompute_derived(
 }
 
 /// Enqueue a durable `derived_recompute` job for one calculation. Runs on the claim-based worker
-/// pool (`DerivedRecompute`), reading `calculation_id` back from the job's params. A definition is
-/// no longer a thing that computes on its own, so the scope is the calculation (Q231).
+/// pool (`DerivedRecompute`), reading `calculation_id` back from the job's params. A definition
+/// does not compute on its own, so the scope is the calculation (Q231).
 pub async fn spawn_recompute_derived(
     db: &sea_orm::DatabaseConnection,
     _events: crate::common::EventSender,

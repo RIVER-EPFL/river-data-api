@@ -1,7 +1,6 @@
 //! What the write paths accept that they should refuse, and what they drop that they should keep.
 //!
-//! Each test asserts the intended behaviour, so a red run is the evidence that the defect is real
-//! and a later green run is the evidence that the fix works. Every flow is provisioned from nothing
+//! Each test asserts the intended behaviour. Every flow is provisioned from nothing
 //! over HTTP as a real Keycloak user, in the order the dashboard drives it.
 
 use axum::Router;

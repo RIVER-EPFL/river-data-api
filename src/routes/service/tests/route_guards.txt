@@ -28,6 +28,7 @@
 /api_token_audit_logs/distinct/status_codes => require_admin
 /calculations/closure => require_read_data
 /calculations/health => require_read_data
+/calculations/sites => require_read_data
 /change_audit => require_read_metadata
 /change_proposals/decide => deny_scoped_token+require_manage_sensors
 /collection_events/preview => require_enter_field_data
@@ -67,13 +68,11 @@
 /notifications/me/subscriptions => require_read_data
 /notifications/test-send => require_admin
 /pairing-plans => deny_scoped_token+require_admin_or_token_write_metadata
-/pairing-plans => require_read_metadata
 /pairing-plans/{id} => deny_scoped_token+require_admin_or_token_write_metadata
-/pairing-plans/{id} => require_read_metadata
 /pairing-plans/{id}/apply => deny_scoped_token+require_admin_or_token_write_metadata
-/pairing-plans/{id}/instruments => require_read_metadata
+/pairing-plans/{id}/instruments => deny_scoped_token+require_admin_or_token_write_metadata
 /pairing-plans/{id}/revert => deny_scoped_token+require_admin_or_token_write_metadata
-/pairing-plans/{id}/site-metadata => require_read_metadata
+/pairing-plans/{id}/site-metadata => deny_scoped_token+require_admin_or_token_write_metadata
 /pairing-plans/{id}/supersede => deny_scoped_token+require_admin_or_token_write_metadata
 /parameter_groups/{id}/definition => require_read_metadata
 /readings/batch => require_write_data
@@ -151,7 +150,7 @@
 /tool_scripts/inspect => require_admin
 /tool_scripts/{id} => require_admin
 /tool_scripts/{id}/activations => require_admin
-/tool_scripts/{id}/formulas => require_admin_or_token_write_metadata
+/tool_scripts/{id}/formulas => deny_scoped_token+require_admin_or_token_write_metadata
 /tool_scripts/{id}/formulas/draft_run => require_admin
 /tool_scripts/{id}/version_ledger => require_read_data
 /tool_scripts/{id}/version_usage => require_admin

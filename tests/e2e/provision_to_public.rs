@@ -19,13 +19,13 @@ async fn provision_pair_ingest_and_expose_publicly() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    // 1. Provision project → site → global parameter.
+    // Provision project → site → global parameter.
     let project_id = e2e::create_project(&app, &token, "E2E Prov", "e2e_prov", true).await;
     let site_id = e2e::create_site(&app, &token, &project_id, "Prov Station", "prov_station").await;
     let param_id = e2e::create_parameter(&app, &token, "e2e_depth", "E2E Depth", "mm").await;
 
-    // 2. Assign the parameter to the site with ONLY {site_id, parameter_id} (WS1 friction fix):
-    //    name is backfilled from the parameter, sensor_type defaults to "".
+    // Assign the parameter to the site with ONLY {site_id, parameter_id}:
+    // name is backfilled from the parameter, sensor_type defaults to "".
     let sp_id = e2e::assign_site_parameter_minimal(&app, &token, &site_id, &param_id).await;
     let (status, sp) =
         crate::common::get_json_with_token(&app, &format!("/api/site_parameters/{sp_id}"), &token)
@@ -40,7 +40,7 @@ async fn provision_pair_ingest_and_expose_publicly() {
         "sensor_type should default to empty: {sp}"
     );
 
-    // 3. Register a source-agnostic stream and pair it to the site_parameter.
+    // Register a source-agnostic stream and pair it to the site_parameter.
     let (status, stream) = crate::common::post_json_parse_with_token(
         &app,
         "/api/streams/register",
@@ -66,7 +66,7 @@ async fn provision_pair_ingest_and_expose_publicly() {
         "pair stream ({status}): {paired}"
     );
 
-    // 4. Ingest readings through the paired stream, they should be stamped with site_id/parameter_id.
+    // Ingest readings through the paired stream, they should be stamped with site_id/parameter_id.
     let times: Vec<String> = (0..6)
         .map(|i| format!("2025-06-01T00:{:02}:00Z", i * 10))
         .collect();
@@ -92,7 +92,7 @@ async fn provision_pair_ingest_and_expose_publicly() {
     );
     assert_eq!(ing["paired"], true, "stream should be paired: {ing}");
 
-    // 5. Authenticated readings reproduce the ingested series (COALESCE(calibrated, raw)).
+    // Authenticated readings reproduce the ingested series (COALESCE(calibrated, raw)).
     let readings_uri = format!(
         "/api/sites/{site_id}/readings?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z"
     );
@@ -120,7 +120,7 @@ async fn provision_pair_ingest_and_expose_publicly() {
         "hourly avg should be 12.5 (mean of 10..15), got {avg:?}"
     );
 
-    // 7. Expose publicly and verify the public JSON + CSV surfaces reproduce the data.
+    // Expose publicly and verify the public JSON + CSV surfaces reproduce the data.
     e2e::set_site_parameter_public(&db, &sp_id).await;
 
     let pub_uri =

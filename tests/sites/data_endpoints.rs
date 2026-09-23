@@ -643,8 +643,8 @@ async fn test_readings_csv_header_uses_parameter_code() {
 /// Scenario: a caller asks for the replicate rows and the per-instant statistics in one request.
 ///
 /// Expected behaviour: refused, naming the conflict. The two are different shapes, a row per
-/// replicate against a row per instant, and the combination used to be served as replicates alone,
-/// which a caller reads as "this window has no sample statistics".
+/// replicate against a row per instant, and serving replicates alone reads to a caller as "this
+/// window has no sample statistics".
 #[tokio::test]
 #[serial]
 async fn replicates_and_sample_statistics_cannot_be_asked_for_together() {
@@ -666,8 +666,8 @@ async fn replicates_and_sample_statistics_cannot_be_asked_for_together() {
 /// window, with replicates included.
 ///
 /// Expected behaviour: every value sits on the row whose timestamp it was measured at, and each
-/// replicate row says which index it is. The axis used to be the longest parameter's timestamps
-/// filled by position, so a nine-row spot group was dated to the first nine continuous samples.
+/// replicate row says which index it is, so a nine-row spot group is not dated to the first nine
+/// continuous samples.
 #[tokio::test]
 #[serial]
 async fn a_replicate_export_dates_every_value_to_its_own_instant() {

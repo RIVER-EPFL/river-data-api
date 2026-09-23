@@ -802,8 +802,8 @@ async fn calibration_candidates_then_backfill_calibrations() {
     );
 
     // The anomaly the endpoint exists to find: rows a window covers whose stamp is missing. It is
-    // made here by hand because no live path produces it any more; what is in the database from
-    // before the stamp was reliable still looks exactly like this.
+    // made here by hand because no live path produces it; a database written before the stamp was
+    // reliable holds rows exactly like this.
     crate::common::exec(
         &db,
         &format!(

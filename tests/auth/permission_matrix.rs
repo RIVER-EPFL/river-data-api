@@ -21,7 +21,7 @@ use river_db::common::authz::{
 };
 use serial_test::serial;
 
-use crate::common::fixtures::{PROJECT_ID, SITE1_ID};
+use crate::common::fixtures::{GLOBAL_PARAM_TEMP_ID, PROJECT_ID, SITE1_ID};
 use crate::common::keycloak::{
     build_test_app_with_keycloak_admin, ensure_realm_user, get_keycloak_jwt, grant_project,
     keycloak_reachable, keycloak_user_id,
@@ -30,6 +30,8 @@ use crate::common::keycloak::{
 /// A project the fixture callers are never granted, for the denial half of every project-bound row.
 const OTHER_PROJECT_ID: &str = "00000000-0000-4000-a000-000000000099";
 const OTHER_SITE_ID: &str = "00000000-0000-4000-a000-000000000098";
+const OTHER_SLOT_ID: &str = "00000000-0000-4000-a000-000000000097";
+const OTHER_STREAM_ID: &str = "00000000-0000-4000-a000-000000000096";
 
 // --- The callers ---
 
@@ -376,7 +378,7 @@ fn entities() -> Vec<Entity> {
         admin_write("data_streams", CrudScope::ProjectBound),
         field("subprojects", CrudScope::ProjectBound),
         field("notes", CrudScope::ProjectBound),
-        catalog("notification_mutes", CrudScope::Global),
+        catalog("notification_mutes", CrudScope::ProjectBound),
         admin_only("notification_logs"),
         // Channel health, `routes(read)`: the sweeper writes it, nothing else, so read is the
         // whole surface.
@@ -391,9 +393,9 @@ fn entities() -> Vec<Entity> {
         },
         field_data("annotations", CrudScope::ProjectBound),
         admin_write("constants", CrudScope::Global),
-        catalog("meteoswiss_subscriptions", CrudScope::Global),
+        catalog("meteoswiss_subscriptions", CrudScope::ProjectBound),
         field_data("samples", CrudScope::ProjectBound),
-        field_data("collection_events", CrudScope::Global),
+        field_data("collection_events", CrudScope::ProjectBound),
         // A job is enqueued by the worker and driven by the rerun and cancel actions below; the
         // CRUD surface is the queue's read side.
         Entity {
@@ -451,12 +453,12 @@ fn entities() -> Vec<Entity> {
         // Append-only: every writer is a side effect of the change it records.
         Entity {
             families: &["read"],
-            ..field("change_audit_entries", CrudScope::Global)
+            ..field("change_audit_entries", CrudScope::ProjectBound)
         },
         // Written by the ingest pass, deleted only by the janitor's age prune.
         Entity {
             families: &["read"],
-            ..field("ingest_receipts", CrudScope::Global)
+            ..field("ingest_receipts", CrudScope::ProjectBound)
         },
     ]
 }
@@ -593,12 +595,12 @@ fn table() -> Table {
     );
 
     // The formula set save: a formula calculation is arithmetic over the catalog, and its rows are
-    // written under the same `write_metadata` (Q196). No scope layer, because a calculation belongs
-    // to no project.
+    // written under the same `write_metadata` (Q196). A calculation belongs to no project, so a
+    // project-scoped token is refused, as the formula rows' own CRUD refuses it.
     t.group(
         Capability::Admin,
         TokenAccess::Bit(TokenBit::WriteMetadata),
-        Scope::Open,
+        Scope::DenyScopedToken,
         &[("POST", "/api/tool_scripts/{id}/formulas")],
     );
 
@@ -809,20 +811,20 @@ fn table() -> Table {
         Capability::ReadMetadata,
         TokenAccess::Same,
         Scope::Open,
-        &[
-            ("GET", "/api/sync/pairing-plans"),
-            ("GET", "/api/sync/pairing-plans/{id}"),
-            ("GET", "/api/sync/pairing-plans/{id}/site-metadata"),
-            ("GET", "/api/sync/pairing-plans/{id}/instruments"),
-            ("GET", "/api/sync/unpaired-summary"),
-        ],
+        &[("GET", "/api/sync/unpaired-summary")],
     );
 
+    // A plan names every portal's stream keys and proposed sites, so it is read by whoever may
+    // write it, and every write names the version it read.
     t.group(
         Capability::Admin,
         TokenAccess::Bit(TokenBit::WriteMetadata),
         Scope::DenyScopedToken,
         &[
+            ("GET", "/api/sync/pairing-plans"),
+            ("GET", "/api/sync/pairing-plans/{id}"),
+            ("GET", "/api/sync/pairing-plans/{id}/site-metadata"),
+            ("GET", "/api/sync/pairing-plans/{id}/instruments"),
             ("POST", "/api/sync/services/{id}/commands"),
             ("POST", "/api/sync/services/{id}/revoke"),
             ("POST", "/api/sync/pairing-plans"),
@@ -1290,10 +1292,96 @@ async fn scope_confinement_denies_another_projects_row() {
     .await;
     assert!(s == 403 || s == 404, "a foreign site by name answers {s}");
 
-    // The unconfined half: an unscoped key reaches both projects, so the denials above are
-    // confinement rather than the row being unreachable.
+    // An edit over readings, and its rollback, is held to the sites of the readings it moves.
     let unscoped =
         crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    for sql in [
+        format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name) VALUES ('{OTHER_SLOT_ID}', '{OTHER_SITE_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'Outside temperature')"
+        ),
+        format!(
+            "INSERT INTO data_streams (id, source_system, source_key, site_parameter_id, paired_at, is_active) VALUES ('{OTHER_STREAM_ID}', 'test', 'outside-temperature', '{OTHER_SLOT_ID}', now(), true)"
+        ),
+        format!(
+            "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value) VALUES ('{OTHER_STREAM_ID}', '{OTHER_SITE_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-01-01T00:00:00Z', 4.0)"
+        ),
+    ] {
+        crate::common::db::exec(&db, &sql).await;
+    }
+    let slot = |site: &str| {
+        serde_json::json!({
+            "site_id": site,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
+            "from": "2025-01-01T00:00:00Z",
+            "to": "2025-01-01T01:00:00Z",
+        })
+    };
+    let flag = serde_json::json!({ "kind": "flag", "reason": "not mine" });
+    let edit = |site: &str| serde_json::json!({ "selection": slot(site), "decision": flag });
+    let (status, preview) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits/preview",
+        &edit(OTHER_SITE_ID),
+        &unscoped,
+    )
+    .await;
+    assert_eq!(status, 200, "{preview}");
+    let preview_id = preview["preview_id"].clone();
+    let mut committed = edit(OTHER_SITE_ID);
+    committed["preview_id"] = preview_id;
+    let restricted = [("granted member", &member), ("scoped token", &scoped)];
+    for (label, token) in restricted {
+        let s = status_of(
+            &app,
+            "POST",
+            "/api/readings/edits/preview",
+            Some(&edit(SITE1_ID)),
+            Some(token),
+        )
+        .await;
+        assert!(
+            !(401..=403).contains(&s),
+            "[{label}] an edit inside the grant previews, got {s}"
+        );
+        for (path, body) in [
+            ("/api/readings/edits/preview", edit(OTHER_SITE_ID)),
+            ("/api/readings/edits", committed.clone()),
+        ] {
+            let s = status_of(&app, "POST", path, Some(&body), Some(token)).await;
+            assert_eq!(
+                s, 403,
+                "[{label}] {path} over another project's readings, got {s}"
+            );
+        }
+    }
+    let (status, recorded) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits",
+        &committed,
+        &unscoped,
+    )
+    .await;
+    assert_eq!(status, 200, "{recorded}");
+    let decision_id = recorded["decision_ids"][0]
+        .as_str()
+        .expect("a decision")
+        .to_string();
+    let set_id = recorded["set_id"].as_str().expect("a set").to_string();
+    for (label, token) in restricted {
+        for path in [
+            format!("/api/readings/edits/{decision_id}/rollback"),
+            format!("/api/readings/edits/sets/{set_id}/rollback"),
+        ] {
+            let s = status_of(&app, "POST", &path, None, Some(token)).await;
+            assert_eq!(
+                s, 403,
+                "[{label}] {path} over another project's readings, got {s}"
+            );
+        }
+    }
+
+    // The unconfined half: an unscoped key reaches both projects, so the denials above are
+    // confinement rather than the row being unreachable.
     for site in [SITE1_ID, OTHER_SITE_ID] {
         let s = status_of(
             &app,
@@ -1454,8 +1542,8 @@ fn registered_routes(sources: &[(&str, &str)]) -> (Vec<(String, String)>, Vec<St
 }
 
 /// A source entry that no longer resolves is drift in the table's own data, so the scan reports it
-/// and keeps reading the rest. It used to panic on the first one, which left every route in the
-/// remaining files unchecked for as long as the entry stood.
+/// and keeps reading the rest, so one stale entry leaves no route in the remaining files
+/// unchecked.
 #[test]
 fn test_a_moved_source_is_reported_as_drift_and_stops_no_other_scan() {
     let sources = [

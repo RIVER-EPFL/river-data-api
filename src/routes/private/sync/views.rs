@@ -1326,12 +1326,13 @@ pub async fn reopen_hold(
 }
 
 /// Sync admin views are split by required authorization, and each group carries its own layers
-/// (Q143), so `service/mod.rs` mounts them under `/sync` and adds nothing. The layers used to sit
-/// at the nest site, where `tests/route_guards.rs` could not see them and all 36 routes recorded
-/// as unguarded (T97).
+/// (Q143), so `service/mod.rs` mounts them under `/sync` and adds nothing, and
+/// `tests/route_guards.rs` sees each route's guard where it is declared.
 ///
 /// Group membership:
-/// - `read_routes`: list/get operations, fine for any read_metadata caller.
+/// - `read_routes`: the unpaired-stream counts, fine for any read_metadata caller.
+/// - `plan_read_routes`: pairing plans, which name every portal's stream keys and proposed sites.
+///   The gate the plan writes take, since every write names the version it read.
 /// - `write_routes`: operator actions such as issuing sync commands and pairing workflows.
 ///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
 /// - `manage_routes`: the replicate audit review surface.
@@ -1343,12 +1344,18 @@ pub async fn reopen_hold(
 ///   cannot enumerate which credentials exist.
 pub fn read_routes() -> Router<AppState> {
     Router::new()
+        .route("/unpaired-summary", get(unpaired_summary))
+        .layer(middleware::from_fn(require_read_metadata))
+}
+
+pub fn plan_read_routes() -> Router<AppState> {
+    Router::new()
         .route("/pairing-plans", get(list_pairing_plans))
         .route("/pairing-plans/{id}", get(get_pairing_plan))
         .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
         .route("/pairing-plans/{id}/instruments", get(plan_instruments))
-        .route("/unpaired-summary", get(unpaired_summary))
-        .layer(middleware::from_fn(require_read_metadata))
+        .layer(middleware::from_fn(deny_scoped_token))
+        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
 }
 
 pub fn write_routes() -> Router<AppState> {
@@ -1432,7 +1439,7 @@ pub async fn create_pairing_plan(
 }
 
 /// List pairing plans, newest first, optionally narrowed to one source system or one status
-/// (draft/applying/applied/reverting/reverted/superseded). Requires `read_metadata`.
+/// (draft/applying/applied/reverting/reverted/superseded). Requires Administrator or `write_metadata`.
 #[utoipa::path(
     get,
     path = "/api/sync/pairing-plans",
@@ -1539,7 +1546,7 @@ pub async fn supersede_pairing_plan(
     }))
 }
 
-/// Get a single pairing plan with its full pairing list. Requires `read_metadata`.
+/// Get a single pairing plan with its full pairing list. Requires Administrator or `write_metadata`.
 #[utoipa::path(
     get,
     path = "/api/sync/pairing-plans/{id}",
@@ -1774,7 +1781,7 @@ pub async fn apply_pairing_plan(
 ) -> AppResult<Json<PlanJobQueued>> {
     // Validate synchronously for immediate feedback, then background the heavy entity-resolution +
     // readings backfill as a tracked job so the request doesn't block. The job's `detail` carries
-    // the execution counts the UI used to read from the response.
+    // the execution counts.
     let status = plan_status(&state.db, id).await?;
     if status != "draft" {
         return Err(AppError::Conflict(format!(
@@ -1890,7 +1897,7 @@ pub async fn unpaired_summary(
 }
 
 /// Get site metadata enrichment for a pairing plan: latitudes, longitudes, glacier names,
-/// stream counts. Used by the pairing UI to display context. Requires `read_metadata`.
+/// stream counts. Used by the pairing UI to display context. Requires Administrator or `write_metadata`.
 #[utoipa::path(
     get,
     path = "/api/sync/pairing-plans/{id}/site-metadata",
@@ -2031,7 +2038,7 @@ pub async fn plan_site_metadata(
 }
 
 /// The instrument picture of a pairing plan: every instrument the plan binds, and the parameters
-/// still without one. Requires `read_metadata`.
+/// still without one. Requires Administrator or `write_metadata`.
 #[utoipa::path(
     get,
     path = "/api/sync/pairing-plans/{id}/instruments",

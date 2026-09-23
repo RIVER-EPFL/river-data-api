@@ -129,7 +129,7 @@ async fn granted_manager_is_confined_to_granted_project() {
     );
 }
 
-/// H2: a `samples` row is confined by its site's project on the write side, not just on read. A
+/// A `samples` row is confined by its site's project on the write side, not just on read. A
 /// manager granted only project A cannot delete a sample owned by project B.
 #[tokio::test]
 #[serial]
@@ -171,7 +171,7 @@ async fn granted_manager_cannot_mutate_other_projects_sample() {
     );
 }
 
-/// H1: a `sensor_calibrations` row is confined by the projects its sensor is deployed to. A manager
+/// A `sensor_calibrations` row is confined by the projects its sensor is deployed to. A manager
 /// granted only project A cannot patch a calibration whose sensor is deployed solely in project B,
 /// editing it would rewrite project B's calibrated readings.
 #[tokio::test]
@@ -240,7 +240,7 @@ async fn granted_manager_cannot_mutate_other_projects_calibration() {
     );
 }
 
-/// H3: creating a site by omitting `project_id` and naming only a `subproject_id` must not bypass the
+/// Creating a site by omitting `project_id` and naming only a `subproject_id` must not bypass the
 /// scope guard, the DB trigger would otherwise stamp the site into the subproject's project. A
 /// manager granted only A cannot create a site under project B's subproject.
 #[tokio::test]

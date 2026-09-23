@@ -432,11 +432,13 @@ pub async fn run_now(
 )]
 pub async fn get_schedule_audit(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(job_name): Path<String>,
 ) -> AppResult<Json<Vec<crate::routes::private::change_audit::models::ChangeEntry>>> {
     Ok(Json(
         crate::routes::private::change_audit::service::entries_for(
             &state.db,
+            &scope,
             &format!("schedule:{job_name}"),
         )
         .await?,

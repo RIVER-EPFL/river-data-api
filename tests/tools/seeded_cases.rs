@@ -1,7 +1,7 @@
 //! Every active tool version's stored test cases, run through the validation path.
 //!
-//! The cases are the claim that the DB-stored R reproduces the legacy portal, and until now they
-//! only ran when someone clicked Validate in the portal. This drives them from the database, so
+//! The cases are the claim that the DB-stored R reproduces the legacy portal. This drives them from
+//! the database, so
 //! adding a tool or a case extends the proof without touching this file: nothing here names a
 //! tool, a case or a number.
 //!

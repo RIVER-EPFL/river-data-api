@@ -1346,9 +1346,9 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
         "each excluded reading is still stored with its original value"
     );
 
-    // The aggregates' `replicate_index = 0` predicate has no probe here any more: no write path
-    // admits a non-zero index on a non-spot reading and a table CHECK refuses one, so the predicate
-    // now covers only rows that predate both.
+    // The aggregates' `replicate_index = 0` predicate has no probe here: no write path admits a
+    // non-zero index on a non-spot reading and a table CHECK refuses one, so the predicate covers
+    // only rows that predate both.
 }
 
 // ============================================================================
