@@ -4102,7 +4102,7 @@ pub(super) async fn calculation_slots(state: &AppState) -> AppResult<Vec<Uuid>> 
 /// Coverage for a set of parameters: how many slots declare each, and what its readings and their
 /// provenance say. Each side is its own LATERAL, so a parameter with no readings still reports a
 /// row with zeroes rather than dropping out of the join.
-pub(super) fn coverage_query(parameter_ids: &[Uuid], site_id: Option<Uuid>) -> Statement {
+pub(super) fn coverage_query(parameter_ids: &[Uuid], site_ids: Option<&[Uuid]>) -> Statement {
     use sea_orm::sea_query::ExprTrait;
 
     let p = Alias::new("p");
@@ -4123,8 +4123,8 @@ pub(super) fn coverage_query(parameter_ids: &[Uuid], site_id: Option<Uuid>) -> S
             Expr::col((sp.clone(), site_parameters::Column::ParameterId))
                 .equals((p.clone(), parameters::Column::Id)),
         );
-    if let Some(id) = site_id {
-        configured.and_where(Expr::col((sp, site_parameters::Column::SiteId)).eq(id));
+    if let Some(ids) = site_ids {
+        configured.and_where(Expr::col((sp, site_parameters::Column::SiteId)).is_in(ids.to_vec()));
     }
 
     let mut observed = Query::select();
@@ -4162,8 +4162,8 @@ pub(super) fn coverage_query(parameter_ids: &[Uuid], site_id: Option<Uuid>) -> S
             Expr::col((r.clone(), readings::Column::ParameterId))
                 .equals((p.clone(), parameters::Column::Id)),
         );
-    if let Some(id) = site_id {
-        observed.and_where(Expr::col((r, readings::Column::SiteId)).eq(id));
+    if let Some(ids) = site_ids {
+        observed.and_where(Expr::col((r, readings::Column::SiteId)).is_in(ids.to_vec()));
     }
 
     let empty_text_array = Expr::cust("ARRAY[]::text[]");
@@ -4215,18 +4215,19 @@ pub(super) fn coverage_query(parameter_ids: &[Uuid], site_id: Option<Uuid>) -> S
     build(&query)
 }
 
-/// Coverage for a set of parameters, one query each over configuration, readings and provenance.
+/// Coverage for a set of parameters, one query each over configuration, readings and provenance,
+/// counted over `site_ids`, or every site when `None`.
 pub async fn coverage_for(
     state: &AppState,
     parameter_ids: &[Uuid],
-    site_id: Option<Uuid>,
+    site_ids: Option<&[Uuid]>,
 ) -> AppResult<Vec<SlotCoverage>> {
     if parameter_ids.is_empty() {
         return Ok(Vec::new());
     }
     let rows = state
         .db
-        .query_all_raw(coverage_query(parameter_ids, site_id))
+        .query_all_raw(coverage_query(parameter_ids, site_ids))
         .await?;
 
     let coverage = rows
@@ -4240,8 +4241,12 @@ pub async fn coverage_for(
 ///
 /// Two grouped reads over the review queue: one counts the findings by kind, the other names the
 /// visits, so a visit carrying three findings of one calculation counts once. A finding no
-/// calculation raised (`tool` NULL) belongs to no row here.
-pub async fn calculation_health(db: &DatabaseConnection) -> AppResult<Vec<CalculationHealth>> {
+/// calculation raised (`tool` NULL) belongs to no row here. `site_ids` confines the findings to
+/// those sites; `None` reads every site.
+pub async fn calculation_health(
+    db: &DatabaseConnection,
+    site_ids: Option<&[Uuid]>,
+) -> AppResult<Vec<CalculationHealth>> {
     #[derive(Debug, FromQueryResult)]
     struct KindCount {
         tool: String,
@@ -4258,7 +4263,8 @@ pub async fn calculation_health(db: &DatabaseConnection) -> AppResult<Vec<Calcul
             Condition::all()
                 .add(hold_model::Column::StreamId.is_null())
                 .add(hold_model::Column::Tool.is_not_null())
-                .add(hold_model::Column::Status.eq(HoldStatus::Pending.as_str())),
+                .add(hold_model::Column::Status.eq(HoldStatus::Pending.as_str()))
+                .add_option(site_ids.map(|ids| hold_model::Column::SiteId.is_in(ids.to_vec()))),
             &HoldKind::EVENT_AUDIT,
         )
     };
@@ -4430,6 +4436,23 @@ pub(super) async fn load_calculation<C: ConnectionTrait>(
         engine: Engine::parse(&row.engine).unwrap_or(Engine::Script),
         active_version_id: row.active_version_id,
     }))
+}
+
+tokio::task_local! {
+    static SAVING_SET: Uuid;
+}
+
+/// Run `work` as part of the set save of `script_id`, which mints that calculation's version once
+/// for everything it wrote.
+pub async fn saving_set<F: Future>(script_id: Uuid, work: F) -> F::Output {
+    SAVING_SET.scope(script_id, work).await
+}
+
+/// Whether a set save in progress mints `script_id` itself, so a step written on its way leaves
+/// that calculation to it.
+#[must_use]
+pub fn is_saving_set(script_id: Uuid) -> bool {
+    SAVING_SET.try_with(|id| *id == script_id).unwrap_or(false)
 }
 
 /// Mint and activate a version for a formula calculation whose formula set has changed. A script
@@ -4945,16 +4968,20 @@ pub async fn calculations_reading_constant<C: ConnectionTrait>(
     Ok(reading)
 }
 
-/// Enqueue what [`migration_jobs`] decided, if anything.
+/// Enqueue what [`migration_jobs`] decided, if anything. Given the transaction that activates the
+/// version, the jobs commit with it or not at all.
+///
+/// # Errors
+/// A database error on any enqueue.
 pub async fn recompute_after_activation<C: ConnectionTrait>(
     db: &C,
     migrate_stored: bool,
     name: &str,
     script_id: Uuid,
     superseded: Option<Uuid>,
-) {
+) -> Result<(), sea_orm::DbErr> {
     for job in migration_jobs(migrate_stored, name, script_id, superseded) {
-        if let Err(e) = crate::routes::private::reprocessing_jobs::service::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             job.kind,
             None,
@@ -4962,16 +4989,9 @@ pub async fn recompute_after_activation<C: ConnectionTrait>(
             &job.params,
             Some(&job.dedupe_key),
         )
-        .await
-        {
-            tracing::warn!(
-                error = %e,
-                calculation = %name,
-                kind = job.kind,
-                "failed to enqueue the version migration"
-            );
-        }
+        .await?;
     }
+    Ok(())
 }
 
 pub(super) async fn activate<C: ConnectionTrait>(

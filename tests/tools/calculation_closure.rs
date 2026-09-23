@@ -261,6 +261,86 @@ async fn the_sites_a_calculation_is_active_at_are_named() {
     assert!(!confined.contains(&SITE_B_ID.to_string()), "{confined:?}");
 }
 
+/// Scenario: a site in a second project declares the temperature `closure_a` reads and carries a
+/// finding against it.
+///
+/// Expected behaviour: a token scoped to the first project is refused the second project's site by
+/// name, counts only its own projects' slots when it names no site, and sees only its own
+/// projects' findings in the calculation's health.
+#[tokio::test]
+#[serial]
+async fn coverage_and_health_are_confined_to_the_callers_projects() {
+    const PROJECT_B_ID: &str = "00000000-0000-4000-e000-000000000001";
+    const SITE_B_ID: &str = "00000000-0000-4000-e000-000000000010";
+    let (db, app, token) = setup().await;
+    for sql in [
+        format!("INSERT INTO projects (id, name) VALUES ('{PROJECT_B_ID}', 'Closure B')"),
+        format!(
+            "INSERT INTO sites (id, name, project_id) VALUES ('{SITE_B_ID}', 'Closure site B', '{PROJECT_B_ID}')"
+        ),
+        format!(
+            "INSERT INTO site_parameters (site_id, parameter_id, name) VALUES ('{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'Temp B')"
+        ),
+        format!(
+            "INSERT INTO replicate_audit_holds \
+               (group_time, expected, computed, delta, status, kind, site_id, parameter_id, tool) \
+             VALUES ('{AT}', '{{}}', '{{}}', '{{}}', 'pending', 'stale_output', \
+                     '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'closure_a')"
+        ),
+    ] {
+        crate::common::db::exec(&db, &sql).await;
+    }
+    let scoped = crate::common::seed_api_token(
+        &db,
+        crate::common::full_permissions(),
+        Some(crate::common::PROJECT_ID),
+    )
+    .await;
+
+    let named = format!("/api/calculations/closure?include_coverage=true&site_id={SITE_B_ID}");
+    let (status, body) = crate::common::get_json_with_token(&app, &named, &scoped).await;
+    assert_eq!(status, 403, "a foreign site is refused by name: {body}");
+    let (status, body) = crate::common::get_json_with_token(&app, &named, &token).await;
+    assert_eq!(status, 200, "{body}");
+
+    let configured = |body: &serde_json::Value| {
+        body["coverage"]
+            .as_array()
+            .expect("coverage")
+            .iter()
+            .find(|c| c["parameter_id"] == GLOBAL_PARAM_TEMP_ID)
+            .and_then(|c| c["sites_configured"].as_i64())
+            .expect("the input is covered")
+    };
+    let every = "/api/calculations/closure?include_coverage=true";
+    let (status, all) = crate::common::get_json_with_token(&app, every, &token).await;
+    assert_eq!(status, 200, "{all}");
+    let (status, own) = crate::common::get_json_with_token(&app, every, &scoped).await;
+    assert_eq!(status, 200, "{own}");
+    assert_eq!(
+        configured(&own),
+        configured(&all) - 1,
+        "the foreign slot is not counted: {own}"
+    );
+
+    let stale = |body: &serde_json::Value| {
+        body.as_array()
+            .expect("a list")
+            .iter()
+            .find(|r| r["tool"] == "closure_a")
+            .and_then(|r| r["stale_visits"].as_i64())
+            .unwrap_or(0)
+    };
+    let (status, all) =
+        crate::common::get_json_with_token(&app, "/api/calculations/health", &token).await;
+    assert_eq!(status, 200, "{all}");
+    assert_eq!(stale(&all), 1, "{all}");
+    let (status, own) =
+        crate::common::get_json_with_token(&app, "/api/calculations/health", &scoped).await;
+    assert_eq!(status, 200, "{own}");
+    assert_eq!(stale(&own), 0, "the foreign finding is not counted: {own}");
+}
+
 /// Expected behaviour: the grid marks each cell with the calculations that read it and the one
 /// that writes it, so the role is visible while a value is being typed.
 #[tokio::test]

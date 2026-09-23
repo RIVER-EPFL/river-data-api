@@ -867,13 +867,8 @@ pub async fn decide_proposals(
     let actor = crate::common::actor::label(&auth);
     let projects = scope.project_ids();
     // An accepted correction rewrites a served value, so it takes the same tail every other
-    // curation write takes: the rollups over the span it moved, the cache, and the visits whose
-    // calculations read it.
-    let tail = |written: &crate::routes::private::readings::service::Recorded| {
-        crate::routes::private::readings::service::Written::new(written.rows)
-            .over(written.span)
-            .touching(written.touched_events.clone())
-    };
+    // curation write takes: the rollups over the span it moved, the cache, the visits whose
+    // calculations read it and the derived values its slots feed.
     let (response, written) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let (response, written) = decide(
             txn,
@@ -884,13 +879,11 @@ pub async fn decide_proposals(
             projects.as_deref(),
         )
         .await?;
-        crate::routes::private::readings::service::queue(txn, &tail(&written), &ACCEPT_TAIL)
-            .await?;
+        crate::routes::private::readings::service::queue(txn, &written, &ACCEPT_TAIL).await?;
         Ok((response, written))
     })
     .await?;
-    crate::routes::private::readings::service::run(&state, &tail(&written), &ACCEPT_TAIL, &actor)
-        .await?;
+    crate::routes::private::readings::service::run(&state, &written, &ACCEPT_TAIL, &actor).await?;
     Ok(axum::Json(response))
 }
 

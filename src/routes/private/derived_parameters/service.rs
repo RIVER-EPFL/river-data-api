@@ -242,9 +242,7 @@ impl CRUDOperations for SharedStepOperations {
         // A declaration changes the shape of both calculations' pinned sets, and it is the whole
         // act, so each is minted once here rather than by a sweep over every formula calculation.
         for calculation in [previous_owner, entity.tool_script_id] {
-            crate::routes::private::tools::service::mint_formula_version(db, calculation, None)
-                .await
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            remint(db, calculation).await?;
         }
         Ok(())
     }
@@ -1091,14 +1089,23 @@ async fn remint_declaring_calculations<C: ConnectionTrait>(
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
     for declaration in declarations {
-        crate::routes::private::tools::service::mint_formula_version(
-            db,
-            declaration.tool_script_id,
-            None,
-        )
+        remint(db, declaration.tool_script_id).await?;
+    }
+    Ok(())
+}
+
+/// Mint a version for a calculation a step change reshaped, in the name of whoever made the
+/// change. A calculation whose set save wrote the step mints once at the end of that save instead.
+async fn remint<C: ConnectionTrait>(db: &C, calculation: Uuid) -> Result<(), ApiError> {
+    use crate::routes::private::tools::service::{is_saving_set, mint_formula_version};
+
+    if is_saving_set(calculation) {
+        return Ok(());
+    }
+    let actor = crate::common::actor::current();
+    mint_formula_version(db, calculation, actor.as_deref())
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    }
     Ok(())
 }
 

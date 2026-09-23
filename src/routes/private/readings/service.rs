@@ -4520,7 +4520,8 @@ pub(super) async fn load_undecided<C: ConnectionTrait>(
 
 /// Accept or reject proposals. An accepted one is written through the curation record, so the
 /// value carries who accepted it and that it arrived through this stream's source system; a
-/// rejected one keeps its number, so the next pass re-proposes nothing.
+/// rejected one keeps its number, so the next pass re-proposes nothing. Returns what the accepted
+/// corrections moved, with their slots, for the tail.
 pub async fn decide<C: ConnectionTrait>(
     conn: &C,
     ids: &[Uuid],
@@ -4528,7 +4529,7 @@ pub async fn decide<C: ConnectionTrait>(
     actor: &str,
     reason: Option<&str>,
     projects: Option<&[Uuid]>,
-) -> AppResult<(DecideResponse, Recorded)> {
+) -> AppResult<(DecideResponse, Written)> {
     let mut response = DecideResponse {
         accepted: 0,
         rejected: 0,
@@ -4545,6 +4546,7 @@ pub async fn decide<C: ConnectionTrait>(
         }
     }
     let mut written = Recorded::default();
+    let mut slots = Vec::new();
     if accept {
         let mut by_stream: std::collections::HashMap<Uuid, Vec<&Pending>> =
             std::collections::HashMap::new();
@@ -4621,6 +4623,7 @@ pub async fn decide<C: ConnectionTrait>(
                 vec![stream_ids.into(), first.into(), last.into()],
             )
             .await?;
+            slots = proposal_slots(conn, &pending).await?;
         }
         response.accepted = pending.len();
     } else {
@@ -4641,7 +4644,31 @@ pub async fn decide<C: ConnectionTrait>(
             .exec(conn)
             .await?;
     }
+    let written = Written::new(written.rows)
+        .over(written.span)
+        .touching(written.touched_events)
+        .at(slots);
     Ok((response, written))
+}
+
+/// The slots the readings under the proposals belong to.
+async fn proposal_slots<C: ConnectionTrait>(conn: &C, pending: &[Pending]) -> AppResult<Vec<Slot>> {
+    let keys = pending.iter().fold(Condition::any(), |any, p| {
+        any.add(
+            Condition::all()
+                .add(Expr::col((Alias::new("r"), readings::Column::StreamId)).eq(p.stream_id))
+                .add(Expr::col((Alias::new("r"), readings::Column::Time)).eq(p.time))
+                .add(
+                    Expr::col((Alias::new("r"), readings::Column::ReplicateIndex))
+                        .eq(p.replicate_index),
+                ),
+        )
+    });
+    Ok(slots_of(conn, Condition::all().add(keys))
+        .await?
+        .into_iter()
+        .map(|(site_id, parameter_id)| Slot::paired(site_id, parameter_id))
+        .collect())
 }
 
 /// How many proposals are awaiting a decision, per source system. The notification's subject.

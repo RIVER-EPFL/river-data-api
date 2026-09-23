@@ -43,7 +43,7 @@ Migrations run on startup. The API is at `http://localhost:3000` and its documen
 
 ## Stack
 
-- [Axum](https://github.com/tokio-rs/axum) 0.8 and [SeaORM](https://www.sea-ql.org/SeaORM/) 1.1
+- [Axum](https://github.com/tokio-rs/axum) 0.8 and [SeaORM](https://www.sea-ql.org/SeaORM/) 2.0
   on Rust 1.95, edition 2024
 - PostgreSQL 18 with [TimescaleDB](https://www.timescale.com/) 2.23 for hypertables,
   compression and continuous aggregates

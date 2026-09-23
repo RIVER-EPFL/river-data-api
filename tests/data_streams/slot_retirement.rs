@@ -347,3 +347,40 @@ async fn retiring_a_slot_that_is_already_gone_is_not_an_error() {
 
     cleanup_test_db(&db).await;
 }
+
+#[tokio::test]
+#[serial]
+async fn retiring_a_stream_whose_rollup_refresh_cannot_be_queued_releases_nothing() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let stream = create_paired_stream(&db, "retire-refused", PARAM_S1_TEMP_ID).await;
+    attributed_reading(&db, stream, 0, 10.0).await;
+
+    crate::common::jobs::refuse_enqueue(&db, "refresh_aggregates").await;
+    let refused = retire_slot(&db, SlotScope::Stream(stream), "test").await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert!(refused.is_err(), "the release reports the refused enqueue");
+    assert_eq!(attributed_count(&db, stream).await, 1, "nothing is released");
+
+    retire_slot(&db, SlotScope::Stream(stream), "test")
+        .await
+        .expect("a retry releases the stream");
+    assert_eq!(attributed_count(&db, stream).await, 0);
+    assert_eq!(
+        e2e::count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM reprocessing_jobs \
+                 WHERE trigger_type = 'refresh_aggregates' AND trigger_id = '{stream}'"
+            )
+        )
+        .await,
+        1,
+        "the retry queues the rollup refresh"
+    );
+
+    cleanup_test_db(&db).await;
+}

@@ -30,6 +30,7 @@ use crate::routes::private::readings::status_events::models as status_events;
 use crate::routes::private::reprocessing_jobs::flows::required_uuid;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
 use crate::routes::private::site_parameters::models as site_parameters;
+use crate::routes::private::site_parameters::service::queue_moved_rollups;
 use crate::routes::private::sync::service::{
     HoldScope, has_plan_attribution, queue_plan_attribution, repoint_holds,
 };
@@ -317,9 +318,9 @@ pub async fn enqueue_slot_reprocess<C: ConnectionTrait>(
 /// transaction, under `actor`, so a release never commits without it.
 ///
 /// The rollups are refreshed over what the teardown touched by a tracked `refresh_aggregates`
-/// job rather than inline: a teardown can span a stream's whole history, and a refresh that fails
-/// then belongs in `/jobs`, where it is visible and rerunnable, not as a 500 on an operation that
-/// already committed.
+/// job, queued in the same transaction, rather than inline: a teardown can span a stream's whole
+/// history, and a refresh that fails then belongs in `/jobs`, where it is visible and rerunnable,
+/// not as a 500 on an operation that already committed.
 ///
 /// A slot the scope cannot resolve reports an empty range rather than an error, so retiring a row
 /// that is already gone is not a failure.
@@ -328,7 +329,10 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
     scope: SlotScope,
     actor: &str,
 ) -> AppResult<TouchedRange> {
-    let touched = bulk_write::guarded(db, async |txn| {
+    let trigger_id = match scope {
+        SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
+    };
+    bulk_write::guarded(db, async |txn| {
         lock_released_streams(txn, scope.streams()).await?;
         let Some(target) = resolve_retire_target(txn, scope).await? else {
             return Ok(TouchedRange::default());
@@ -343,26 +347,10 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
             crate::routes::private::collection_events::flows::Writer::Person,
         )
         .await?;
+        queue_moved_rollups(txn, &touched, trigger_id).await?;
         Ok(touched)
     })
-    .await?;
-
-    if let Some((from, until)) = touched.span() {
-        let trigger_id = match scope {
-            SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
-        };
-        crate::routes::private::reprocessing_jobs::service::enqueue(
-            db,
-            "refresh_aggregates",
-            None,
-            Some(trigger_id),
-            &serde_json::json!({ "from": from.to_rfc3339(), "until": until.to_rfc3339() }),
-            None,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    }
-    Ok(touched)
+    .await
 }
 
 /// The status a guarded plan job's work leaves behind, read before it runs.

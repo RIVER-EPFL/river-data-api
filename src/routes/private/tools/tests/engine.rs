@@ -597,9 +597,9 @@ fn test_coverage_query_keeps_the_two_sides_lateral() {
     );
     assert!(!unscoped.contains(r#""sp"."site_id""#), "{unscoped}");
 
-    let scoped = coverage_query(&[uuid::Uuid::nil()], Some(uuid::Uuid::nil())).sql;
-    assert!(scoped.contains(r#""sp"."site_id" = $"#), "{scoped}");
-    assert!(scoped.contains(r#""r"."site_id" = $"#), "{scoped}");
+    let scoped = coverage_query(&[uuid::Uuid::nil()], Some(&[uuid::Uuid::nil()])).sql;
+    assert!(scoped.contains(r#""sp"."site_id" IN ($"#), "{scoped}");
+    assert!(scoped.contains(r#""r"."site_id" IN ($"#), "{scoped}");
 }
 
 /// The manifest's aggregate outputs, recomputed server-side over the curve-applied replicates.

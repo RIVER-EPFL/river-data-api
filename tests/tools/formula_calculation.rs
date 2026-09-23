@@ -1305,3 +1305,71 @@ async fn a_set_save_names_the_output_it_stopped_publishing() {
         "ticking it back publishes the same catalog row, not a second one"
     );
 }
+
+/// Scenario: an author saves a correction on the correcting arm, and the migration job it owes
+/// cannot be queued.
+///
+/// Expected behaviour: the save and its migration are one transaction, so the save is refused and
+/// the calculation stays on the version whose values nothing was queued to repair.
+#[tokio::test]
+#[serial]
+async fn a_correcting_save_whose_migration_cannot_be_queued_saves_nothing() {
+    let group_id = "00000000-0000-4000-c000-000000000130";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "queued_out",
+        "DO_Temperature / Dissolved_O2",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "save ({status}): {text}");
+    let (was, _) = active_version(&db).await.expect("a version");
+
+    crate::common::exec(
+        &db,
+        "CREATE FUNCTION refuse_version_migration() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.trigger_type = 'event_recompute' THEN \
+         RAISE EXCEPTION 'the migration is refused'; END IF; RETURN NEW; END $$",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "CREATE TRIGGER refuse_version_migration BEFORE INSERT ON reprocessing_jobs \
+         FOR EACH ROW EXECUTE FUNCTION refuse_version_migration()",
+    )
+    .await;
+    let id = formula_id(&db, "queued_out").await;
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tool_scripts/{script_id}/formulas"),
+        &json!({
+            "formulas": [{ "id": id, "code": "queued_out", "units": "ratio",
+                           "formula": "DO_Temperature * 2", "ordinal": 1 }],
+            "migrate_stored": true,
+        }),
+        &token,
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DROP TRIGGER refuse_version_migration ON reprocessing_jobs",
+    )
+    .await;
+    crate::common::exec(&db, "DROP FUNCTION refuse_version_migration()").await;
+
+    assert!(
+        !(200..300).contains(&status),
+        "a save whose migration was not queued is refused ({status}): {text}"
+    );
+    let (now, body) = active_version(&db).await.expect("a version");
+    assert_eq!(now, was, "the calculation stays on its version");
+    assert!(
+        !body.contains("DO_Temperature * 2"),
+        "and the correction is not stored: {body}"
+    );
+}

@@ -26,7 +26,7 @@ use super::models::{
     DraftRunRequest, DraftRunResponse, DraftRunResults, Engine, FormulaDraftRunRequest,
     FormulaDraftRunResponse, FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse,
     LintFinding, MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse,
-    SavedFormula, ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest,
+    SavedFormula, SavedSharedStep, ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest,
     ValidateResponse, VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
 };
 use super::service::{
@@ -167,11 +167,13 @@ pub async fn trace_run(
     responses(
         (status = 200, description = "Calculations fed, with optional slot coverage", body = ClosureResponse),
         (status = 400, description = "Invalid query parameters"),
+        (status = 403, description = "A site outside the caller's projects"),
     ),
     tag = "tools"
 )]
 pub async fn get_calculation_closure(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Query(query): Query<ClosureQuery>,
 ) -> AppResult<Response> {
     let subject = closure_subject(&query)?;
@@ -180,8 +182,9 @@ pub async fn get_calculation_closure(
     // Coverage covers every slot an active calculation touches, not only the ones asked about: an
     // admin's question is "is this calculation wired up anywhere", which the named set cannot answer.
     let coverage = if query.include_coverage {
+        let site_ids = coverage_sites(&state, &scope, query.site_id).await?;
         let slots = calculation_slots(&state).await?;
-        coverage_for(&state, &slots, query.site_id).await?
+        coverage_for(&state, &slots, site_ids.as_deref()).await?
     } else {
         Vec::new()
     };
@@ -203,6 +206,22 @@ pub async fn get_calculation_closure(
     .into_response())
 }
 
+/// The sites a coverage count reads: the one named, once it is the caller's, else every site of
+/// the caller's projects, `None` for an unrestricted caller naming none.
+async fn coverage_sites(
+    state: &AppState,
+    scope: &crate::common::authz::AccessScope,
+    site_id: Option<Uuid>,
+) -> AppResult<Option<Vec<Uuid>>> {
+    match site_id {
+        Some(site_id) => {
+            crate::common::scope::require_sites_in_scope(&state.db, scope, &[site_id]).await?;
+            Ok(Some(vec![site_id]))
+        }
+        None => scope_site_ids(&state.db, scope).await,
+    }
+}
+
 /// Every enabled calculation and the sites it is active at, confined to the caller's projects.
 #[utoipa::path(
     get,
@@ -222,7 +241,8 @@ pub async fn get_calculation_sites(
     ))
 }
 
-/// The open event-audit findings each calculation is carrying, and how many visits they sit on.
+/// The open event-audit findings each calculation is carrying at the caller's projects' sites, and
+/// how many visits they sit on.
 #[utoipa::path(
     get,
     path = "/api/calculations/health",
@@ -233,8 +253,12 @@ pub async fn get_calculation_sites(
 )]
 pub async fn get_calculation_health(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<Vec<CalculationHealth>>> {
-    Ok(Json(calculation_health(&state.db).await?))
+    let site_ids = scope_site_ids(&state.db, &scope).await?;
+    Ok(Json(
+        calculation_health(&state.db, site_ids.as_deref()).await?,
+    ))
 }
 
 /// List every calculation with its live version and how many versions it has. Requires
@@ -841,14 +865,17 @@ pub async fn activate_version(
     // The correcting arm reaches exactly the visits the superseded version produced values at
     // (Q170). It is enqueued after the commit, so a failure here leaves the activation standing
     // and the audit's findings say what was not repaired.
-    super::service::recompute_after_activation(
+    if let Err(e) = super::service::recompute_after_activation(
         &state.db,
         payload.migrate_stored,
         &script.name,
         id,
         current.active_version_id,
     )
-    .await;
+    .await
+    {
+        tracing::warn!(error = %e, calculation = %script.name, "failed to enqueue the version migration");
+    }
     Ok(Json(ActivateResponse { script, lint }))
 }
 
@@ -886,10 +913,87 @@ fn update_model(f: &SavedFormula) -> CalculationFormulaUpdate {
     }
 }
 
+/// A shared step as a create: owned by no calculation, which is what makes it shared.
+fn step_create_model(s: &SavedSharedStep) -> CalculationFormulaCreate {
+    CalculationFormulaCreate {
+        code: s.code.clone(),
+        name: s.name.clone().unwrap_or_else(|| s.code.clone()),
+        units: s.units.clone().unwrap_or_default(),
+        formula: s.formula.clone(),
+        description: s.description.clone(),
+        tool_script_id: None,
+        ordinal: None,
+        curve_slot: s.curve_slot.clone(),
+        per_replicate: s.per_replicate.clone(),
+        intermediate: Some(true),
+    }
+}
+
+/// A shared step as an update. Releasing the owner is what marks a step of this calculation's own
+/// shared; on a step that is already shared it changes nothing.
+fn step_update_model(s: &SavedSharedStep) -> CalculationFormulaUpdate {
+    CalculationFormulaUpdate {
+        code: Some(Some(s.code.clone())),
+        name: Some(Some(s.name.clone().unwrap_or_else(|| s.code.clone()))),
+        units: Some(Some(s.units.clone().unwrap_or_default())),
+        formula: Some(Some(s.formula.clone())),
+        description: Some(s.description.clone()),
+        tool_script_id: Some(None),
+        ordinal: None,
+        curve_slot: Some(s.curve_slot.clone()),
+        per_replicate: Some(s.per_replicate.clone()),
+        intermediate: Some(Some(true)),
+    }
+}
+
+/// Write the shared steps a set save carries, and declare each one the calculation does not yet
+/// read. Every other calculation declaring a corrected step is re-minted by the step's own hook;
+/// this one is left to the save, which mints once for everything it wrote.
+async fn write_shared_steps(
+    txn: &sea_orm::DatabaseTransaction,
+    script_id: Uuid,
+    steps: &[SavedSharedStep],
+) -> AppResult<()> {
+    use crate::routes::private::derived_parameters::models::shared_step;
+
+    for step in steps {
+        let formula_id = match step.id {
+            Some(formula_id) => {
+                CalculationFormula::update(txn, formula_id, step_update_model(step))
+                    .await?
+                    .id
+            }
+            None => {
+                CalculationFormula::create(txn, step_create_model(step))
+                    .await?
+                    .id
+            }
+        };
+        let declared = shared_step::Entity::find()
+            .filter(shared_step::Column::ToolScriptId.eq(script_id))
+            .filter(shared_step::Column::FormulaId.eq(formula_id))
+            .one(txn)
+            .await?
+            .is_some();
+        if !declared {
+            shared_step::CalculationSharedStep::create(
+                txn,
+                shared_step::CalculationSharedStepCreate {
+                    tool_script_id: script_id,
+                    formula_id,
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Save a formula calculation's whole formula set as one version.
 ///
 /// The set is the request: a formula carrying an `id` updates that row, one without an id is
-/// created, and a stored formula the set leaves out is deleted. One version is minted from the
+/// created, and a stored formula the set leaves out is deleted. The shared steps it carries are
+/// written first, in the same transaction, and are not the set's to delete. One version is minted from the
 /// resulting set and activated, whatever the save touched, so an author's version history reads as
 /// their decisions rather than as their keystrokes (Q186). `migrate_stored` chooses what happens to
 /// the values the superseded version produced (Q170). Requires Administrator, or a token with
@@ -932,6 +1036,7 @@ pub async fn save_formula_set(
 
     let payload_ids: Vec<Uuid> = payload.formulas.iter().filter_map(|f| f.id).collect();
     take_back_steps(&txn, id, &script.name, &payload_ids).await?;
+    super::service::saving_set(id, write_shared_steps(&txn, id, &payload.shared_steps)).await?;
 
     let before = formula_entity::Entity::find()
         .filter(formula_entity::Column::ToolScriptId.eq(id))
@@ -1003,6 +1108,11 @@ pub async fn save_formula_set(
             .await?,
         );
     }
+    // The migration commits with the version it repairs, so a save reporting `migrated` has its
+    // job queued, and a job that cannot be queued leaves no save behind.
+    let migrated = payload.migrate_stored && superseded.is_some() && version_id != superseded;
+    super::service::recompute_after_activation(&txn, migrated, &script.name, id, superseded)
+        .await?;
     txn.commit().await?;
 
     let version_no = match version_id {
@@ -1015,9 +1125,6 @@ pub async fn save_formula_set(
 
     // The audit is the backstop under either arm: it reports what the save left disagreeing.
     audit_after_activation(&state.db, &script.name).await;
-    let migrated = payload.migrate_stored && superseded.is_some() && version_id != superseded;
-    super::service::recompute_after_activation(&state.db, migrated, &script.name, id, superseded)
-        .await;
 
     Ok(Json(SaveFormulaSetResponse {
         version_id,

@@ -483,7 +483,135 @@ async fn correcting_a_shared_step_mints_a_version_for_each_declaring_calculation
             body.contains("Dissolved_O2 * 3"),
             "the version {calculation} runs holds the correction: {body}"
         );
+        let author = crate::common::e2e::scalar(
+            &db,
+            &format!(
+                "SELECT COALESCE(created_by, 'none') FROM tool_script_versions \
+                  WHERE id::text = '{now}'"
+            ),
+        )
+        .await;
+        assert_ne!(author, "none", "the correction names who made it");
     }
+}
+
+/// Scenario: a step two calculations read is corrected from the second calculation's page, and the
+/// author saves on the correcting arm.
+///
+/// Expected behaviour: the correction and the set save are one act. The calculation gets one
+/// version, authored and holding the correction, and the values the version it replaces produced
+/// are queued for recompute.
+#[tokio::test]
+#[serial]
+async fn correcting_a_shared_step_in_a_set_save_mints_one_version_and_migrates() {
+    let (db, app, token) = setup().await;
+    let first = calculation(&db, "bp_owner").await;
+    let second = calculation(&db, "bp_reader").await;
+
+    let step = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "bp_step", "name": "BP step", "units": "hPa",
+            "formula": "Dissolved_O2 * 2", "tool_script_id": first,
+            "ordinal": 0, "intermediate": true,
+        }),
+        &token,
+    )
+    .await;
+    let step_id = id_of(&step);
+    post(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": second, "formula_id": step_id }),
+        &token,
+    )
+    .await;
+    let (status, saved) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &second,
+        json!([{ "code": "bp_out", "units": "hPa", "formula": "bp_step + 1", "ordinal": 1 }]),
+    )
+    .await;
+    assert_eq!(status, 200, "{saved}");
+
+    let versions = || {
+        let db = db.clone();
+        let second = second.clone();
+        async move {
+            crate::common::e2e::scalar(
+                &db,
+                &format!(
+                    "SELECT count(*)::text FROM tool_script_versions \
+                      WHERE tool_script_id = '{second}'"
+                ),
+            )
+            .await
+        }
+    };
+    let minted_before: i64 = versions().await.parse().expect("a count");
+    let superseded = crate::common::e2e::scalar(
+        &db,
+        &format!("SELECT active_version_id::text FROM tool_scripts WHERE id = '{second}'"),
+    )
+    .await;
+    let out_id = crate::common::e2e::scalar(
+        &db,
+        "SELECT id::text FROM calculation_formulas WHERE code = 'bp_out'",
+    )
+    .await;
+
+    let (status, raw) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tool_scripts/{second}/formulas"),
+        &json!({
+            "formulas": [{ "id": out_id, "code": "bp_out", "units": "hPa",
+                           "formula": "bp_step + 1", "ordinal": 1 }],
+            "shared_steps": [{ "id": step_id, "code": "bp_step", "name": "BP step",
+                               "units": "hPa", "formula": "Dissolved_O2 * 3" }],
+            "migrate_stored": true,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{raw}");
+    let saved: Value = serde_json::from_str(&raw).expect("JSON");
+    assert_eq!(
+        saved["migrated"], true,
+        "the superseded version's values are queued: {saved}"
+    );
+
+    let minted_after: i64 = versions().await.parse().expect("a count");
+    assert_eq!(minted_after, minted_before + 1, "one save is one version");
+    let (body, author) = {
+        let active = crate::common::e2e::scalar(
+            &db,
+            &format!(
+                "SELECT v.script || '|' || COALESCE(v.created_by, 'none') \
+                   FROM tool_scripts s JOIN tool_script_versions v ON v.id = s.active_version_id \
+                  WHERE s.id = '{second}'"
+            ),
+        )
+        .await;
+        let (body, author) = active.rsplit_once('|').expect("script and author");
+        (body.to_string(), author.to_string())
+    };
+    assert!(
+        body.contains("Dissolved_O2 * 3"),
+        "the version holds the correction: {body}"
+    );
+    assert_ne!(author, "none", "and names who saved it");
+
+    let queued = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT count(*)::text FROM reprocessing_jobs \
+              WHERE dedupe_key = 'event_recompute:version:{superseded}'"
+        ),
+    )
+    .await;
+    assert_eq!(queued, "1", "the recompute names the version it replaces");
 }
 
 /// A shared step the other calculation stopped reading is saved back into the set of the one

@@ -2203,10 +2203,36 @@ pub struct SavedFormula {
     pub intermediate: bool,
 }
 
+/// A shared step a set save writes: one this calculation declares and corrects, or one of its own
+/// it marks shared. An `id` names a stored formula, which is written in place and keeps every
+/// calculation reading it; a step without one is created. Either way it is owned by no calculation
+/// afterwards and this calculation declares it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SavedSharedStep {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    pub code: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub units: Option<String>,
+    pub formula: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub curve_slot: Option<String>,
+    #[serde(default)]
+    pub per_replicate: Option<String>,
+}
+
 /// Save a formula calculation's whole set, as one version (Q186).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SaveFormulaSetRequest {
     pub formulas: Vec<SavedFormula>,
+    /// The shared steps written with the set, in the same transaction, so the one version the save
+    /// mints holds them and the version they supersede is the one the page was editing.
+    #[serde(default)]
+    pub shared_steps: Vec<SavedSharedStep>,
     /// What happens to the values the version being replaced produced (Q170). `false`, the
     /// default, leaves them on that version. `true` is a correction: every visit the superseded
     /// version produced values at is recomputed under the new one.

@@ -309,3 +309,71 @@ async fn an_accept_whose_rollup_refresh_fails_answers_the_decision_it_recorded()
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: a manager accepts a correction to a stored temperature that a derived output may
+/// read.
+///
+/// Expected behaviour: the accept queues one `derived_recompute` over the reading's slot and
+/// instant in the decision's transaction, as a flag does, so a value computed from the old number
+/// is recomputed from the new one.
+#[tokio::test]
+#[serial]
+async fn accepting_a_correction_queues_the_recompute_of_its_slot() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app_without_worker(db.clone());
+
+    let proposal = proposal_on(&db, PARAM_S1_TEMP_ID, "recompute-slot").await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                 (stream_id, time, replicate_index, raw_value, site_id, parameter_id) \
+             SELECT stream_id, time, 0, 10.0, \
+                    (SELECT site_id FROM site_parameters WHERE id = '{PARAM_S1_TEMP_ID}'), \
+                    '{GLOBAL_PARAM_TEMP_ID}' \
+             FROM reading_change_proposals WHERE id = '{proposal}'"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/change_proposals/decide",
+        &json!({ "ids": [proposal], "decision": "accept" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "accept ({status}): {body}");
+
+    let jobs = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT params FROM reprocessing_jobs WHERE trigger_type = 'derived_recompute'",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1, "one recompute is queued");
+    let params: serde_json::Value = jobs[0].try_get("", "params").unwrap();
+    let site: Uuid = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT site_id FROM site_parameters WHERE id = '{PARAM_S1_TEMP_ID}'"),
+        ))
+        .await
+        .unwrap()
+        .expect("the slot")
+        .try_get("", "site_id")
+        .unwrap();
+    assert_eq!(params["site_ids"], json!([site.to_string()]));
+    assert_eq!(params["parameter_ids"], json!([GLOBAL_PARAM_TEMP_ID]));
+    let at: chrono::DateTime<chrono::Utc> = AT.parse().unwrap();
+    assert_eq!(params["start"], json!(at.to_rfc3339()));
+    assert_eq!(params["end"], json!(at.to_rfc3339()));
+
+    crate::common::cleanup_test_db(&db).await;
+}
