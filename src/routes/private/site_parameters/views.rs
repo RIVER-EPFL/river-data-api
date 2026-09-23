@@ -148,7 +148,6 @@ pub async fn apply_group(
     let txn = state.db.begin().await?;
     // The change-audit trigger reads the writer from the transaction it fires in.
     crate::common::actor::declare(&txn).await?;
-    crate::common::actor::declare(&txn).await?;
     let mut created = Vec::with_capacity(to_create.len());
     for member in &to_create {
         let id = Uuid::new_v4();

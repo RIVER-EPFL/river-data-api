@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use crudcrate::{UpsertStatus, upsert};
+use sea_orm::ActiveValue::Unchanged;
 use sea_orm::sea_query::{Alias, Expr, Query as SeaQuery, QueryStatementBuilder, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
@@ -27,6 +28,7 @@ use crate::routes::private::reprocessing_jobs::flows::{
 use crate::routes::private::reprocessing_jobs::service::Job;
 use crate::routes::private::reprocessing_jobs::service::{JobContext, JobReport, Schedule};
 use crate::routes::private::site_parameters::models as site_parameters;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -334,8 +336,10 @@ async fn reconcile_instrument_range<C: ConnectionTrait + TransactionTrait>(
 
     Ok(stats)
 }
-/// Reconstruct resolved breach episodes for one slot over `[start, end]` and persist them
-/// idempotently. Returns the number of episode rows written.
+/// Reconstruct resolved threshold episodes for one slot over `[start, end]` and persist them in one
+/// transaction: a stored episode with the same cadence and start is updated in place, keeping its
+/// acknowledgement and notification state, and the rest are inserted. Returns the number of
+/// episodes computed.
 pub async fn evaluate_alarm_episodes(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -378,45 +382,128 @@ pub async fn evaluate_alarm_episodes(
         all_episodes.push((super::service::cadence_label(spot), episodes));
     }
 
-    // Idempotent: clear the resolved episodes previously written for this slot+window, then reinsert
-    // the freshly computed set. Open rows (`resolved_at IS NULL`) are owned by the sweeper and left
-    // alone.
-    alarm_event::Entity::delete_many()
+    // Match each computed episode to the stored one it recomputes, by cadence and start, so an
+    // acknowledgement and the notifications that name the row survive; only new episodes are
+    // inserted, and a stored one nothing recomputes is removed. Open rows (`resolved_at IS NULL`) are owned by the sweeper and left alone.
+    let txn = db.begin().await?;
+    let stored = alarm_event::Entity::find()
         .filter(alarm_event::Column::SiteId.eq(site_id))
         .filter(alarm_event::Column::ParameterId.eq(parameter_id))
+        .filter(alarm_event::Column::Kind.eq(KIND_THRESHOLD))
         .filter(alarm_event::Column::ResolvedAt.is_not_null())
         .filter(alarm_event::Column::StartedAt.gte(start))
         .filter(alarm_event::Column::StartedAt.lte(end))
-        .exec(db)
+        .all(&txn)
         .await?;
-
-    let rows: Vec<alarm_event::ActiveModel> = all_episodes
+    let computed: Vec<(&'static str, &EpisodeRow)> = all_episodes
         .iter()
-        .flat_map(|(cadence, episodes)| {
-            episodes.iter().map(|ep| alarm_event::ActiveModel {
+        .flat_map(|(cadence, episodes)| episodes.iter().map(move |ep| (*cadence, ep)))
+        .collect();
+    let matched = match_episodes(
+        &stored
+            .iter()
+            .map(|e| (e.id, e.measurement_type.as_str(), e.started_at))
+            .collect::<Vec<_>>(),
+        &computed
+            .iter()
+            .map(|(cadence, ep)| (*cadence, ep.started_at.with_timezone(&Utc)))
+            .collect::<Vec<_>>(),
+    );
+
+    for stale in matched.stale.chunks(10_000) {
+        alarm_event::Entity::delete_many()
+            .filter(alarm_event::Column::Id.is_in(stale.iter().copied()))
+            .exec(&txn)
+            .await?;
+    }
+    let by_id: HashMap<Uuid, &alarm_event::Model> = stored.iter().map(|e| (e.id, e)).collect();
+    let mut inserts = Vec::new();
+    for ((cadence, ep), id) in computed.iter().zip(&matched.stored) {
+        let episode = alarm_event::ActiveModel {
+            severity: Set(ep.severity),
+            max_severity: Set(ep.max_severity),
+            value_at_start: Set(ep.value_at_start),
+            last_seen_at: Set(ep.last_seen_at.with_timezone(&Utc)),
+            last_value: Set(ep.last_value),
+            resolved_at: Set(ep.resolved_at.map(|t| t.with_timezone(&Utc))),
+            resolved_value: Set(ep.resolved_value),
+            ..Default::default()
+        };
+        match id {
+            Some(id) => {
+                if by_id.get(id).is_some_and(|e| episode_unchanged(e, ep)) {
+                    continue;
+                }
+                alarm_event::ActiveModel {
+                    id: Unchanged(*id),
+                    updated_at: Set(Utc::now()),
+                    ..episode
+                }
+                .update(&txn)
+                .await?;
+            }
+            None => inserts.push(alarm_event::ActiveModel {
                 id: Set(Uuid::new_v4()),
                 site_id: Set(site_id),
                 parameter_id: Set(parameter_id),
                 measurement_type: Set((*cadence).to_string()),
-                severity: Set(ep.severity),
-                max_severity: Set(ep.max_severity),
                 started_at: Set(ep.started_at.with_timezone(&Utc)),
-                value_at_start: Set(ep.value_at_start),
-                last_seen_at: Set(ep.last_seen_at.with_timezone(&Utc)),
-                last_value: Set(ep.last_value),
-                resolved_at: Set(ep.resolved_at.map(|t| t.with_timezone(&Utc))),
-                resolved_value: Set(ep.resolved_value),
-                ..Default::default()
-            })
-        })
-        .collect();
-    let written = rows.len() as i64;
-    if !rows.is_empty() {
-        alarm_event::Entity::insert_many(rows).exec(db).await?;
+                ..episode
+            }),
+        }
     }
+    if !inserts.is_empty() {
+        alarm_event::Entity::insert_many(inserts).exec(&txn).await?;
+    }
+    txn.commit().await?;
 
-    Ok(written)
+    Ok(computed.len() as i64)
 }
+/// Which stored episode each computed one recomputes, keyed on cadence and start: `stored[i]` is
+/// the row `computed[i]` updates, `None` a new episode, and `stale` the rows nothing claimed.
+#[derive(Debug, PartialEq)]
+pub(super) struct EpisodeMatch {
+    pub(super) stored: Vec<Option<Uuid>>,
+    pub(super) stale: Vec<Uuid>,
+}
+
+pub(super) fn match_episodes(
+    stored: &[(Uuid, &str, DateTime<Utc>)],
+    computed: &[(&str, DateTime<Utc>)],
+) -> EpisodeMatch {
+    let mut by_key: HashMap<(&str, DateTime<Utc>), VecDeque<Uuid>> = HashMap::new();
+    for (id, cadence, started_at) in stored {
+        by_key
+            .entry((*cadence, *started_at))
+            .or_default()
+            .push_back(*id);
+    }
+    let matched: Vec<Option<Uuid>> = computed
+        .iter()
+        .map(|key| by_key.get_mut(key).and_then(VecDeque::pop_front))
+        .collect();
+    let claimed: HashSet<Uuid> = matched.iter().flatten().copied().collect();
+    EpisodeMatch {
+        stale: stored
+            .iter()
+            .map(|(id, ..)| *id)
+            .filter(|id| !claimed.contains(id))
+            .collect(),
+        stored: matched,
+    }
+}
+
+/// Whether a stored episode already holds what the rebuild computed for it.
+fn episode_unchanged(stored: &alarm_event::Model, ep: &EpisodeRow) -> bool {
+    stored.severity == ep.severity
+        && stored.max_severity == ep.max_severity
+        && stored.value_at_start == ep.value_at_start
+        && stored.last_seen_at == ep.last_seen_at
+        && stored.last_value == ep.last_value
+        && stored.resolved_at == ep.resolved_at.map(|t| t.with_timezone(&Utc))
+        && stored.resolved_value == ep.resolved_value
+}
+
 /// Rebuild resolved alarm episodes across every active slot matching the optional `site_id` /
 /// `parameter_id` filter. When `start`/`end` are omitted they default per-slot to the slot's reading
 /// range (`MIN`/`MAX(time)`). Returns the total number of episode rows written. Slot-level failures

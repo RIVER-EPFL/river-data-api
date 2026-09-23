@@ -10,8 +10,8 @@ use axum::{
 };
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult,
-    IntoActiveModel, QueryFilter, QueryOrder, Statement, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+    QueryOrder, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -179,14 +179,6 @@ pub async fn update_my_notifications(
     Ok(Json(load(&state, &sub).await?))
 }
 
-#[derive(FromQueryResult)]
-pub(super) struct ChannelCounts {
-    kind: String,
-    sent_1d: i64,
-    sent_7d: i64,
-    sent_30d: i64,
-}
-
 #[utoipa::path(
     get,
     path = "/api/notifications/channels",
@@ -199,27 +191,8 @@ pub async fn list_channels(
 ) -> AppResult<Json<Vec<ChannelView>>> {
     let sub = require_sub(&auth)?;
     let role = caller_role(&auth);
-    let counts = state
-        .db
-        .query_all_raw(Statement::from_string(
-            PG,
-            // A send is a delivery the dispatcher recorded as `sent`; a failed or muted attempt is
-            // not one, and the card says what the channel has sent lately. `created_at` is the
-            // only time the row carries.
-            "SELECT kind,
-                    count(*) FILTER (WHERE status = 'sent'
-                        AND created_at > now() - interval '1 day')::bigint AS sent_1d,
-                    count(*) FILTER (WHERE status = 'sent'
-                        AND created_at > now() - interval '7 days')::bigint AS sent_7d,
-                    count(*) FILTER (WHERE status = 'sent'
-                        AND created_at > now() - interval '30 days')::bigint AS sent_30d
-               FROM notification_log GROUP BY kind"
-                .to_string(),
-        ))
-        .await?;
     let mut by_kind = std::collections::HashMap::new();
-    for row in &counts {
-        let c = ChannelCounts::from_query_result(row, "")?;
+    for c in sent_counts_by_kind(&state.db).await? {
         by_kind.insert(c.kind.clone(), c);
     }
     let mine = subscription::Entity::find()

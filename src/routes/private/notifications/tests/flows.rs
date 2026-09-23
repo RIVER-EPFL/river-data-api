@@ -182,3 +182,55 @@ fn test_owed_holds_message_is_none_when_nothing_is_owed() {
     assert!(owed_holds_message(&[]).is_none());
     assert!(owed_holds_message(&[(HoldKind::ReplicateStats, 157)]).is_none());
 }
+
+fn failed(trigger_type: &str, error: Option<&str>, scope: Option<serde_json::Value>) -> FailedJob {
+    FailedJob {
+        trigger_type: trigger_type.to_string(),
+        error_message: error.map(str::to_string),
+        scope,
+    }
+}
+
+/// Scenario: the failed runs arrive grouped by trigger type, newest first within each.
+/// Expected behaviour: one digest per type, counting every run and keeping the newest error and
+/// the newest scope any run recorded, a JSON null scope being no scope.
+#[test]
+fn test_failed_job_digests_keep_the_newest_error_and_scope_per_type() {
+    let runs = vec![
+        failed("csv_import", None, Some(serde_json::Value::Null)),
+        failed("csv_import", Some("constraint violated"), None),
+        failed(
+            "csv_import",
+            Some("older error"),
+            Some(serde_json::json!({"site_id": 1})),
+        ),
+        failed(
+            "reprocess",
+            Some("gone"),
+            Some(serde_json::json!({"sensor_id": 2})),
+        ),
+    ];
+    let digests = failed_job_digests(runs);
+    assert_eq!(
+        digests,
+        vec![
+            FailedJobs {
+                trigger_type: "csv_import".to_string(),
+                n: 3,
+                sample_error: Some("constraint violated".to_string()),
+                scope: Some(serde_json::json!({"site_id": 1})),
+            },
+            FailedJobs {
+                trigger_type: "reprocess".to_string(),
+                n: 1,
+                sample_error: Some("gone".to_string()),
+                scope: Some(serde_json::json!({"sensor_id": 2})),
+            },
+        ]
+    );
+}
+
+#[test]
+fn test_failed_job_digests_of_no_runs_is_empty() {
+    assert!(failed_job_digests(Vec::new()).is_empty());
+}

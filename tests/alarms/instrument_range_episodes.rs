@@ -208,3 +208,68 @@ async fn a_range_breach_inside_the_thresholds_alarms_on_its_own() {
     );
     assert_eq!(episodes[0].0, "instrument_range");
 }
+
+/// Every resolved episode on the turbidity slot, as (id, kind), ordered by kind.
+async fn resolved_episodes(db: &DatabaseConnection) -> Vec<(Uuid, String)> {
+    db.query_all_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT id, kind FROM alarm_events WHERE site_id='{}' AND parameter_id='{}' \
+             AND resolved_at IS NOT NULL ORDER BY kind",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TURB_ID,
+        ),
+    ))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get::<Uuid>("", "id").unwrap(),
+            row.try_get::<String>("", "kind").unwrap(),
+        )
+    })
+    .collect()
+}
+
+/// Scenario: a range episode opened and resolved by the sweep, then the slot's history is rebuilt
+/// over the same window, as a CSV import does.
+///
+/// Expected behaviour: the rebuild computes threshold episodes only, so the range episode is left
+/// as the sweep wrote it.
+#[tokio::test]
+#[serial]
+async fn a_rebuild_leaves_a_resolved_range_episode_alone() {
+    let (db, stream, sensor) = setup().await;
+    declare_range(&db, sensor, "0", "500").await;
+    inject(&db, stream, AT, OVER_THRESHOLD_AND_RANGE).await;
+    alarms::flows::evaluate_alarm_events(&db)
+        .await
+        .expect("the sweep runs");
+    inject(&db, stream, "2025-02-01T01:00:00Z", IN_EVERY_RANGE).await;
+    alarms::flows::evaluate_alarm_events(&db)
+        .await
+        .expect("the sweep runs again");
+    let before = resolved_episodes(&db).await;
+    assert_eq!(
+        before.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
+        ["instrument_range", "threshold"],
+        "the sweep resolved both episodes"
+    );
+
+    alarms::flows::evaluate_alarm_episodes(
+        &db,
+        crate::common::SITE1_ID.parse().unwrap(),
+        crate::common::GLOBAL_PARAM_TURB_ID.parse().unwrap(),
+        AT.parse().unwrap(),
+        "2025-02-01T02:00:00Z".parse().unwrap(),
+    )
+    .await
+    .expect("the rebuild runs");
+
+    assert_eq!(
+        resolved_episodes(&db).await,
+        before,
+        "the rebuild keeps both episodes, each in its own row"
+    );
+}

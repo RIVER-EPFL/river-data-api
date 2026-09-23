@@ -7,11 +7,15 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use moka::future::Cache;
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Order, Query};
+use sea_orm::sea_query::extension::postgres::PgFunc;
+use sea_orm::sea_query::{
+    Alias, Asterisk, Condition, Expr, ExprTrait, Func, OnConflict, Order, PgDateTruncUnit, Query,
+    SelectStatement,
+};
 use sea_orm::{
     ActiveValue, ActiveValue::NotSet, ActiveValue::Set, ColumnTrait, ConnectionTrait,
-    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Statement, TransactionTrait, TryInsertResult,
+    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, JoinType, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, RelationTrait, TransactionTrait, TryInsertResult,
 };
 use std::fmt::Write as _;
 use uuid::Uuid;
@@ -28,9 +32,14 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::alarms::models::alarm_event;
 use crate::routes::private::api_tokens::service as users;
 use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::decision_model;
+use crate::routes::private::reprocessing_jobs::models::job;
+use crate::routes::private::sites::models as sites;
 use crate::routes::private::sync::hold_model;
 use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::events as sync_events;
+use crate::routes::private::sync::models::services as sync_services;
 
 pub(super) const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
@@ -287,29 +296,56 @@ pub(super) async fn read_health(db: &DatabaseConnection, config: &Config) -> Not
 
 /// How many deliveries reached nobody in the last day, by kind of failure.
 pub(super) async fn recent_failures(db: &DatabaseConnection) -> (i64, i64) {
-    let row = db
-        .query_one_raw(Statement::from_string(
-            PG,
-            "SELECT \
-                 COUNT(*) FILTER (WHERE status = 'undeliverable')::bigint AS undeliverable, \
-                 COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed \
-             FROM notification_log WHERE created_at > NOW() - INTERVAL '24 hours'"
-                .to_string(),
-        ))
+    let counted = log::Entity::find()
+        .select_only()
+        .column_as(count_where(log_status("undeliverable")), "undeliverable")
+        .column_as(count_where(log_status("failed")), "failed")
+        .filter(log::Column::CreatedAt.gt(Utc::now() - chrono::Duration::hours(24)))
+        .into_tuple::<(i64, i64)>()
+        .one(db)
         .await;
-    // Both columns are cast to bigint in the query and a FILTER count is never NULL, so a default
-    // here is unreachable; it stands because this function reports health and must not fail.
-    match row {
-        Ok(Some(r)) => (
-            r.try_get::<i64>("", "undeliverable").unwrap_or(0),
-            r.try_get::<i64>("", "failed").unwrap_or(0),
-        ),
+    // An aggregate always returns its one row, so `None` is unreachable; the default stands
+    // because this function reports health and must not fail.
+    match counted {
+        Ok(Some(counts)) => counts,
         Ok(None) => (0, 0),
         Err(e) => {
             tracing::warn!(error = %e, "failed to count recent notification failures");
             (0, 0)
         }
     }
+}
+
+/// What one channel has sent lately, by the day, week and month.
+#[derive(FromQueryResult)]
+pub(super) struct ChannelCounts {
+    pub(super) kind: String,
+    pub(super) sent_1d: i64,
+    pub(super) sent_7d: i64,
+    pub(super) sent_30d: i64,
+}
+
+/// A send is a delivery the dispatcher recorded as `sent`; a failed or muted attempt is not one.
+/// `created_at` is the only time the row carries.
+pub(super) async fn sent_counts_by_kind(
+    db: &DatabaseConnection,
+) -> Result<Vec<ChannelCounts>, DbErr> {
+    let sent_within = |days: i64| {
+        count_where(
+            log_status("sent")
+                .add(log::Column::CreatedAt.gt(Utc::now() - chrono::Duration::days(days))),
+        )
+    };
+    log::Entity::find()
+        .select_only()
+        .column(log::Column::Kind)
+        .column_as(sent_within(1), "sent_1d")
+        .column_as(sent_within(7), "sent_7d")
+        .column_as(sent_within(30), "sent_30d")
+        .group_by(log::Column::Kind)
+        .into_model::<ChannelCounts>()
+        .all(db)
+        .await
 }
 
 /// The statuses `dispatcher::deliver` writes. A filter naming anything else is refused rather than
@@ -368,54 +404,11 @@ pub async fn list_deliveries(
         validate(status, "status")?;
     }
 
-    // Both queries filter the same way, so a message's counts and its page position agree.
-    let mut filters = String::new();
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    if let Some(kind) = &q.kind {
-        values.push(kind.clone().into());
-        filters.push_str(&format!(" AND nl.kind = ${}", values.len()));
-    }
-    let having = match &q.status {
-        Some(status) => {
-            values.push(status.clone().into());
-            format!(
-                " HAVING COUNT(*) FILTER (WHERE nl.status = ${}) > 0",
-                values.len()
-            )
-        }
-        None => String::new(),
-    };
-
-    let group_sql = format!(
-        "SELECT nl.alarm_event_id, nl.kind, date_trunc('second', nl.created_at) AS at, \
-                s.name AS site_name, p.name AS parameter_name, \
-                COUNT(*)::bigint AS total, \
-                COUNT(*) FILTER (WHERE nl.status = 'sent')::bigint AS sent, \
-                COUNT(*) FILTER (WHERE nl.status = 'failed')::bigint AS failed, \
-                COUNT(*) FILTER (WHERE nl.status = 'muted')::bigint AS muted, \
-                COUNT(*) FILTER (WHERE nl.status = 'undeliverable')::bigint AS undeliverable, \
-                COUNT(*) FILTER (WHERE nl.status = 'skipped')::bigint AS skipped \
-         FROM notification_log nl \
-         LEFT JOIN alarm_events ae ON ae.id = nl.alarm_event_id \
-         LEFT JOIN sites s ON s.id = ae.site_id \
-         LEFT JOIN parameters p ON p.id = ae.parameter_id \
-         WHERE true{filters} \
-         GROUP BY nl.alarm_event_id, nl.kind, at, s.name, p.name{having} \
-         ORDER BY at DESC, nl.kind \
-         LIMIT {limit} OFFSET {offset}"
-    );
-
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            PG,
-            &group_sql,
-            values.clone(),
-        ))
+    let rows = MessageRow::find_by_statement(PG.build(&message_page(q, limit, offset)))
+        .all(db)
         .await?;
-
     let mut messages = Vec::with_capacity(rows.len());
-    for r in rows {
-        let row = MessageRow::from_query_result(&r, "")?;
+    for row in rows {
         messages.push(DeliveryMessage {
             alarm_event_id: row.alarm_event_id,
             kind: row.kind,
@@ -434,14 +427,8 @@ pub async fn list_deliveries(
         });
     }
 
-    let count_sql = format!(
-        "SELECT COUNT(*)::bigint AS c FROM ( \
-            SELECT 1 FROM notification_log nl WHERE true{filters} \
-            GROUP BY nl.alarm_event_id, nl.kind, date_trunc('second', nl.created_at){having} \
-         ) g"
-    );
     let total = db
-        .query_one_raw(Statement::from_sql_and_values(PG, &count_sql, values))
+        .query_one_raw(PG.build(&message_count(q)))
         .await?
         .map(|r| r.try_get::<i64>("", "c"))
         .transpose()?
@@ -465,20 +452,25 @@ pub(super) async fn attach_recipients(
 ) -> AppResult<()> {
     let oldest = messages.iter().map(|m| m.at).min().expect("page not empty");
     let newest = messages.iter().map(|m| m.at).max().expect("page not empty");
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT alarm_event_id, kind, date_trunc('second', created_at) AS at, \
-                    channel, recipient, status, error, created_at \
-             FROM notification_log \
-             WHERE created_at >= $1 AND created_at < $2 + INTERVAL '1 second' \
-             ORDER BY created_at",
-            [oldest.into(), newest.into()],
-        ))
+    let rows = log::Entity::find()
+        .select_only()
+        .columns([log::Column::AlarmEventId, log::Column::Kind])
+        .column_as(sent_second(), "at")
+        .columns([
+            log::Column::Channel,
+            log::Column::Recipient,
+            log::Column::Status,
+            log::Column::Error,
+            log::Column::CreatedAt,
+        ])
+        .filter(log::Column::CreatedAt.gte(oldest))
+        .filter(log::Column::CreatedAt.lt(newest + chrono::Duration::seconds(1)))
+        .order_by_asc(log::Column::CreatedAt)
+        .into_model::<RecipientRow>()
+        .all(db)
         .await?;
 
-    for r in rows {
-        let row = RecipientRow::from_query_result(&r, "")?;
+    for row in rows {
         let Some(msg) = messages.iter_mut().find(|m| {
             (m.alarm_event_id, m.kind.as_str(), m.at)
                 == (row.alarm_event_id, row.kind.as_str(), row.at)
@@ -494,6 +486,112 @@ pub(super) async fn attach_recipients(
         });
     }
     Ok(())
+}
+
+/// `COUNT(*) FILTER (WHERE condition)` as a bigint, which is what every reader decodes a count as.
+pub(super) fn count_where(condition: Condition) -> Expr {
+    Expr::from(Func::count(Expr::col(Asterisk)).filter(condition)).cast_as(Alias::new("bigint"))
+}
+
+/// `COUNT(*)` as a bigint.
+fn count_all() -> Expr {
+    Expr::from(Func::count(Expr::col(Asterisk))).cast_as(Alias::new("bigint"))
+}
+
+/// The delivery rows written with one status.
+fn log_status(status: &str) -> Condition {
+    Condition::all().add(log::Column::Status.eq(status))
+}
+
+/// The second a delivery row was written in. The rows one send writes share it, so it is the
+/// message's time.
+fn sent_second() -> Expr {
+    PgFunc::date_trunc(
+        PgDateTruncUnit::Second,
+        Expr::col((log::Entity, log::Column::CreatedAt)),
+    )
+    .into()
+}
+
+/// The message time as a group selects it. The groups are keyed on this output column rather than
+/// on the expression again, which would bind its unit a second time and read to Postgres as a
+/// different expression.
+fn at() -> Expr {
+    Expr::col(Alias::new("at"))
+}
+
+/// One group per message a delivery filter keeps, selecting its time. The page and its count
+/// both start from here, so a message's counts and its page position agree.
+fn message_groups(q: &DeliveryQuery) -> SelectStatement {
+    let mut groups = Query::select();
+    groups
+        .expr_as(sent_second(), Alias::new("at"))
+        .from(log::Entity)
+        .add_group_by([
+            Expr::col((log::Entity, log::Column::AlarmEventId)),
+            Expr::col((log::Entity, log::Column::Kind)),
+            at(),
+        ]);
+    if let Some(kind) = &q.kind {
+        groups.and_where(log::Column::Kind.eq(kind.as_str()));
+    }
+    if let Some(status) = &q.status {
+        groups.and_having(count_where(log_status(status)).gt(0));
+    }
+    groups
+}
+
+/// One page of messages, newest first, each with the slot its alarm event names and a count per
+/// status.
+fn message_page(q: &DeliveryQuery, limit: u64, offset: u64) -> SelectStatement {
+    let mut page = message_groups(q);
+    page.column((log::Entity, log::Column::AlarmEventId))
+        .column((log::Entity, log::Column::Kind))
+        .expr_as(
+            Expr::col((sites::Entity, sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(
+            Expr::col((parameters::Entity, parameters::Column::Name)),
+            Alias::new("parameter_name"),
+        )
+        .expr_as(count_all(), Alias::new("total"));
+    for status in STATUSES {
+        page.expr_as(count_where(log_status(status)), Alias::new(status));
+    }
+    page.left_join(
+        alarm_event::Entity,
+        Expr::col((alarm_event::Entity, alarm_event::Column::Id))
+            .equals((log::Entity, log::Column::AlarmEventId)),
+    )
+    .left_join(
+        sites::Entity,
+        Expr::col((sites::Entity, sites::Column::Id))
+            .equals((alarm_event::Entity, alarm_event::Column::SiteId)),
+    )
+    .left_join(
+        parameters::Entity,
+        Expr::col((parameters::Entity, parameters::Column::Id))
+            .equals((alarm_event::Entity, alarm_event::Column::ParameterId)),
+    )
+    .add_group_by([
+        Expr::col((sites::Entity, sites::Column::Name)),
+        Expr::col((parameters::Entity, parameters::Column::Name)),
+    ])
+    .order_by_expr(at(), Order::Desc)
+    .order_by((log::Entity, log::Column::Kind), Order::Asc)
+    .limit(limit)
+    .offset(offset);
+    page
+}
+
+/// How many messages the filter keeps in all, under the column `c`.
+fn message_count(q: &DeliveryQuery) -> SelectStatement {
+    let groups = message_groups(q);
+    Query::select()
+        .expr_as(count_all(), Alias::new("c"))
+        .from_subquery(groups, Alias::new("g"))
+        .to_owned()
 }
 
 pub struct WebPushChannel {
@@ -618,76 +716,113 @@ pub async fn slot_subscriptions(
     slot: &Option<Slot>,
     kind: &str,
 ) -> Result<Vec<Subscription>, String> {
-    if channel(kind).is_none() {
-        // A kind no channel answers for is addressed to whoever asked for it, never fanned out
-        // by subscription: the test send is the only one.
-        return read_subscriptions(
-            db,
-            Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                SELECT_ENABLED_SUBSCRIPTIONS.to_string(),
-            ),
-        )
-        .await;
+    let mut audience = enabled_subscriptions();
+    // A kind no channel answers for is addressed to whoever asked for it, never fanned out by
+    // subscription: the test send is the only one.
+    if channel(kind).is_some() {
+        audience.and_where(group_subscribed(slot, kind));
     }
-
-    let (site_id, parameter_id, project_id) = match slot {
-        Some(s) => (Some(s.site_id), Some(s.parameter_id), s.project_id),
-        None => (None, None, None),
-    };
-
-    read_subscriptions(
-        db,
-        Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("{SELECT_ENABLED_SUBSCRIPTIONS} AND {GROUP_SUBSCRIBED}"),
-            [
-                site_id.into(),
-                parameter_id.into(),
-                project_id.into(),
-                kind.into(),
-                on_by_default(kind).into(),
-            ],
-        ),
-    )
-    .await
+    read_subscriptions(db, &audience).await
 }
 
-pub(super) const SELECT_ENABLED_SUBSCRIPTIONS: &str = "\
-    SELECT wps.id, wps.keycloak_sub AS sub, wps.endpoint, wps.p256dh, wps.auth \
-    FROM web_push_subscriptions wps \
-    LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = wps.keycloak_sub \
-    WHERE COALESCE(ns.web_push_enabled, true)";
+/// Every push device whose holder has not switched push off. A holder with no subscriber row
+/// has not switched it off.
+fn enabled_subscriptions() -> SelectStatement {
+    let device = |c: push_subscription::Column| Expr::col((push_subscription::Entity, c));
+    Query::select()
+        .expr_as(device(push_subscription::Column::Id), Alias::new("id"))
+        .expr_as(
+            device(push_subscription::Column::KeycloakSub),
+            Alias::new("sub"),
+        )
+        .expr_as(
+            device(push_subscription::Column::Endpoint),
+            Alias::new("endpoint"),
+        )
+        .expr_as(
+            device(push_subscription::Column::P256dh),
+            Alias::new("p256dh"),
+        )
+        .expr_as(device(push_subscription::Column::Auth), Alias::new("auth"))
+        .from(push_subscription::Entity)
+        .left_join(
+            subscriber::Entity,
+            Expr::col((subscriber::Entity, subscriber::Column::KeycloakSub)).equals((
+                push_subscription::Entity,
+                push_subscription::Column::KeycloakSub,
+            )),
+        )
+        .and_where(
+            Func::coalesce([
+                Expr::col((subscriber::Entity, subscriber::Column::WebPushEnabled)),
+                Expr::val(true),
+            ])
+            .into(),
+        )
+        .to_owned()
+}
 
-/// The most specific row the subscriber holds for this channel wins: parameter, then site,
-/// then project, then the channel-wide row. With none of them the channel's own default stands.
-pub(super) const GROUP_SUBSCRIBED: &str = "\
-    COALESCE(( \
-      SELECT subq.enabled FROM notification_subscriptions subq \
-      WHERE subq.keycloak_sub = wps.keycloak_sub \
-        AND subq.channel = $4 \
-        AND ( (subq.site_id = $1 AND subq.parameter_id = $2) \
-           OR (subq.site_id = $1 AND subq.parameter_id IS NULL) \
-           OR ($3::uuid IS NOT NULL AND subq.project_id = $3 \
-               AND subq.site_id IS NULL AND subq.parameter_id IS NULL) \
-           OR (subq.project_id IS NULL AND subq.site_id IS NULL \
-               AND subq.parameter_id IS NULL) ) \
-      ORDER BY (subq.parameter_id IS NOT NULL) DESC, (subq.site_id IS NOT NULL) DESC, \
-               (subq.project_id IS NOT NULL) DESC \
-      LIMIT 1 \
-    ), $5)";
+/// Whether the device's holder has this channel on for the slot. The most specific row the
+/// holder keeps for the channel wins: parameter, then site, then project, then the channel-wide
+/// row. With none of them the channel's own default stands.
+fn group_subscribed(slot: &Option<Slot>, kind: &str) -> Expr {
+    use subscription::Column as C;
+    let row = |c: C| Expr::col((subscription::Entity, c));
+    let mut scopes = Condition::any().add(
+        Condition::all()
+            .add(row(C::ProjectId).is_null())
+            .add(row(C::SiteId).is_null())
+            .add(row(C::ParameterId).is_null()),
+    );
+    if let Some(s) = slot {
+        scopes = scopes
+            .add(
+                Condition::all()
+                    .add(row(C::SiteId).eq(s.site_id))
+                    .add(row(C::ParameterId).eq(s.parameter_id)),
+            )
+            .add(
+                Condition::all()
+                    .add(row(C::SiteId).eq(s.site_id))
+                    .add(row(C::ParameterId).is_null()),
+            );
+        if let Some(project_id) = s.project_id {
+            scopes = scopes.add(
+                Condition::all()
+                    .add(row(C::ProjectId).eq(project_id))
+                    .add(row(C::SiteId).is_null())
+                    .add(row(C::ParameterId).is_null()),
+            );
+        }
+    }
+    let most_specific = Query::select()
+        .expr(row(C::Enabled))
+        .from(subscription::Entity)
+        .cond_where(
+            Condition::all()
+                .add(row(C::KeycloakSub).equals((
+                    push_subscription::Entity,
+                    push_subscription::Column::KeycloakSub,
+                )))
+                .add(row(C::Channel).eq(kind))
+                .add(scopes),
+        )
+        .order_by_expr(row(C::ParameterId).is_not_null(), Order::Desc)
+        .order_by_expr(row(C::SiteId).is_not_null(), Order::Desc)
+        .order_by_expr(row(C::ProjectId).is_not_null(), Order::Desc)
+        .limit(1)
+        .to_owned();
+    Func::coalesce([Expr::expr(most_specific), Expr::val(on_by_default(kind))]).into()
+}
 
 pub(super) async fn read_subscriptions(
     db: &DatabaseConnection,
-    statement: Statement,
+    audience: &SelectStatement,
 ) -> Result<Vec<Subscription>, String> {
-    let rows = db
-        .query_all_raw(statement)
+    Subscription::find_by_statement(PG.build(audience))
+        .all(db)
         .await
-        .map_err(|e| e.to_string())?;
-    rows.iter()
-        .map(|row| Subscription::from_query_result(row, "").map_err(|e| e.to_string()))
-        .collect()
+        .map_err(|e| e.to_string())
 }
 
 pub(super) async fn prune_subscription(db: &DatabaseConnection, id: Uuid) {
@@ -883,35 +1018,41 @@ pub(super) async fn fetch_pending(
     db: &DatabaseConnection,
     opened: bool,
 ) -> Result<Vec<Row>, DbErr> {
-    let sql = if opened {
-        "SELECT ae.id, ae.site_id, ae.parameter_id, s.project_id AS project_id, s.name AS site_name, \
-                p.name AS parameter_name, p.default_units AS units, \
-                ae.severity AS severity, ae.last_value AS value \
-         FROM alarm_events ae \
-         JOIN sites s ON s.id = ae.site_id \
-         JOIN parameters p ON p.id = ae.parameter_id \
-         WHERE ae.notified_at IS NULL AND ae.resolved_at IS NULL \
-         ORDER BY ae.started_at"
+    use alarm_event::Column as C;
+    let pending = alarm_event::Entity::find()
+        .select_only()
+        .columns([C::Id, C::SiteId, C::ParameterId])
+        .column_as(sites::Column::ProjectId, "project_id")
+        .column_as(sites::Column::Name, "site_name")
+        .column_as(parameters::Column::Name, "parameter_name")
+        .column_as(parameters::Column::DefaultUnits, "units")
+        .join(JoinType::InnerJoin, alarm_event::Relation::Site.def())
+        .join(JoinType::InnerJoin, alarm_event::Relation::Parameter.def());
+    let pending = if opened {
+        pending
+            .column_as(C::Severity, "severity")
+            .column_as(C::LastValue, "value")
+            .filter(C::NotifiedAt.is_null())
+            .filter(C::ResolvedAt.is_null())
+            .order_by_asc(C::StartedAt)
     } else {
-        "SELECT ae.id, ae.site_id, ae.parameter_id, s.project_id AS project_id, s.name AS site_name, \
-                p.name AS parameter_name, p.default_units AS units, \
-                ae.max_severity AS severity, COALESCE(ae.resolved_value, ae.last_value) AS value \
-         FROM alarm_events ae \
-         JOIN sites s ON s.id = ae.site_id \
-         JOIN parameters p ON p.id = ae.parameter_id \
-         WHERE ae.resolved_at IS NOT NULL AND ae.resolution_notified_at IS NULL \
-         ORDER BY ae.resolved_at"
+        pending
+            .column_as(C::MaxSeverity, "severity")
+            .column_as(
+                Expr::from(Func::coalesce([
+                    Expr::col((alarm_event::Entity, C::ResolvedValue)),
+                    Expr::col((alarm_event::Entity, C::LastValue)),
+                ])),
+                "value",
+            )
+            .filter(C::ResolvedAt.is_not_null())
+            .filter(C::ResolutionNotifiedAt.is_null())
+            .order_by_asc(C::ResolvedAt)
     };
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql.to_string(),
-        ))
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let r = PendingRow::from_query_result(row, "")?;
-        out.push(Row {
+    let rows = pending.into_model::<PendingRow>().all(db).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Row {
             id: r.id,
             slot: (r.site_id, r.parameter_id),
             project_id: r.project_id,
@@ -922,9 +1063,8 @@ pub(super) async fn fetch_pending(
                 severity: r.severity,
                 value: r.value,
             },
-        });
-    }
-    Ok(out)
+        })
+        .collect())
 }
 
 /// Deliver to every channel, log each attempt, and decide whether to stamp the outbox: stamp when
@@ -1059,51 +1199,38 @@ pub(super) async fn log_delivery(
     status: &str,
     error: Option<&str>,
 ) {
-    let res = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO notification_log (alarm_event_id, kind, channel, recipient, status, error) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-            [
-                alarm_event_id.into(),
-                kind.into(),
-                channel.into(),
-                recipient.into(),
-                status.into(),
-                error.into(),
-            ],
-        ))
-        .await;
+    let row = log::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        alarm_event_id: Set(alarm_event_id),
+        kind: Set(kind.to_string()),
+        channel: Set(channel.to_string()),
+        recipient: Set(recipient.to_string()),
+        status: Set(status.to_string()),
+        error: Set(error.map(str::to_string)),
+        created_at: NotSet,
+    };
+    let res = log::Entity::insert(row).exec_without_returning(db).await;
     if let Err(e) = res {
         tracing::warn!(error = %e, "failed to write notification_log row");
     }
 }
 
 /// Atomically claim one outbox event by stamping its sent-marker column iff still NULL. The single
-/// replica whose UPDATE flips it from NULL wins (gets a RETURNING row) and sends; a peer that lost the
-/// race gets no row and skips.
-///
-/// Raw because the claim is the `WHERE ... IS NULL` read back through `RETURNING`: the statement
-/// decides the winner, and no generated writer spells that (M206). The column is the entity's own,
-/// so the only names this can interpolate are the table's.
+/// replica whose UPDATE flips it from NULL wins and sends; a peer that lost the race updates no
+/// row and skips.
 pub(super) async fn claim_event(
     db: &DatabaseConnection,
     column: alarm_event::Column,
     id: Uuid,
 ) -> Result<bool, DbErr> {
-    let column = sea_orm::Iden::to_string(&column);
-    let sql = format!(
-        "UPDATE alarm_events SET {column} = NOW(), updated_at = NOW() \
-         WHERE id = $1 AND {column} IS NULL RETURNING id"
-    );
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            [id.into()],
-        ))
+    let claimed = alarm_event::Entity::update_many()
+        .col_expr(column, Expr::current_timestamp())
+        .col_expr(alarm_event::Column::UpdatedAt, Expr::current_timestamp())
+        .filter(alarm_event::Column::Id.eq(id))
+        .filter(column.is_null())
+        .exec(db)
         .await?;
-    Ok(row.is_some())
+    Ok(claimed.rows_affected == 1)
 }
 
 /// Release a claim after an all-channel send failure so the next tick retries it (at-least-once).
@@ -1400,15 +1527,21 @@ pub(super) async fn state_upsert(
     key: &str,
     state: &str,
 ) -> Result<(), DbErr> {
-    db.execute_raw(Statement::from_sql_and_values(
-        PG,
-        "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
-         VALUES ($1, $2, $3, NOW()) \
-         ON CONFLICT (kind, subject_key) \
-         DO UPDATE SET state = EXCLUDED.state, last_notified_at = NOW()",
-        [kind.into(), key.into(), state.into()],
-    ))
-    .await?;
+    let row = state::ActiveModel {
+        kind: Set(kind.to_string()),
+        subject_key: Set(key.to_string()),
+        state: Set(state.to_string()),
+        last_notified_at: Set(Utc::now()),
+        detail: NotSet,
+    };
+    state::Entity::insert(row)
+        .on_conflict(
+            OnConflict::columns([state::Column::Kind, state::Column::SubjectKey])
+                .update_columns([state::Column::State, state::Column::LastNotifiedAt])
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
     Ok(())
 }
 
@@ -1518,19 +1651,30 @@ pub(super) async fn arrivals_by_source(
     db: &DatabaseConnection,
     since: DateTime<Utc>,
 ) -> Result<Vec<(String, i64)>, DbErr> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT s.service_type AS source_system, SUM(e.readings_synced)::bigint AS n \
-               FROM sync_events e JOIN sync_services s ON s.id = e.service_id \
-              WHERE e.started_at > $1 AND e.readings_synced > 0 \
-              GROUP BY s.service_type ORDER BY s.service_type",
-            [sea_orm::prelude::DateTimeWithTimeZone::from(since).into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| Ok((r.try_get("", "source_system")?, r.try_get("", "n")?)))
-        .collect()
+    sync_events::Entity::find()
+        .select_only()
+        .column_as(sync_services::Column::ServiceType, "source_system")
+        .column_as(
+            Expr::from(Func::sum(Expr::col((
+                sync_events::Entity,
+                sync_events::Column::ReadingsSynced,
+            ))))
+            .cast_as(Alias::new("bigint")),
+            "n",
+        )
+        .join(
+            JoinType::InnerJoin,
+            sync_events::Relation::SyncService.def(),
+        )
+        .filter(
+            sync_events::Column::StartedAt.gt(sea_orm::prelude::DateTimeWithTimeZone::from(since)),
+        )
+        .filter(sync_events::Column::ReadingsSynced.gt(0))
+        .group_by(sync_services::Column::ServiceType)
+        .order_by_asc(sync_services::Column::ServiceType)
+        .into_tuple::<(String, i64)>()
+        .all(db)
+        .await
 }
 
 /// What one job kind reports having done since `since`: the named `detail.counts` key summed over
@@ -1541,27 +1685,29 @@ pub(super) async fn job_total_since(
     key: Option<&str>,
     since: DateTime<Utc>,
 ) -> Result<i64, DbErr> {
-    let value = match key {
-        Some(k) => format!("COALESCE((detail -> 'counts' ->> '{k}')::bigint, 0)"),
-        None => "COALESCE(readings_updated, 0)".to_string(),
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    let per_run = match key {
+        Some(k) => Expr::col((job::Entity, job::Column::Detail))
+            .get_json_field("counts")
+            .cast_json_field(k)
+            .cast_as(Alias::new("bigint")),
+        None => Expr::col((job::Entity, job::Column::ReadingsUpdated)),
     };
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            format!(
-                "SELECT COALESCE(SUM({value}), 0)::bigint AS n FROM reprocessing_jobs \
-                  WHERE trigger_type = $1 AND status = 'completed' AND completed_at > $2"
-            ),
-            [
-                trigger_type.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(since).into(),
-            ],
-        ))
+    let total = Expr::from(Func::coalesce([
+        Expr::from(Func::sum(Func::coalesce([per_run, Expr::val(0)]))),
+        Expr::val(0),
+    ]))
+    .cast_as(Alias::new("bigint"));
+    let n = job::Entity::find()
+        .select_only()
+        .column_as(total, "n")
+        .filter(job::Column::TriggerType.eq(trigger_type))
+        .filter(job::Column::Status.eq("completed"))
+        .filter(job::Column::CompletedAt.gt(sea_orm::prelude::DateTimeWithTimeZone::from(since)))
+        .into_tuple::<i64>()
+        .one(db)
         .await?;
-    match row {
-        Some(row) => row.try_get("", "n"),
-        None => Ok(0),
-    }
+    Ok(n.unwrap_or(0))
 }
 
 /// Readings a system-made change of one kind touched since `since`, counted from the ledger rows

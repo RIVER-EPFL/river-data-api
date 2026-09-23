@@ -7,8 +7,8 @@ use sea_orm::sea_query::{
     Alias, Condition, Expr, ExprTrait, Func, JoinType, Order, PostgresQueryBuilder, Query,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
-    Statement,
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, Statement,
 };
 
 use super::models::*;
@@ -20,11 +20,14 @@ use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::service as readings_service;
+use crate::routes::private::reprocessing_jobs::models::job;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sites::models as sites;
-use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::hold_model;
+use crate::routes::private::sync::models::events as sync_events;
 use crate::routes::private::sync::models::services as sync_services;
+use crate::routes::private::sync::models::{HoldKind, HoldStatus};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
@@ -178,18 +181,20 @@ struct HoldCount {
 }
 
 #[derive(FromQueryResult)]
+struct FailedJob {
+    trigger_type: String,
+    error_message: Option<String>,
+    scope: Option<serde_json::Value>,
+}
+
+/// The failed runs of one trigger type: how many, and the latest error and scope any of them
+/// recorded.
+#[derive(Debug, PartialEq)]
 struct FailedJobs {
     trigger_type: String,
     n: i64,
     sample_error: Option<String>,
     scope: Option<serde_json::Value>,
-}
-
-#[derive(FromQueryResult)]
-struct FailureCounts {
-    n_failed: i64,
-    n_partial: i64,
-    sample_error: Option<String>,
 }
 
 const BATTERY_RENOTIFY_HOURS: i64 = 7 * 24;
@@ -608,24 +613,28 @@ pub fn battery_trend_query(battery_param: uuid::Uuid) -> Statement {
     Statement::from_sql_and_values(PG, sql, values)
 }
 
+/// The parameter battery voltage is recorded under: a device-health parameter named for a
+/// battery, one named exactly `battery` first.
+async fn battery_parameter(db: &sea_orm::DatabaseConnection) -> Result<Option<uuid::Uuid>, DbErr> {
+    let named_for_battery = Condition::any()
+        .add(parameters::Column::Code.ilike("%batt%"))
+        .add(parameters::Column::Name.ilike("%batt%"));
+    Ok(parameters::Entity::find()
+        .filter(parameters::Column::Category.eq("device_health"))
+        .filter(named_for_battery)
+        .order_by(parameters::Column::Name.ilike("battery"), Order::Desc)
+        .one(db)
+        .await?
+        .map(|p| p.id))
+}
+
 async fn battery_forecast(
     state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
 ) -> Result<(), DbErr> {
     let db = &state.db;
     let config = state.config.as_ref();
-    let Some(battery_param) = db
-        .query_one_raw(Statement::from_string(
-            PG,
-            "SELECT id FROM parameters \
-             WHERE category = 'device_health' AND (code ILIKE '%batt%' OR name ILIKE '%batt%') \
-             ORDER BY (name ILIKE 'battery') DESC LIMIT 1"
-                .to_string(),
-        ))
-        .await?
-        .map(|r| r.try_get::<uuid::Uuid>("", "id"))
-        .transpose()?
-    else {
+    let Some(battery_param) = battery_parameter(db).await? else {
         return Ok(());
     };
 
@@ -766,25 +775,16 @@ async fn streams_unpaired(
         .await?;
 
     // `last_data_time` is the stream's cursor, so it is set exactly when readings have landed.
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            PG,
-            "SELECT id, source_system, COALESCE(source_name, source_key) AS label \
-             FROM data_streams \
-             WHERE site_parameter_id IS NULL AND is_active AND last_data_time IS NOT NULL \
-             ORDER BY source_system, source_key"
-                .to_string(),
-        ))
-        .await?;
+    let rows = unpaired_streams_with_data(db).await?;
 
     let mut by_system: std::collections::BTreeMap<String, Vec<(uuid::Uuid, String)>> =
         std::collections::BTreeMap::new();
-    for r in &rows {
-        let UnpairedStream {
-            id,
-            source_system,
-            label,
-        } = UnpairedStream::from_query_result(r, "")?;
+    for UnpairedStream {
+        id,
+        source_system,
+        label,
+    } in rows
+    {
         // Claim the firing transition before sending so only one replica announces it.
         if claim_insert(db, "streams_unpaired", &id.to_string()).await? {
             by_system
@@ -827,6 +827,32 @@ async fn streams_unpaired(
     Ok(())
 }
 
+/// Streams storing readings with no site parameter: active, unpaired, and past their first
+/// reading (`last_data_time` is the stream's cursor, so it is set exactly when readings landed).
+async fn unpaired_streams_with_data(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<Vec<UnpairedStream>, DbErr> {
+    use data_streams::Column as C;
+    data_streams::Entity::find()
+        .select_only()
+        .columns([C::Id, C::SourceSystem])
+        .column_as(
+            Expr::from(Func::coalesce([
+                Expr::col((data_streams::Entity, C::SourceName)),
+                Expr::col((data_streams::Entity, C::SourceKey)),
+            ])),
+            "label",
+        )
+        .filter(C::SiteParameterId.is_null())
+        .filter(C::IsActive.eq(true))
+        .filter(C::LastDataTime.is_not_null())
+        .order_by_asc(C::SourceSystem)
+        .order_by_asc(C::SourceKey)
+        .into_model::<UnpairedStream>()
+        .all(db)
+        .await
+}
+
 /// Holds a manager owes an action on, announced on the cadence a silent sync service is: a pending
 /// field day or a stale output is only found by somebody who goes looking.
 async fn holds_open(
@@ -834,20 +860,8 @@ async fn holds_open(
     channels: &[Box<dyn NotificationChannel>],
 ) -> Result<(), DbErr> {
     let db = &state.db;
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            PG,
-            format!(
-                "SELECT kind, COUNT(*)::bigint AS n FROM replicate_audit_holds \
-                 WHERE status IN {open} AND kind IN {owed} GROUP BY kind ORDER BY kind",
-                open = *crate::routes::private::sync::service::OPEN,
-                owed = HoldKind::sql_list(&HoldKind::OWED)
-            ),
-        ))
-        .await?;
-    let mut counts = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let HoldCount { kind, n } = HoldCount::from_query_result(r, "")?;
+    let mut counts = Vec::new();
+    for HoldCount { kind, n } in owed_hold_counts(db).await? {
         if let Ok(kind) = serde_json::from_value(serde_json::Value::String(kind)) {
             counts.push((kind, n));
         }
@@ -870,6 +884,24 @@ async fn holds_open(
     };
     let _ = deliver(state, channels, &msg, None).await;
     Ok(())
+}
+
+/// Open holds of the kinds a manager owes an action on, counted by kind.
+async fn owed_hold_counts(db: &sea_orm::DatabaseConnection) -> Result<Vec<HoldCount>, DbErr> {
+    hold_model::Entity::find()
+        .select_only()
+        .column(hold_model::Column::Kind)
+        .column_as(
+            Expr::col((hold_model::Entity, hold_model::Column::Id)).count(),
+            "n",
+        )
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .filter(hold_model::of_kinds(Condition::all(), &HoldKind::OWED))
+        .group_by(hold_model::Column::Kind)
+        .order_by_asc(hold_model::Column::Kind)
+        .into_model::<HoldCount>()
+        .all(db)
+        .await
 }
 
 /// The subject and body announcing what a manager owes, one line per place the work is done, or
@@ -1201,35 +1233,21 @@ async fn jobs_failed(
     channels: &[Box<dyn NotificationChannel>],
 ) -> Result<(), DbErr> {
     let db = &state.db;
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            PG,
-            "SELECT trigger_type, COUNT(*)::bigint AS n, \
-                    (ARRAY_AGG(error_message ORDER BY completed_at DESC) \
-                        FILTER (WHERE error_message IS NOT NULL))[1] AS sample_error, \
-                    (ARRAY_AGG(detail -> 'scope' ORDER BY completed_at DESC) \
-                        FILTER (WHERE detail -> 'scope' IS NOT NULL))[1] AS scope \
-               FROM reprocessing_jobs \
-              WHERE status = 'failed' AND completed_at > NOW() - INTERVAL '24 hours' \
-              GROUP BY trigger_type ORDER BY trigger_type"
-                .to_string(),
-        ))
-        .await?;
-
-    for row in &rows {
-        let FailedJobs {
-            trigger_type,
-            n,
-            sample_error,
-            scope,
-        } = FailedJobs::from_query_result(row, "")?;
+    let since = Utc::now() - Duration::hours(24);
+    for FailedJobs {
+        trigger_type,
+        n,
+        sample_error,
+        scope,
+    } in failed_job_digests(failed_jobs_since(db, since).await?)
+    {
         if !claim_renotify(db, "job_failed", &trigger_type, JOB_FAILED_RENOTIFY_HOURS).await? {
             continue;
         }
         let mut body = format!(
             "{n} {trigger_type} job(s) failed in the last 24 hours and will not be retried again."
         );
-        if let Some(scope) = scope.filter(|s| !s.is_null()) {
+        if let Some(scope) = scope {
             body.push_str(&format!("\nScope: {scope}"));
         }
         if let Some(err) = sample_error {
@@ -1250,6 +1268,56 @@ async fn jobs_failed(
     Ok(())
 }
 
+/// Every job that ended `failed` since `since`, grouped by trigger type and newest first within
+/// it, carrying only what the digest reads.
+async fn failed_jobs_since(
+    db: &sea_orm::DatabaseConnection,
+    since: DateTime<Utc>,
+) -> Result<Vec<FailedJob>, DbErr> {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    job::Entity::find()
+        .select_only()
+        .columns([job::Column::TriggerType, job::Column::ErrorMessage])
+        .column_as(
+            Expr::col((job::Entity, job::Column::Detail)).get_json_field("scope"),
+            "scope",
+        )
+        .filter(job::Column::Status.eq("failed"))
+        .filter(job::Column::CompletedAt.gt(sea_orm::prelude::DateTimeWithTimeZone::from(since)))
+        .order_by_asc(job::Column::TriggerType)
+        .order_by_desc(job::Column::CompletedAt)
+        .into_model::<FailedJob>()
+        .all(db)
+        .await
+}
+
+/// One digest per trigger type from its failed runs, which arrive grouped by type and newest first.
+fn failed_job_digests(runs: Vec<FailedJob>) -> Vec<FailedJobs> {
+    let mut digests: Vec<FailedJobs> = Vec::new();
+    for run in runs {
+        if digests
+            .last()
+            .is_none_or(|d| d.trigger_type != run.trigger_type)
+        {
+            digests.push(FailedJobs {
+                trigger_type: run.trigger_type,
+                n: 0,
+                sample_error: None,
+                scope: None,
+            });
+        }
+        let digest = digests.last_mut().expect("a digest for this run");
+        digest.n += 1;
+        if digest.sample_error.is_none() {
+            digest.sample_error = run.error_message;
+        }
+        if digest.scope.is_none() {
+            digest.scope = run.scope.filter(|s| !s.is_null());
+        }
+    }
+    digests
+}
+
 async fn sync_failures(
     state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
@@ -1267,32 +1335,11 @@ async fn sync_failures(
         let since = state_get(db, "sync_failure", &key)
             .await?
             .map_or_else(|| Utc::now() - Duration::hours(24), |(_, t)| t);
-        let count_row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                PG,
-                "SELECT COUNT(*) FILTER (WHERE status = 'failed') AS n_failed, \
-                        COUNT(*) FILTER (WHERE status = 'partial') AS n_partial, \
-                        (ARRAY_AGG(errors ->> 0 ORDER BY started_at DESC) \
-                            FILTER (WHERE jsonb_typeof(errors) = 'array' \
-                                      AND jsonb_array_length(errors) > 0))[1] AS sample_error \
-                 FROM sync_events \
-                 WHERE service_id = $1 AND status IN ('failed', 'partial') AND started_at > $2",
-                [service_id.into(), since.into()],
-            ))
-            .await?;
-        let Some(count_row) = count_row else { continue };
-        let FailureCounts {
-            n_failed,
-            n_partial,
-            sample_error,
-        } = FailureCounts::from_query_result(&count_row, "").unwrap_or(FailureCounts {
-            n_failed: 0,
-            n_partial: 0,
-            sample_error: None,
-        });
+        let (n_failed, n_partial) = unhealthy_cycles_since(db, service_id, since).await?;
         if n_failed == 0 && n_partial == 0 {
             continue;
         }
+        let sample_error = latest_cycle_error_since(db, service_id, since).await?;
 
         // A failed cycle claims by advancing the watermark, so a replica losing the CAS skips and
         // the digest sends once. Partials go through the suppression window instead: they recur
@@ -1326,6 +1373,53 @@ async fn sync_failures(
         let _ = deliver(state, channels, &msg, None).await;
     }
     Ok(())
+}
+
+/// A service's failed and partial cycles since `since`.
+fn unhealthy_cycles(service_id: uuid::Uuid, since: DateTime<Utc>) -> Condition {
+    Condition::all()
+        .add(sync_events::Column::ServiceId.eq(service_id))
+        .add(sync_events::Column::Status.is_in(["failed", "partial"]))
+        .add(sync_events::Column::StartedAt.gt(sea_orm::prelude::DateTimeWithTimeZone::from(since)))
+}
+
+/// How many of a service's cycles since `since` failed outright and how many in part.
+async fn unhealthy_cycles_since(
+    db: &sea_orm::DatabaseConnection,
+    service_id: uuid::Uuid,
+    since: DateTime<Utc>,
+) -> Result<(i64, i64), DbErr> {
+    let with_status = |s: &str| Condition::all().add(sync_events::Column::Status.eq(s));
+    let counts = sync_events::Entity::find()
+        .select_only()
+        .column_as(count_where(with_status("failed")), "n_failed")
+        .column_as(count_where(with_status("partial")), "n_partial")
+        .filter(unhealthy_cycles(service_id, since))
+        .into_tuple::<(i64, i64)>()
+        .one(db)
+        .await?;
+    Ok(counts.unwrap_or((0, 0)))
+}
+
+/// The first error of the newest of those cycles that reported one. `->> 0` is NULL on anything
+/// but a non-empty array, so a cycle with no error list is passed over.
+async fn latest_cycle_error_since(
+    db: &sea_orm::DatabaseConnection,
+    service_id: uuid::Uuid,
+    since: DateTime<Utc>,
+) -> Result<Option<String>, DbErr> {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    let first_error =
+        Expr::col((sync_events::Entity, sync_events::Column::Errors)).cast_json_field(0);
+    sync_events::Entity::find()
+        .select_only()
+        .column_as(first_error.clone(), "sample_error")
+        .filter(unhealthy_cycles(service_id, since))
+        .filter(first_error.is_not_null())
+        .order_by_desc(sync_events::Column::StartedAt)
+        .into_tuple::<String>()
+        .one(db)
+        .await
 }
 
 /// Prune Web Push subscriptions for users whose Keycloak account is revoked or disabled.

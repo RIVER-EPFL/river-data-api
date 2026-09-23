@@ -211,3 +211,79 @@ async fn test_web_push_health_reports_an_unusable_keypair() {
     let err = mismatched.check_health().await.expect_err("unhealthy");
     assert!(err.contains("VAPID_PUBLIC_KEY"), "{err}");
 }
+
+fn rendered(statement: &SelectStatement) -> String {
+    statement.to_string(sea_orm::sea_query::PostgresQueryBuilder)
+}
+
+/// Scenario: a message with no slot (a digest) is matched against a subscriber's rows.
+/// Expected behaviour: only the channel-wide row can decide it, so no site, parameter or project
+/// arm is built.
+#[test]
+fn test_group_subscribed_without_a_slot_reads_only_the_channel_wide_row() {
+    let mut audience = enabled_subscriptions();
+    audience.and_where(group_subscribed(&None, "holds_open"));
+    let sql = rendered(&audience);
+    assert!(
+        sql.contains(r#""notification_subscriptions"."project_id" IS NULL"#),
+        "{sql}"
+    );
+    assert!(
+        !sql.contains(r#""notification_subscriptions"."site_id" ="#),
+        "{sql}"
+    );
+    assert!(
+        !sql.contains(r#""notification_subscriptions"."project_id" ="#),
+        "{sql}"
+    );
+}
+
+/// Scenario: a slot inside a project is matched against a subscriber's rows.
+/// Expected behaviour: the parameter, site, project and channel-wide arms are all built, and the
+/// most specific row is read first.
+#[test]
+fn test_group_subscribed_with_a_project_slot_builds_every_arm() {
+    let slot = Some(Slot {
+        project_id: Some(Uuid::nil()),
+        site_id: Uuid::nil(),
+        parameter_id: Uuid::nil(),
+    });
+    let mut audience = enabled_subscriptions();
+    audience.and_where(group_subscribed(&slot, "alarm_opened"));
+    let sql = rendered(&audience);
+    assert!(
+        sql.contains(r#""notification_subscriptions"."parameter_id" = "#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""notification_subscriptions"."project_id" = "#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#"ORDER BY "notification_subscriptions"."parameter_id" IS NOT NULL DESC"#),
+        "{sql}"
+    );
+    assert!(sql.contains("LIMIT 1), TRUE)"), "alarms default on: {sql}");
+}
+
+/// Scenario: the delivery log is filtered by status.
+/// Expected behaviour: the status keeps whole messages, so it is a HAVING over the group, never a
+/// WHERE that would drop the message's other rows.
+#[test]
+fn test_message_groups_filter_status_on_the_group() {
+    let q = DeliveryQuery {
+        limit: None,
+        offset: None,
+        status: Some("failed".to_string()),
+        kind: Some("alarm_opened".to_string()),
+    };
+    let sql = rendered(&message_count(&q));
+    assert!(
+        sql.contains(r#"WHERE "notification_log"."kind" = 'alarm_opened'"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#"HAVING CAST(COUNT(*) FILTER (WHERE "notification_log"."status" = 'failed') AS bigint) > 0"#),
+        "{sql}"
+    );
+}

@@ -191,3 +191,134 @@ async fn rebuild_alarm_events_action_is_idempotent() {
         "rebuild is idempotent: {second:?} vs {first:?}"
     );
 }
+
+/// (id, acknowledged_by, resolution_notified_at IS NOT NULL) for every threshold episode at
+/// SITE1/Turbidity, ordered by start.
+async fn turbidity_episode_state(
+    db: &sea_orm::DatabaseConnection,
+) -> Vec<(Uuid, Option<String>, bool)> {
+    db.query_all_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT id, acknowledged_by, resolution_notified_at IS NOT NULL AS told \
+             FROM alarm_events WHERE site_id = '{site}' AND parameter_id = '{param}' \
+             AND kind = 'threshold' ORDER BY started_at",
+            site = crate::common::SITE1_ID,
+            param = crate::common::GLOBAL_PARAM_TURB_ID,
+        ),
+    ))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<Uuid>("", "id").unwrap(),
+            r.try_get::<Option<String>>("", "acknowledged_by").unwrap(),
+            r.try_get::<bool>("", "told").unwrap(),
+        )
+    })
+    .collect()
+}
+
+/// Scenario: a manager acknowledged a resolved episode and its subscribers were told it closed,
+/// then the history is rebuilt over the same window, once unchanged and once with a later
+/// breach backfilled beside it.
+///
+/// Expected behaviour: the stored episode keeps its id, its acknowledgement and its notification
+/// state; only the backfilled breach is added.
+#[tokio::test]
+#[serial]
+async fn rebuild_keeps_an_acknowledged_episode_in_place() {
+    use river_db::routes::private::alarms::flows::evaluate_alarm_episodes;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let site1 = crate::common::SITE1_ID;
+    let turb = crate::common::GLOBAL_PARAM_TURB_ID;
+    let stream_id: Uuid = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT stream_id FROM readings WHERE site_id='{site1}' AND parameter_id='{turb}' LIMIT 1"),
+        ))
+        .await
+        .unwrap()
+        .expect("a seeded turbidity stream")
+        .try_get("", "stream_id")
+        .unwrap();
+    let inject = |time: &'static str, value: f64| {
+        let db = db.clone();
+        async move {
+            crate::common::exec(
+                &db,
+                &format!(
+                    "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
+                     VALUES ('{stream_id}', '{site1}', '{turb}', '{time}', {value}, 0) ON CONFLICT DO NOTHING"
+                ),
+            )
+            .await;
+        }
+    };
+    let start = "2025-02-01T00:00:00Z".parse().unwrap();
+    let end = "2025-02-01T01:00:00Z".parse().unwrap();
+
+    inject("2025-02-01T00:00:00Z", 50.0).await;
+    inject("2025-02-01T00:10:00Z", 600.0).await;
+    inject("2025-02-01T00:20:00Z", 40.0).await;
+    evaluate_alarm_episodes(
+        &db,
+        site1.parse().unwrap(),
+        turb.parse().unwrap(),
+        start,
+        end,
+    )
+    .await
+    .unwrap();
+    let [(id, None, false)] = turbidity_episode_state(&db).await[..] else {
+        panic!("one unacknowledged resolved episode after the first rebuild");
+    };
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE alarm_events SET acknowledged_at = now(), acknowledged_by = 'manager', \
+             notified_at = now(), resolution_notified_at = now() WHERE id = '{id}'"
+        ),
+    )
+    .await;
+
+    evaluate_alarm_episodes(
+        &db,
+        site1.parse().unwrap(),
+        turb.parse().unwrap(),
+        start,
+        end,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        turbidity_episode_state(&db).await,
+        vec![(id, Some("manager".to_string()), true)],
+        "an unchanged rebuild leaves the acknowledged episode as it was"
+    );
+
+    inject("2025-02-01T00:30:00Z", 150.0).await;
+    inject("2025-02-01T00:40:00Z", 30.0).await;
+    evaluate_alarm_episodes(
+        &db,
+        site1.parse().unwrap(),
+        turb.parse().unwrap(),
+        start,
+        end,
+    )
+    .await
+    .unwrap();
+    let after = turbidity_episode_state(&db).await;
+    assert_eq!(after.len(), 2, "the backfilled breach is added: {after:?}");
+    assert_eq!(
+        after[0],
+        (id, Some("manager".to_string()), true),
+        "the acknowledged episode keeps its row"
+    );
+    assert_eq!(after[1].1, None, "the new episode is unacknowledged");
+}

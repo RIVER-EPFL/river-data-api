@@ -1,7 +1,7 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IdenStatic, Iterable,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -373,7 +373,7 @@ pub(crate) async fn resolve_identifiers<C: ConnectionTrait>(
         } else if !names_a_constant(db, var_name).await? {
             let columns = match &site_columns {
                 Some(columns) => columns,
-                None => site_columns.insert(site_columns_of(db).await?),
+                None => site_columns.insert(site_column_names()),
             };
             if columns.contains(var_name) {
                 resolved
@@ -393,22 +393,9 @@ pub(crate) async fn resolve_identifiers<C: ConnectionTrait>(
 
 /// The columns of the `sites` row, which is what a site source may name (D13: any column is
 /// resolvable, and the kind check at calculate time is what refuses a text one in a number input).
-async fn site_columns_of<C: ConnectionTrait>(db: &C) -> Result<Vec<String>, ApiError> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = 'sites'",
-        ))
-        .await
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    // A skipped column is a site source refused for naming something that exists, so a decode
-    // failure is an error rather than a shorter list.
-    rows.iter()
-        .map(|r| {
-            r.try_get::<String>("", "column_name")
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
-        })
+fn site_column_names() -> Vec<String> {
+    sites::Column::iter()
+        .map(|c| c.as_str().to_string())
         .collect()
 }
 
