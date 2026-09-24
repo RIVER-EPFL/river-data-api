@@ -547,25 +547,18 @@ async fn a_detached_output_is_reported_and_left_alone() {
     {
         return;
     }
+    if !crate::common::profile::Service::Keycloak
+        .require("a_detached_output_is_reported_and_left_alone")
+        .await
+    {
+        return;
+    }
     let v = visit_with_family(&[(0, 10.0), (1, 20.0)]).await;
     install_script(&v.db, "staged_a", SCRIPT_A, &manifest_a().to_string()).await;
-    // The chain takes the slot, then it is detached and a person's number put there. The detach
-    // route is Administrator-only, so the decision it appends is written here directly.
     recompute_event(&v.state, v.event_id, "test")
         .await
         .expect("the recompute runs");
-    save_family(&v.app, &v.token, GLOBAL_PARAM_DO_ID, &[(0, 99.0)]).await;
-    exec(
-        &v.db,
-        "INSERT INTO reading_decisions (stream_id, time, replicate_index, kind, old, new, actor,
-             origin)
-         SELECT r.stream_id, r.time, r.replicate_index, 'detach', '{}'::jsonb, '{}'::jsonb,
-                'tester', 'manual'
-         FROM readings r
-         WHERE r.site_id = $1::uuid AND r.parameter_id = $2::uuid AND r.time = $3::timestamptz",
-        vec![SITE1_ID.into(), GLOBAL_PARAM_DO_ID.into(), AT.into()],
-    )
-    .await;
+    override_output(&v.db).await;
 
     let preview = preview_event(
         &v.state,
@@ -591,6 +584,25 @@ async fn a_detached_output_is_reported_and_left_alone() {
         Some(99.0),
         "the manual value stands"
     );
+}
+
+async fn override_output(db: &DatabaseConnection) {
+    let app = crate::common::keycloak::build_test_app_with_keycloak(db.clone()).await;
+    let admin = crate::common::keycloak::get_keycloak_jwt("admin", "admin").await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/override",
+        &json!({
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_DO_ID,
+            "time": AT,
+            "value": 99.0,
+            "reason": "field log",
+        }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "override the calculated output: {body}");
 }
 
 /// An output the arithmetic refused is reported as refused, and the preview files no finding for
