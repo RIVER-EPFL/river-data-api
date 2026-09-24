@@ -467,6 +467,15 @@ impl SlotScope {
             }
         }
     }
+
+    /// The `reason` a released reading's `attribution` decision records.
+    #[must_use]
+    pub fn release_reason(self) -> &'static str {
+        match self {
+            Self::Stream(_) => "unpaired",
+            Self::SiteParameter(_) => "slot deleted",
+        }
+    }
 }
 
 /// Which sites a slot move covers.

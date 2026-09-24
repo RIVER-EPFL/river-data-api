@@ -233,54 +233,39 @@ async fn hold_curve<C: ConnectionTrait>(
         .is_some_and(|held| held.skipped_at.is_some()))
 }
 
-async fn insert_curve<C: ConnectionTrait>(
+/// Store a successor curve under the payload's provenance. Insert-only: a stored curve is never
+/// rewritten, and one already registered under the key (a concurrent register) is returned as it
+/// stands.
+async fn insert_curve<C: ConnectionTrait + TransactionTrait>(
     conn: &C,
     payload: &RegisterStandardCurveRequest,
     source_system: &str,
     sensor_id: Uuid,
 ) -> AppResult<Uuid> {
-    let id = Uuid::new_v4();
-    // Raw for its `DO NOTHING`: a stored curve is never rewritten, and an edited one is superseded
-    // by the caller above rather than updated in place. crudcrate's registration has no
-    // insert-only arm, so `upsert` here would overwrite the coefficients readings were made with
-    // (M208).
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO standard_curves
-                 (id, sensor_id, name, fitted_on, slope, intercept, r_squared, notes, created_at,
-                  source_system, source_key)
-             VALUES ($1, $2, $3, COALESCE($4, CURRENT_DATE), $5, $6, $7, $8, NOW(), $9, $10)
-             ON CONFLICT (source_system, source_key)
-                 WHERE source_system IS NOT NULL AND source_key IS NOT NULL
-                 DO NOTHING",
-        [
-            id.into(),
-            sensor_id.into(),
-            payload
-                .curve
+    let curve = &payload.curve;
+    let active = super::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        sensor_id: Set(sensor_id),
+        name: Set(Some(
+            curve
                 .name
                 .clone()
-                .unwrap_or_else(|| payload.curve.source_key.clone())
-                .into(),
-            payload.curve.fitted_on.into(),
-            payload.curve.slope.into(),
-            payload.curve.intercept.into(),
-            payload.curve.r_squared.into(),
-            payload.curve.notes.clone().into(),
-            source_system.into(),
-            payload.curve.source_key.clone().into(),
-        ],
-    ))
-    .await?;
-    // A concurrent register of the same provenance wins the insert; resolve to whichever row holds
-    // the key now.
-    let row = Entity::find()
-        .filter(Column::SourceSystem.eq(source_system))
-        .filter(Column::SourceKey.eq(payload.curve.source_key.clone()))
-        .one(conn)
-        .await?
-        .ok_or_else(|| AppError::Internal("registered curve not found after upsert".to_string()))?;
-    Ok(row.id)
+                .unwrap_or_else(|| curve.source_key.clone()),
+        )),
+        fitted_on: Set(Some(
+            curve.fitted_on.unwrap_or_else(|| Utc::now().date_naive()),
+        )),
+        slope: Set(curve.slope),
+        intercept: Set(curve.intercept),
+        r_squared: Set(curve.r_squared),
+        notes: Set(curve.notes.clone()),
+        created_at: Set(Utc::now()),
+        source_system: Set(Some(source_system.to_string())),
+        source_key: Set(Some(curve.source_key.clone())),
+        ..Default::default()
+    };
+    let (stored, _) = crudcrate::register_new::<super::StandardCurve, _>(conn, active).await?;
+    Ok(stored.id)
 }
 
 /// The one reading a slot's last hand-picked curve is read from. `time` is the instant it was

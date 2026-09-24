@@ -16,8 +16,9 @@ use uuid::Uuid;
 use super::models::{
     CellFinding, CellReplicate, CellSample, EnqueuedJobResponse, Entity, EventAuditRequest,
     EventCell, EventDetailResponse, EventRecomputeRequest, ExpectedParameter, PreviewEventRequest,
-    PreviewUnstagedRequest, StageEventRequest, StageEventsRequest, StageVisitRow, StagedEvent,
-    VisitListQuery, VisitListRow, VisitRow, VisitsQuery, VisitsResponse,
+    PreviewUnstagedRequest, SiteVisitCount, StageEventRequest, StageEventsRequest, StageVisitRow,
+    StagedEvent, VisitListQuery, VisitListRow, VisitRow, VisitSitesQuery, VisitsQuery,
+    VisitsResponse,
 };
 use super::service::{self, paging, visit_list_order};
 use crate::common::AppState;
@@ -29,9 +30,10 @@ use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::sensors::models::{self as sensors, InstrumentKind};
-use crate::routes::private::site_parameters::models as site_parameters;
+use crate::routes::private::sync::hold_model as holds;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::tools::models::EventPreview;
+use crate::routes::private::tools::service::parse_ids;
 use crate::routes::resolve_site;
 
 /// Recompute a collection event's tool outputs on demand: the chain executor runs every active
@@ -74,6 +76,7 @@ pub async fn recompute_collection_event(
         Some(event.site_id),
         &serde_json::json!({
             "collection_event_id": id,
+            "site_id": event.site_id,
             "actor": crate::common::actor::label(&auth),
         }),
         None,
@@ -550,6 +553,35 @@ pub async fn list_site_visits(
     .into_response())
 }
 
+/// The sites with a visit holding a live value of every parameter named, each with how many such
+/// visits it has: where a calculation reading those parameters can run. Requires `read_data`; a
+/// project-scoped caller sees its projects' sites.
+#[utoipa::path(
+    get,
+    path = "/api/visits/sites",
+    params(VisitSitesQuery),
+    responses(
+        (status = 200, description = "Sites and their visit counts", body = Vec<SiteVisitCount>),
+        (status = 400, description = "A parameter id is not a UUID"),
+    ),
+    tag = "collection_events"
+)]
+pub async fn list_visit_sites(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Query(q): Query<VisitSitesQuery>,
+) -> AppResult<Json<Vec<SiteVisitCount>>> {
+    let holding = parse_ids(Some(&q.holding))?;
+    if holding.is_empty() {
+        return Err(AppError::BadRequest(
+            "holding names no parameter".to_string(),
+        ));
+    }
+    Ok(Json(
+        service::sites_holding(&state.db, &holding, scope.project_ids()).await?,
+    ))
+}
+
 /// List visits across sites with per-visit fill and finding counts. Requires `read_data`; a
 /// project-scoped caller sees the visits of its projects' sites.
 #[utoipa::path(
@@ -569,7 +601,9 @@ pub async fn list_visits(
 ) -> AppResult<Json<Page<VisitListRow>>> {
     let order = visit_list_order(q.sort.as_deref(), q.order.as_deref())?;
     let paging = paging(q.page, q.page_size.or(Some(100)));
-    let filter = service::visit_filter(q.site_id, scope.project_ids(), q.start, q.end);
+    let holding = parse_ids(q.holding.as_deref())?;
+    let filter = service::visit_filter(q.site_id, scope.project_ids(), q.start, q.end)
+        .add_option(service::holding(&holding));
     let total = service::count_visits(&state.db, filter.clone()).await?;
     let mut headers = service::visit_headers_page(&state.db, filter, &order, paging).await?;
     service::attach_recompute_status(&state.db, &mut headers).await?;
@@ -632,55 +666,23 @@ async fn open_findings_at(
     site_id: Uuid,
     collected_at: DateTime<Utc>,
 ) -> Result<Vec<FindingRow>, sea_orm::DbErr> {
-    use crate::routes::private::sync::hold_model as holds;
-    let h = Alias::new("h");
-    let ds = Alias::new("ds");
-    let sp = Alias::new("sp");
-    let site = Expr::expr(sea_orm::sea_query::Func::coalesce([
-        Expr::col((h.clone(), holds::Column::SiteId)),
-        Expr::col((sp.clone(), site_parameters::Column::SiteId)),
-    ]));
-    let parameter = Expr::expr(sea_orm::sea_query::Func::coalesce([
-        Expr::col((h.clone(), holds::Column::ParameterId)),
-        Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
-    ]));
-    let mut query = SeaQuery::select();
-    query
-        .column((h.clone(), holds::Column::Id))
-        .column((h.clone(), holds::Column::Kind))
-        .expr_as(parameter.clone(), Alias::new("parameter_id"))
-        .column((h.clone(), holds::Column::Tool))
-        .column((h.clone(), holds::Column::Status))
-        .from_as(holds::Entity, h.clone())
-        .join_as(
-            JoinType::LeftJoin,
-            data_streams::Entity,
-            ds.clone(),
-            Expr::col((ds.clone(), data_streams::Column::Id))
-                .equals((h.clone(), holds::Column::StreamId)),
-        )
-        .join_as(
-            JoinType::LeftJoin,
-            site_parameters::Entity,
-            sp.clone(),
-            Expr::col((sp.clone(), site_parameters::Column::Id))
-                .equals((ds.clone(), data_streams::Column::SiteParameterId)),
-        )
-        .and_where(site.eq(site_id))
-        .and_where(Expr::col((h.clone(), holds::Column::GroupTime)).eq(collected_at))
-        .and_where(Expr::col((h.clone(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
-        .and_where(parameter.is_not_null())
-        .order_by((h, holds::Column::CreatedAt), Order::Asc);
-    let (sql, values) = query.build(PostgresQueryBuilder);
-    db.query_all_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
-        values,
-    ))
-    .await?
-    .iter()
-    .map(|f| FindingRow::from_query_result(f, ""))
-    .collect()
+    let query = holds::with_stream_slot()
+        .column((holds::h(), holds::Column::Id))
+        .column((holds::h(), holds::Column::Kind))
+        .expr_as(holds::slot_parameter(), Alias::new("parameter_id"))
+        .column((holds::h(), holds::Column::Tool))
+        .column((holds::h(), holds::Column::Status))
+        .and_where(holds::slot_site().eq(site_id))
+        .and_where(Expr::col((holds::h(), holds::Column::GroupTime)).eq(collected_at))
+        .and_where(Expr::col((holds::h(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
+        .and_where(holds::slot_parameter().is_not_null())
+        .order_by((holds::h(), holds::Column::CreatedAt), Order::Asc)
+        .to_owned();
+    db.query_all(&query)
+        .await?
+        .iter()
+        .map(|f| FindingRow::from_query_result(f, ""))
+        .collect()
 }
 
 /// One visit's grid row: every parameter measured at the event with its replicates, sample

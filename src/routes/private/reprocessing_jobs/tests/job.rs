@@ -142,3 +142,12 @@ fn a_walk_reports_its_ends_and_a_hundredth_of_what_is_between() {
     assert!(reports_step(1, 100_000));
     assert!(reports_step(100_000, 100_000));
 }
+
+#[test]
+fn test_site_of_reads_the_site_the_params_name() {
+    let site = Uuid::from_u128(3);
+    assert_eq!(site_of(&serde_json::json!({ "site_id": site })), Some(site));
+    assert_eq!(site_of(&serde_json::json!({ "calculation": "doc" })), None);
+    assert_eq!(site_of(&serde_json::json!({ "site_id": null })), None);
+    assert_eq!(site_of(&serde_json::json!({ "site_id": "not a uuid" })), None);
+}

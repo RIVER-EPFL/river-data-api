@@ -26,6 +26,7 @@ use crate::routes::private::tools::service as tool_service;
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct TouchedEvent {
     pub id: Uuid,
+    pub site_id: Uuid,
     pub source: String,
     pub parameter_ids: Vec<Uuid>,
 }
@@ -64,6 +65,7 @@ pub async fn touched_events<C: ConnectionTrait>(
     let ce = Alias::new("ce");
     let (sql, values) = SeaQuery::select()
         .column((ce.clone(), events::Column::Id))
+        .column((ce.clone(), events::Column::SiteId))
         .column((ce.clone(), events::Column::Source))
         .expr_as(
             Expr::cust("array_agg(DISTINCT r.parameter_id)"),
@@ -87,6 +89,7 @@ pub async fn touched_events<C: ConnectionTrait>(
         .cond_where(rows)
         .add_group_by([
             Expr::col((ce.clone(), events::Column::Id)),
+            Expr::col((ce.clone(), events::Column::SiteId)),
             Expr::col((ce.clone(), events::Column::Source)),
         ])
         .take()
@@ -126,6 +129,7 @@ pub async fn events_from_pairs<C: ConnectionTrait>(
         .map(|r| TouchedEvent {
             parameter_ids: by_event.remove(&r.id).unwrap_or_default(),
             source: r.source,
+            site_id: r.site_id,
             id: r.id,
         })
         .collect())
@@ -172,7 +176,11 @@ pub async fn enqueue_for<C: ConnectionTrait>(
             "event_recompute",
             None,
             Some(event.id),
-            &serde_json::json!({ "collection_event_id": event.id, "actor": actor }),
+            &serde_json::json!({
+                "collection_event_id": event.id,
+                "site_id": event.site_id,
+                "actor": actor,
+            }),
             Some(&key),
         )
         .await?

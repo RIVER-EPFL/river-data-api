@@ -374,8 +374,9 @@ fn test_apply_bulk_action_never_pairs_an_entry_with_no_slot() {
 
 /// Scenario: CNET declares on the descriptor for `CO2_HS_Um_avg` the portal function that writes
 /// it and the columns that function reads.
-/// Expected behaviour: the plan carries both, so the member row states what the portal computed
-/// and a column still waiting for a formula set is the one carrying nothing.
+/// Expected behaviour: the plan carries both, with the system and the column they came from, so
+/// the member row states what the portal computed and a column still waiting for a formula set
+/// is the one carrying nothing.
 #[test]
 fn test_plan_calculation_carries_the_declared_function_and_its_inputs() {
     let metadata = serde_json::json!({
@@ -388,7 +389,7 @@ fn test_plan_calculation_carries_the_declared_function_and_its_inputs() {
         },
     });
     assert_eq!(
-        plan_calculation(&metadata),
+        plan_calculation("cnet", &metadata),
         Some(PlanCalculationRef {
             function: "calcPCO2".to_string(),
             inputs: vec![
@@ -396,6 +397,8 @@ fn test_plan_calculation_carries_the_declared_function_and_its_inputs() {
                 "WTW_Temp_degC_1".to_string(),
                 "Field_BP".to_string(),
             ],
+            source_system: Some("cnet".to_string()),
+            column: Some("CO2_HS_Um_avg".to_string()),
         })
     );
 }
@@ -426,7 +429,7 @@ fn test_plan_calculation_refuses_a_declaration_missing_either_half() {
         serde_json::json!(null),
     ];
     for metadata in cases {
-        assert_eq!(plan_calculation(&metadata), None, "{metadata}");
+        assert_eq!(plan_calculation("cnet", &metadata), None, "{metadata}");
     }
 }
 

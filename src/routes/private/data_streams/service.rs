@@ -824,6 +824,8 @@ pub(super) struct RetireTarget {
     pub(super) rows: Condition,
     /// The slot itself is going away, so the streams pointing at it are unpaired too.
     pub(super) site_parameter_id: Option<Uuid>,
+    /// What each released reading's ledger row records as the reason.
+    pub(super) reason: &'static str,
 }
 
 pub(super) async fn resolve_retire_target<C: ConnectionTrait>(
@@ -834,6 +836,7 @@ pub(super) async fn resolve_retire_target<C: ConnectionTrait>(
         SlotScope::Stream(stream_id) => Ok(Some(RetireTarget {
             rows: Condition::all().add(Expr::col(Alias::new("stream_id")).eq(stream_id)),
             site_parameter_id: None,
+            reason: scope.release_reason(),
         })),
         SlotScope::SiteParameter(sp_id) => {
             let Some(row) = site_parameters::Entity::find_by_id(sp_id).one(conn).await? else {
@@ -844,9 +847,47 @@ pub(super) async fn resolve_retire_target<C: ConnectionTrait>(
                     .add(Expr::col(Alias::new("site_id")).eq(row.site_id))
                     .add(Expr::col(Alias::new("parameter_id")).eq(row.parameter_id)),
                 site_parameter_id: Some(sp_id),
+                reason: scope.release_reason(),
             }))
         }
     }
+}
+
+/// The rows of `target` that still carry one of `columns`, so a release rewrites, and records,
+/// only a row it changes.
+fn carrying(target: &RetireTarget, columns: &[&str]) -> Condition {
+    let carries = columns.iter().fold(Condition::any(), |any, c| {
+        any.add(Expr::col(Alias::new(*c)).is_not_null())
+    });
+    target.rows.clone().add(carries)
+}
+
+/// The ledger rows a release owes: one `attribution` decision per reading it is about to release,
+/// naming each released column as stored and as NULL, inserted before the release.
+fn release_ledger(target: &RetireTarget, columns: &[&str]) -> sea_orm::sea_query::InsertStatement {
+    use crate::routes::private::readings::service::{Writer, columns_object, derivation_ledger};
+
+    let (kind, _) = Writer::SlotRelease
+        .decision()
+        .expect("a slot release is recorded");
+    let old = columns
+        .iter()
+        .map(|c| (*c, Expr::col(Alias::new(*c))))
+        .collect();
+    let new = columns
+        .iter()
+        .map(|c| (*c, Expr::value(Option::<Uuid>::None)))
+        .collect();
+    let moving = SeaQuery::select()
+        .column(readings_model::Column::StreamId)
+        .column(readings_model::Column::Time)
+        .column(readings_model::Column::ReplicateIndex)
+        .expr_as(columns_object(old), Alias::new("old"))
+        .expr_as(columns_object(new), Alias::new("new"))
+        .from(readings_model::Entity)
+        .cond_where(carrying(target, columns))
+        .take();
+    derivation_ledger(kind, moving, Some(target.reason), None)
 }
 
 pub(super) async fn release_slot_rows<C: ConnectionTrait>(
@@ -863,15 +904,16 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
             Release::Unattribute(columns) => {
                 // Narrow to rows that still carry something to release: an UPDATE that rewrites
                 // already-null rows maximises what it has to decompress and changes nothing.
-                let mut carries = Condition::any();
+                let carrying = carrying(target, columns);
                 let mut statement = SeaQuery::update();
                 statement.table(slot.rows.table_ref());
                 for c in columns {
                     statement.value(Alias::new(*c), Expr::value(Option::<Uuid>::None));
-                    carries = carries.add(Expr::col(Alias::new(*c)).is_not_null());
                 }
-                let carrying = target.rows.clone().add(carries);
                 let statement = statement.cond_where(carrying.clone()).take();
+                if slot.rows == SlotRows::Readings {
+                    bulk_write::mutation_rows(conn, release_ledger(target, columns)).await?;
+                }
                 if slot.timed {
                     let releasing = SeaQuery::select()
                         .column(Alias::new("time"))

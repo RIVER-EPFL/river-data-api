@@ -287,11 +287,6 @@ async fn coverage_and_health_are_confined_to_the_callers_projects() {
              VALUES ('{AT}', '{{}}', '{{}}', '{{}}', 'pending', 'stale_output', \
                      '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'closure_a')"
         ),
-        format!(
-            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, params) \
-             VALUES (gen_random_uuid(), 'event_recompute', 'failed', 'operator', \
-                     '{{\"site_id\": \"{SITE_B_ID}\", \"calculation\": \"closure_b_repair\"}}')"
-        ),
     ] {
         crate::common::db::exec(&db, &sql).await;
     }
@@ -299,6 +294,35 @@ async fn coverage_and_health_are_confined_to_the_callers_projects() {
         &db,
         crate::common::full_permissions(),
         Some(crate::common::PROJECT_ID),
+    )
+    .await;
+
+    let (status, queued) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/actions/event_recompute",
+        &serde_json::json!({ "site_id": SITE_B_ID, "calculation": "closure_b_repair" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the repair is queued: {queued}");
+    let job_id = queued["job_id"].as_str().expect("a job").to_string();
+    let listed = |body: &serde_json::Value| {
+        body.as_array()
+            .expect("a list")
+            .iter()
+            .any(|j| j["id"] == job_id.as_str())
+    };
+    let jobs = "/api/reprocessing_jobs?filter=%7B%22trigger_type%22%3A%22event_recompute%22%7D";
+    let (status, all) = crate::common::get_json_with_token(&app, jobs, &token).await;
+    assert_eq!(status, 200, "{all}");
+    assert!(listed(&all), "the repair is listed: {all}");
+    let (status, own) = crate::common::get_json_with_token(&app, jobs, &scoped).await;
+    assert_eq!(status, 200, "{own}");
+    assert!(!listed(&own), "the foreign repair is not listed: {own}");
+    crate::common::jobs::wait_for_job(&db, &job_id).await;
+    crate::common::db::exec(
+        &db,
+        &format!("UPDATE reprocessing_jobs SET status = 'failed' WHERE id = '{job_id}'"),
     )
     .await;
 

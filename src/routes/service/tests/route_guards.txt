@@ -169,6 +169,7 @@
 /users/{id}/roles => require_admin
 /version => require_read_metadata
 /visits => require_read_data
+/visits/sites => require_read_data
 /{project_code}/docs => -
 /{project_code}/sites => -
 /{project_code}/sites/{site_code} => -

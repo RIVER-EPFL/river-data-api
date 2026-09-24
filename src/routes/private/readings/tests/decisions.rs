@@ -238,6 +238,7 @@ fn every_writer_is_classified_and_derivation_writers_append_nothing() {
             Kind::Attribution,
             Origin::System,
         ),
+        (Writer::SlotRelease, Kind::Attribution, Origin::System),
     ];
     for (w, k, o) in curation {
         assert_eq!(w.decision(), Some((k, o)), "{w:?}");

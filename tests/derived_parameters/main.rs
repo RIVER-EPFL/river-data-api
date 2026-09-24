@@ -8,6 +8,7 @@ mod common;
 
 mod continuous_recompute_and_backfill;
 mod excluded_inputs;
+mod formula_rename;
 mod formula_transition;
 mod formula_validation_and_crud;
 mod formula_versions;

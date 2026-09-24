@@ -1,23 +1,23 @@
 //! Collection event queries: the CRUD guard, the attach helper every spot write path lands
 //! through, the visit lists and their grid, and the recompute state a visit is listed with.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::sea_query::{
     Alias, Expr, ExprTrait, IntoTableRef, JoinType, OnConflict, Order, PostgresQueryBuilder,
-    Query as SeaQuery, SelectStatement,
+    Query as SeaQuery, SelectStatement, SimpleExpr,
 };
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
 use super::models::{
-    CollectionEvent, ExpectedParameter, StagedEvent, VisitCell, VisitCellCurve, VisitListRow,
-    VisitReplicate, VisitRow,
+    CollectionEvent, ExpectedParameter, SiteVisitCount, StagedEvent, VisitCell, VisitCellCurve,
+    VisitListRow, VisitReplicate, VisitRow,
 };
 use crate::common::bulk_write;
 use crate::common::paging::Window;
@@ -29,6 +29,7 @@ use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sites::models as sites;
 use crate::routes::private::standard_curves::models as standard_curves;
+use crate::routes::private::sync::hold_model as holds;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 
@@ -418,15 +419,17 @@ pub(super) fn visit_count_columns() -> String {
         .and_where(Expr::col((r(), readings::Column::ParameterId)).is_not_null())
         .to_owned()
         .to_string(PostgresQueryBuilder);
-    format!(
-        "({filled}) AS filled, \
-         (SELECT COUNT(*) FROM replicate_audit_holds h \
-           LEFT JOIN data_streams ds ON ds.id = h.stream_id \
-           LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
-           WHERE h.group_time = ce.collected_at AND h.status = '{pending}' \
-             AND COALESCE(h.site_id, sp.site_id) = ce.site_id) AS findings_open",
-        pending = HoldStatus::Pending.as_str()
-    )
+    let findings_open = holds::with_stream_slot()
+        .expr(Expr::val(1).count())
+        .and_where(
+            Expr::col((holds::h(), holds::Column::GroupTime))
+                .equals((ce(), super::Column::CollectedAt)),
+        )
+        .and_where(Expr::col((holds::h(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
+        .and_where(holds::slot_site().equals((ce(), super::Column::SiteId)))
+        .to_owned()
+        .to_string(PostgresQueryBuilder);
+    format!("({filled}) AS filled, ({findings_open}) AS findings_open")
 }
 
 /// Paging is opt-in: a caller naming neither `page` nor `page_size` gets every row.
@@ -444,6 +447,66 @@ pub(super) fn paging(page: Option<u64>, page_size: Option<u64>) -> Option<Window
 
 fn s() -> Alias {
     Alias::new("s")
+}
+
+/// The visits holding a live value, unflagged and not withdrawn, of every parameter named: the
+/// visits a calculation reading those parameters can run at.
+pub(super) fn visits_holding(parameter_ids: &[Uuid]) -> SelectStatement {
+    let wanted: HashSet<Uuid> = parameter_ids.iter().copied().collect();
+    let n = i64::try_from(wanted.len()).unwrap_or(i64::MAX);
+    readings::Entity::find()
+        .select_only()
+        .column(readings::Column::CollectionEventId)
+        .filter(readings::Column::CollectionEventId.is_not_null())
+        .filter(readings::Column::ParameterId.is_in(wanted))
+        .filter(readings::Column::WithdrawnAt.is_null())
+        .filter(
+            Condition::any()
+                .add(readings::Column::IsFlagged.is_null())
+                .add(readings::Column::IsFlagged.eq(false)),
+        )
+        .group_by(readings::Column::CollectionEventId)
+        .having(
+            Expr::col((readings::Entity, readings::Column::ParameterId))
+                .count_distinct()
+                .eq(n),
+        )
+        .into_query()
+}
+
+/// Confines a listing to the visits holding every parameter named, or to nothing more when none is.
+#[must_use]
+pub(super) fn holding(parameter_ids: &[Uuid]) -> Option<SimpleExpr> {
+    (!parameter_ids.is_empty())
+        .then(|| Expr::col((ce(), super::Column::Id)).in_subquery(visits_holding(parameter_ids)))
+}
+
+/// Each site with a visit holding every parameter named, and how many it has, confined to
+/// `projects` when the caller is scoped.
+pub(super) async fn sites_holding<C: ConnectionTrait>(
+    db: &C,
+    parameter_ids: &[Uuid],
+    projects: Option<Vec<Uuid>>,
+) -> AppResult<Vec<SiteVisitCount>> {
+    use super::models::{Column, Entity};
+    let mut query = Entity::find()
+        .select_only()
+        .column(Column::SiteId)
+        .column_as(Column::Id.count(), "visits")
+        .filter(Column::Id.in_subquery(visits_holding(parameter_ids)))
+        .group_by(Column::SiteId);
+    if let Some(projects) = projects {
+        query = query.filter(
+            Column::SiteId.in_subquery(
+                sites::Entity::find()
+                    .select_only()
+                    .column(sites::Column::Id)
+                    .filter(sites::Column::ProjectId.is_in(projects))
+                    .into_query(),
+            ),
+        );
+    }
+    Ok(query.into_model::<SiteVisitCount>().all(db).await?)
 }
 
 /// The visits a listing covers: at the site when one is named, in the caller's projects when the
@@ -751,23 +814,35 @@ pub async fn status_for(
         return Ok(out);
     }
     let latest_job = newest_job_per_visit(recompute_jobs_for(db, event_ids).await?);
-    let stale = EventIdRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "SELECT DISTINCT ce.id
-                 FROM replicate_audit_holds h
-                 JOIN collection_events ce
-                   ON ce.site_id = h.site_id AND ce.collected_at = h.group_time
-                 WHERE h.kind IN {kinds}
-                   AND h.status = '{pending}' AND h.stream_id IS NULL
-                   AND ce.id = ANY($1)",
-            pending = HoldStatus::Pending.as_str(),
-            kinds = HoldKind::sql_list(&[HoldKind::StaleOutput, HoldKind::SkippedOutput])
-        ),
-        [event_ids.to_vec().into()],
-    ))
-    .all(db)
-    .await?;
+    let stale = SeaQuery::select()
+        .distinct()
+        .column((ce(), super::Column::Id))
+        .from_as(holds::Entity, holds::h())
+        .join_as(
+            JoinType::InnerJoin,
+            super::Entity,
+            ce(),
+            Condition::all()
+                .add(
+                    Expr::col((ce(), super::Column::SiteId))
+                        .equals((holds::h(), holds::Column::SiteId)),
+                )
+                .add(
+                    Expr::col((ce(), super::Column::CollectedAt))
+                        .equals((holds::h(), holds::Column::GroupTime)),
+                ),
+        )
+        .and_where(Expr::col((holds::h(), holds::Column::Kind)).is_in([
+            HoldKind::StaleOutput.as_str(),
+            HoldKind::SkippedOutput.as_str(),
+        ]))
+        .and_where(Expr::col((holds::h(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
+        .and_where(Expr::col((holds::h(), holds::Column::StreamId)).is_null())
+        .and_where(Expr::col((ce(), super::Column::Id)).is_in(event_ids.iter().copied()))
+        .to_owned();
+    let stale = EventIdRow::find_by_statement(sea_orm::DatabaseBackend::Postgres.build(&stale))
+        .all(db)
+        .await?;
     let stale_events: std::collections::HashSet<Uuid> = stale.into_iter().map(|r| r.id).collect();
     for id in event_ids {
         out.insert(
@@ -1001,32 +1076,33 @@ async fn visit_cell_rows(db: &DatabaseConnection, event_ids: &[Uuid]) -> AppResu
 /// The open findings at each listed visit, by (instant, parameter): the oldest one's kind and how
 /// many are open there.
 async fn open_findings_by_slot(db: &DatabaseConnection, event_ids: &[Uuid]) -> AppResult<Findings> {
-    let finding_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            // A hold is keyed on the slot (an event-audit finding) or on the stream that
-            // raised it (a statistics disagreement, a source modification, a brake). Both
-            // land at a visit's instant and both belong in its grid, so the stream's own
-            // pairing resolves the slot rather than the hold being skipped for lacking one.
-            // Oldest first, matching the detail endpoint, so the two grids cannot disagree
-            // about which finding a cell carries.
-            format!(
-                "SELECT COALESCE(h.parameter_id, sp.parameter_id) AS parameter_id, \
-                    h.group_time, h.kind, h.created_at \
-             FROM replicate_audit_holds h \
-             LEFT JOIN data_streams ds ON ds.id = h.stream_id \
-             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
-             JOIN collection_events ce \
-               ON ce.site_id = COALESCE(h.site_id, sp.site_id) \
-              AND ce.collected_at = h.group_time \
-             WHERE h.status = '{pending}' AND ce.id = ANY($1) \
-               AND COALESCE(h.parameter_id, sp.parameter_id) IS NOT NULL \
-             ORDER BY h.created_at",
-                pending = HoldStatus::Pending.as_str()
-            ),
-            [event_ids.to_vec().into()],
-        ))
-        .await?;
+    // A hold is keyed on the slot (an event-audit finding) or on the stream that raised it (a
+    // statistics disagreement, a source modification, a brake). Both land at a visit's instant and
+    // both belong in its grid, so the stream's own pairing resolves the slot rather than the hold
+    // being skipped for lacking one. Oldest first, matching the detail endpoint, so the two grids
+    // cannot disagree about which finding a cell carries.
+    let query = holds::with_stream_slot()
+        .expr_as(holds::slot_parameter(), Alias::new("parameter_id"))
+        .column((holds::h(), holds::Column::GroupTime))
+        .column((holds::h(), holds::Column::Kind))
+        .column((holds::h(), holds::Column::CreatedAt))
+        .join_as(
+            JoinType::InnerJoin,
+            super::Entity,
+            ce(),
+            Condition::all()
+                .add(holds::slot_site().equals((ce(), super::Column::SiteId)))
+                .add(
+                    Expr::col((ce(), super::Column::CollectedAt))
+                        .equals((holds::h(), holds::Column::GroupTime)),
+                ),
+        )
+        .and_where(Expr::col((holds::h(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
+        .and_where(Expr::col((ce(), super::Column::Id)).is_in(event_ids.iter().copied()))
+        .and_where(holds::slot_parameter().is_not_null())
+        .order_by((holds::h(), holds::Column::CreatedAt), Order::Asc)
+        .to_owned();
+    let finding_rows = db.query_all(&query).await?;
     // Oldest wins, and the rest are counted: a cell carrying two open findings says so
     // rather than picking one silently.
     let mut findings: HashMap<(DateTime<Utc>, Uuid), (String, i64)> = HashMap::new();

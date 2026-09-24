@@ -24,7 +24,7 @@ pub async fn of_stream<C: ConnectionTrait>(
     site_id: Option<Uuid>,
     time: DateTime<Utc>,
 ) -> AppResult<Option<PortalCalculation>> {
-    let Some(declared) = plan_calculation(&stream.metadata) else {
+    let Some(declared) = plan_calculation(&stream.source_system, &stream.metadata) else {
         return Ok(None);
     };
     let points = match site_id {

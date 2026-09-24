@@ -4057,7 +4057,7 @@ pub(super) fn normalised_json(text: &str) -> AppResult<serde_json::Value> {
         .map_err(|e| AppError::Internal(format!("normalised version content is not JSON: {e}")))
 }
 
-pub(super) fn parse_ids(csv: Option<&str>) -> AppResult<Vec<Uuid>> {
+pub(crate) fn parse_ids(csv: Option<&str>) -> AppResult<Vec<Uuid>> {
     csv.unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -4332,7 +4332,7 @@ pub async fn calculation_health(
 
 /// Each calculation's latest `event_recompute` run that still needs watching, keyed by the
 /// calculation name the Recompute action writes into the job's params. Given `site_ids`, a run
-/// naming a site outside them is left out; one naming no site is global, as a job listing reads it.
+/// belonging to a site outside them is left out; one with no site is global, as the listing reads it.
 async fn latest_repairs(
     db: &DatabaseConnection,
     site_ids: Option<&[Uuid]>,
@@ -4342,11 +4342,10 @@ async fn latest_repairs(
     use sea_orm::sea_query::extension::postgres::PgExpr as _;
 
     let calculation = || Expr::col(job::Column::Params).cast_json_field("calculation");
-    let site = || Expr::col(job::Column::Params).cast_json_field("site_id");
     let in_scope = site_ids.map(|ids| {
         Condition::any()
-            .add(site().is_null())
-            .add(site().is_in(ids.iter().map(ToString::to_string)))
+            .add(job::Column::SiteId.is_null())
+            .add(job::Column::SiteId.is_in(ids.to_vec()))
     });
     let runs = job::Entity::find()
         .filter(job::Column::TriggerType.eq("event_recompute"))
@@ -4611,6 +4610,75 @@ pub(super) fn latest_version_no_query(script_id: Uuid) -> sea_orm::Select<versio
 #[must_use]
 pub fn next_version_no(latest: Option<i32>) -> i32 {
     latest.unwrap_or(0) + 1
+}
+
+/// The `(old, new)` code of each formula a set save renames: one it names by id under a code the
+/// stored row does not carry.
+#[must_use]
+pub fn renames_of(
+    stored: &[(Uuid, String)],
+    named: &[(Option<Uuid>, String)],
+) -> Vec<(String, String)> {
+    named
+        .iter()
+        .filter_map(|(id, code)| {
+            let (_, was) = stored
+                .iter()
+                .find(|(stored_id, _)| Some(*stored_id) == *id)?;
+            (was != code).then(|| (was.clone(), code.clone()))
+        })
+        .collect()
+}
+
+/// `text` with each whole identifier a rename names replaced by its new code, in one pass, so a
+/// swap of two codes carries both. A token is read as [`free_identifiers`] reads one, so the
+/// exponent of `2e5` is part of its number.
+#[must_use]
+pub fn carry_renames(text: &str, renames: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut start = None;
+    let push = |out: &mut String, token: &str| {
+        let renamed = (!token.starts_with(|c: char| c.is_ascii_digit()))
+            .then(|| renames.iter().find(|(old, _)| old == token))
+            .flatten();
+        out.push_str(renamed.map_or(token, |(_, new)| new));
+    };
+    for (i, c) in text.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            start.get_or_insert(i);
+        } else {
+            if let Some(s) = start.take() {
+                push(&mut out, &text[s..i]);
+            }
+            out.push(c);
+        }
+    }
+    if let Some(s) = start {
+        push(&mut out, &text[s..]);
+    }
+    out
+}
+
+/// Each `(reader, name)` where a formula of the set, given as `(code, formula, per_replicate)`,
+/// reads a name that was a formula of the set before the save and is not one after it.
+#[must_use]
+pub fn reads_of_former(
+    readers: &[(&str, &str, Option<&str>)],
+    former: &[String],
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (code, formula, per_replicate) in readers {
+        for name in free_identifiers(formula)
+            .into_iter()
+            .chain(per_replicate.map(str::to_string))
+        {
+            let pair = ((*code).to_string(), name);
+            if former.contains(&pair.1) && !found.contains(&pair) {
+                found.push(pair);
+            }
+        }
+    }
+    found
 }
 
 /// What a set-level save does to one formula of the set it was given.

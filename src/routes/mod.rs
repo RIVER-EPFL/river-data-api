@@ -234,6 +234,7 @@ pub fn validate_optional_time_range(
         private::collection_events::views::run_event_recompute,
         private::collection_events::views::list_site_visits,
         private::collection_events::views::list_visits,
+        private::collection_events::views::list_visit_sites,
         private::collection_events::views::get_event_detail,
         private::readings::views::get_reading_provenance,
         private::readings::views::get_reading_ledger,

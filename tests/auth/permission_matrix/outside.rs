@@ -324,6 +324,13 @@ fn probes() -> Vec<Probe> {
     );
     add(
         "GET",
+        "/api/visits/sites",
+        format!("/api/visits/sites?holding={GLOBAL_PARAM_TEMP_ID}"),
+        None,
+        filtered,
+    );
+    add(
+        "GET",
         "/api/me/sites",
         "/api/me/sites".into(),
         None,

@@ -632,6 +632,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::collection_events::views::list_visits),
         )
         .route(
+            "/visits/sites",
+            get(crate::routes::private::collection_events::views::list_visit_sites),
+        )
+        .route(
             "/collection_events/{id}/detail",
             get(crate::routes::private::collection_events::views::get_event_detail),
         )

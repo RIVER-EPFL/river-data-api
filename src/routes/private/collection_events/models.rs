@@ -384,6 +384,22 @@ pub struct VisitListQuery {
     /// `asc` or `desc` (default).
     #[serde(default)]
     pub order: Option<String>,
+    /// Comma-separated parameter ids: only visits holding a live value of every one.
+    #[serde(default)]
+    pub holding: Option<String>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct VisitSitesQuery {
+    /// Comma-separated parameter ids a visit must hold a live value of every one of.
+    pub holding: String,
+}
+
+/// A site with visits holding every parameter asked for, and how many.
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
+pub struct SiteVisitCount {
+    pub site_id: Uuid,
+    pub visits: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

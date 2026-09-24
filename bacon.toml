@@ -25,6 +25,9 @@ need_stdout = true
 [jobs.run]
 command = ["cargo", "run", "--color", "always"]
 need_stdout = true
+# The server restarts on what it is built from, not on an edit to a test.
+default_watch = false
+watch = ["src", "migration", "Cargo.toml", "Cargo.lock"]
 allow_warnings = true
 background = true
 on_change_strategy = "kill_then_restart"

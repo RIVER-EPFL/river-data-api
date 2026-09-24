@@ -123,6 +123,63 @@ pub fn of_kinds(
     condition.add(Column::Kind.is_in(names))
 }
 
+/// The alias every statement over the holds and their slots reads the hold under.
+#[must_use]
+pub fn h() -> sea_orm::sea_query::Alias {
+    sea_orm::sea_query::Alias::new("h")
+}
+
+/// `replicate_audit_holds h LEFT JOIN data_streams ds LEFT JOIN site_parameters sp`: a hold with
+/// its stream's pairing, which places a stream-keyed hold on the slot a stream-less one names.
+#[must_use]
+pub fn with_stream_slot() -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::data_streams::models as data_streams;
+    use crate::routes::private::site_parameters::models as site_parameters;
+    use sea_orm::sea_query::{Alias, ExprTrait, JoinType, Query};
+    let (ds, sp) = (Alias::new("ds"), Alias::new("sp"));
+    Query::select()
+        .from_as(Entity, h())
+        .join_as(
+            JoinType::LeftJoin,
+            data_streams::Entity,
+            ds.clone(),
+            Expr::col((ds.clone(), data_streams::Column::Id)).equals((h(), Column::StreamId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Expr::col((sp, site_parameters::Column::Id))
+                .equals((ds, data_streams::Column::SiteParameterId)),
+        )
+        .to_owned()
+}
+
+/// The site a hold stands at under [`with_stream_slot`]: its own, else its stream's pairing.
+#[must_use]
+pub fn slot_site() -> Expr {
+    use crate::routes::private::site_parameters::models as site_parameters;
+    slot_column(Column::SiteId, site_parameters::Column::SiteId)
+}
+
+/// The parameter a hold stands at under [`with_stream_slot`]: its own, else its stream's pairing.
+#[must_use]
+pub fn slot_parameter() -> Expr {
+    use crate::routes::private::site_parameters::models as site_parameters;
+    slot_column(Column::ParameterId, site_parameters::Column::ParameterId)
+}
+
+fn slot_column(
+    own: Column,
+    paired: crate::routes::private::site_parameters::models::Column,
+) -> Expr {
+    use sea_orm::sea_query::{Alias, Func};
+    Expr::expr(Func::coalesce([
+        Expr::col((h(), own)),
+        Expr::col((Alias::new("sp"), paired)),
+    ]))
+}
+
 #[cfg(test)]
 #[path = "tests/hold_slot.rs"]
 mod tests;

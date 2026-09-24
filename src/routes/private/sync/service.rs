@@ -876,16 +876,20 @@ pub fn hold_statement(hold: &Hold) -> sea_orm::sea_query::InsertStatement {
             Column::Tool,
         ])
         .values([
-            (Column::CreatedAt, Expr::cust("NOW()")),
+            (Column::CreatedAt, Expr::current_timestamp()),
             (
                 Column::Status,
-                Expr::cust(format!(
-                    "CASE WHEN replicate_audit_holds.status = '{deferred}' \
-                          AND EXCLUDED.status = '{pending}' \
-                     THEN '{pending}' ELSE replicate_audit_holds.status END",
-                    deferred = HoldStatus::Deferred.as_str(),
-                    pending = HoldStatus::Pending.as_str(),
-                )),
+                Expr::case(
+                    Expr::col((hold_model::Entity, Column::Status))
+                        .eq(HoldStatus::Deferred.as_str())
+                        .and(
+                            Expr::col((Alias::new("excluded"), Column::Status))
+                                .eq(HoldStatus::Pending.as_str()),
+                        ),
+                    HoldStatus::Pending.as_str(),
+                )
+                .finally(Expr::col((hold_model::Entity, Column::Status)))
+                .into(),
             ),
         ]);
     SeaQuery::insert()
@@ -1904,31 +1908,64 @@ pub(super) async fn mint_audit_annotation<C: ConnectionTrait>(
     text: &str,
     by: &str,
 ) {
-    let result = conn
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO annotations
-                 (site_id, parameter_id, start_time, end_time, text, category,
-                  created_by, audit_hold_id)
-             SELECT COALESCE(sp.site_id, h.site_id), COALESCE(sp.parameter_id, h.parameter_id),
-                    h.group_time, h.group_time, $2, $3, $4, h.id
-             FROM replicate_audit_holds h
-             LEFT JOIN data_streams ds ON ds.id = h.stream_id
-             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-             WHERE h.id = $1
-               AND COALESCE(sp.site_id, h.site_id) IS NOT NULL
-               AND COALESCE(sp.parameter_id, h.parameter_id) IS NOT NULL",
-            [
-                hold_id.into(),
-                text.to_string().into(),
-                AUDIT_ANNOTATION_CATEGORY.into(),
-                by.to_string().into(),
-            ],
+    use annotations::models::{Column as A, Entity as Annotations};
+    let slot = hold_model::with_stream_slot()
+        .expr(sp_first(
+            hold_model::Column::SiteId,
+            site_parameters::Column::SiteId,
         ))
-        .await;
+        .expr(sp_first(
+            hold_model::Column::ParameterId,
+            site_parameters::Column::ParameterId,
+        ))
+        .column((hold_model::h(), hold_model::Column::GroupTime))
+        .column((hold_model::h(), hold_model::Column::GroupTime))
+        .expr(Expr::val(text))
+        .expr(Expr::val(AUDIT_ANNOTATION_CATEGORY))
+        .expr(Expr::val(by))
+        .column((hold_model::h(), hold_model::Column::Id))
+        .and_where(Expr::col((hold_model::h(), hold_model::Column::Id)).eq(hold_id))
+        .and_where(
+            sp_first(hold_model::Column::SiteId, site_parameters::Column::SiteId).is_not_null(),
+        )
+        .and_where(
+            sp_first(
+                hold_model::Column::ParameterId,
+                site_parameters::Column::ParameterId,
+            )
+            .is_not_null(),
+        )
+        .to_owned();
+    let insert = SeaQuery::insert()
+        .into_table(Annotations)
+        .columns([
+            A::SiteId,
+            A::ParameterId,
+            A::StartTime,
+            A::EndTime,
+            A::Text,
+            A::Category,
+            A::CreatedBy,
+            A::AuditHoldId,
+        ])
+        .select_from(slot)
+        .map(|q| q.to_owned());
+    let result = match insert {
+        Ok(insert) => conn.execute(&insert).await.map(|_| ()),
+        Err(e) => Err(sea_orm::DbErr::Custom(e.to_string())),
+    };
     if let Err(e) = result {
         tracing::warn!("could not annotate audit hold {hold_id}: {e}");
     }
+}
+
+/// A hold's slot column under `with_stream_slot`, read from the stream's pairing first and the
+/// hold's own second.
+fn sp_first(own: hold_model::Column, paired: site_parameters::Column) -> Expr {
+    Expr::expr(Func::coalesce([
+        Expr::col((Alias::new("sp"), paired)),
+        Expr::col((hold_model::h(), own)),
+    ]))
 }
 
 /// Remove the annotations a hold's decisions minted. Runs on reopen, inside its transaction: the
@@ -3881,6 +3918,14 @@ pub struct PlanCalculationRef {
     pub function: String,
     /// The columns it reads, in the order the source lists them.
     pub inputs: Vec<String>,
+    /// The source system the column belongs to (`cnet`).
+    #[serde(default)]
+    #[schema(required)]
+    pub source_system: Option<String>,
+    /// The source's own column the function writes (`CO2_HS_Um_avg`).
+    #[serde(default)]
+    #[schema(required)]
+    pub column: Option<String>,
 }
 
 /// A group's code: lowercase, non-alphanumerics collapsed to underscores. The rule the portal seed
@@ -3930,11 +3975,15 @@ pub fn plan_group(metadata: &serde_json::Value) -> Option<PlanGroupRef> {
     })
 }
 
-/// The calculation a stream's metadata declares for its column, where the source names one.
+/// The calculation a stream's metadata declares for its column, where the source names one, with
+/// the system and the column it came from.
 ///
 /// A function with no inputs is not a calculation anybody can read back, so both are required.
 #[must_use]
-pub fn plan_calculation(metadata: &serde_json::Value) -> Option<PlanCalculationRef> {
+pub fn plan_calculation(
+    source_system: &str,
+    metadata: &serde_json::Value,
+) -> Option<PlanCalculationRef> {
     let declared = metadata.get("parameter")?.get("source_calculation")?;
     let function = declared.get("function")?.as_str()?.trim();
     if function.is_empty() {
@@ -3952,9 +4001,18 @@ pub fn plan_calculation(metadata: &serde_json::Value) -> Option<PlanCalculationR
     if inputs.is_empty() {
         return None;
     }
+    let column = metadata
+        .get("parameter")
+        .and_then(|p| p.get("column_name"))
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(ToString::to_string);
     Some(PlanCalculationRef {
         function: function.to_string(),
         inputs,
+        source_system: Some(source_system.to_string()),
+        column,
     })
 }
 
@@ -4107,27 +4165,19 @@ pub async fn create_plan(
 
     // Open replicate-statistics holds per stream, quoted by the review.
     let stream_ids: Vec<Uuid> = streams.iter().map(|s| s.id).collect();
-    let sd_evidence: std::collections::HashMap<Uuid, i64> = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT h.stream_id, count(*) AS holds \
-                 FROM replicate_audit_holds h \
-                 WHERE h.kind = '{REPLICATE_STATS}' \
-                   AND h.status IN {open} \
-                   AND h.stream_id = ANY($1) \
-                 GROUP BY h.stream_id",
-                REPLICATE_STATS = HoldKind::ReplicateStats.as_str(),
-                open = *OPEN
-            ),
-            [stream_ids.into()],
-        ))
+    let sd_evidence: std::collections::HashMap<Uuid, i64> = hold_model::Entity::find()
+        .select_only()
+        .column(hold_model::Column::StreamId)
+        .column_as(hold_model::Column::Id.count(), "holds")
+        .filter(hold_model::Column::Kind.eq(HoldKind::ReplicateStats.as_str()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .filter(hold_model::Column::StreamId.is_in(stream_ids))
+        .group_by(hold_model::Column::StreamId)
+        .into_model::<HoldCountRow>()
+        .all(db)
         .await?
-        .iter()
-        .filter_map(|r| {
-            let r = HoldCountRow::from_query_result(r, "").ok()?;
-            Some((r.stream_id, r.holds))
-        })
+        .into_iter()
+        .map(|r| (r.stream_id, r.holds))
         .collect();
 
     // Build entries
@@ -4182,7 +4232,7 @@ pub async fn create_plan(
                 units: h.units,
                 group_key: None,
                 group: plan_group(&stream.metadata),
-                calculation: plan_calculation(&stream.metadata),
+                calculation: plan_calculation(&stream.source_system, &stream.metadata),
                 original_names: vec![],
                 attach: None,
             },

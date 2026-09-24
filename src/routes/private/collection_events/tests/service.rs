@@ -66,6 +66,25 @@ fn test_visit_headers_without_bounds_list_every_visit() {
 }
 
 #[test]
+fn test_holding_counts_each_named_parameter_once() {
+    assert!(holding(&[]).is_none());
+    let a = Uuid::from_u128(1);
+    let b = Uuid::from_u128(2);
+    let filter = visit_filter(None, None, None, None).add_option(holding(&[a, b, a]));
+    let (sql, values) = visit_headers(filter, None).build(PostgresQueryBuilder);
+    assert!(
+        sql.contains(r#""ce"."id" IN (SELECT "readings"."collection_event_id""#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#"HAVING COUNT(DISTINCT "readings"."parameter_id") = $4"#),
+        "{sql}"
+    );
+    // a, b, the unflagged false and the count of two
+    assert_eq!(values.0.len(), 4);
+}
+
+#[test]
 fn an_active_job_is_the_state_whatever_the_findings_say() {
     assert_eq!(visit_status(Some("queued"), true), "queued");
     assert_eq!(visit_status(Some("pending"), false), "queued");

@@ -94,6 +94,65 @@ async fn retiring_a_stream_counts_only_the_rows_it_releases() {
     cleanup_test_db(&db).await;
 }
 
+async fn released_on_ledger(db: &sea_orm::DatabaseConnection, reason: &str) -> i64 {
+    e2e::count(
+        db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM reading_decisions \
+             WHERE kind = 'attribution' AND origin = 'system' AND reason = '{reason}' \
+               AND old->>'site_id' = '{SITE1_ID}' \
+               AND old->>'parameter_id' = '{GLOBAL_PARAM_TEMP_ID}' \
+               AND new ? 'site_id' AND new->'site_id' = 'null'::jsonb \
+               AND new->'parameter_id' = 'null'::jsonb \
+               AND new->'sample_id' = 'null'::jsonb \
+               AND new->'collection_event_id' = 'null'::jsonb"
+        ),
+    )
+    .await
+}
+
+/// Scenario: a stream's readings are released by an unpair, and a slot's by its delete (CID17).
+/// Expected behaviour: each released reading records one `attribution` decision naming the four
+/// released columns on both sides, and a reading with nothing to release records nothing.
+#[tokio::test]
+#[serial]
+async fn retiring_records_each_released_reading_on_the_ledger() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let unpaired = create_paired_stream(&db, "retire-ledger-unpair", PARAM_S1_TEMP_ID).await;
+    attributed_reading(&db, unpaired, 0, 10.0).await;
+    attributed_reading(&db, unpaired, 1, 20.0).await;
+    unattributed_reading(&db, unpaired, 2, 30.0).await;
+    retire_slot(&db, SlotScope::Stream(unpaired), "test")
+        .await
+        .expect("unpairing the stream");
+    assert_eq!(released_on_ledger(&db, "unpaired").await, 2);
+
+    let deleted = create_paired_stream(&db, "retire-ledger-delete", PARAM_S1_TEMP_ID).await;
+    attributed_reading(&db, deleted, 5, 40.0).await;
+    retire_slot(
+        &db,
+        SlotScope::SiteParameter(PARAM_S1_TEMP_ID.parse().unwrap()),
+        "test",
+    )
+    .await
+    .expect("retiring the slot");
+    assert_eq!(released_on_ledger(&db, "slot deleted").await, 1);
+    assert_eq!(
+        e2e::count(
+            &db,
+            "SELECT COUNT(*)::bigint FROM reading_decisions WHERE kind = 'attribution'"
+        )
+        .await,
+        3,
+        "the readings the unpair already released are not recorded again"
+    );
+
+    cleanup_test_db(&db).await;
+}
+
 #[tokio::test]
 #[serial]
 async fn retiring_a_stream_a_second_time_releases_nothing() {

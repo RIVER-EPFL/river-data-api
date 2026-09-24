@@ -1063,6 +1063,7 @@ pub enum Writer {
     MeasurementRetag,
     AdoptClaim,
     DeploymentRollback,
+    SlotRelease,
     CurveRetirement,
     DerivedRecompute,
 }
@@ -1095,9 +1096,10 @@ impl Writer {
                 Some((Kind::Reprocess, Origin::System))
             }
             Self::MeasurementRetag => Some((Kind::Retag, Origin::System)),
-            Self::PairingBackfill | Self::AdoptClaim | Self::DeploymentRollback => {
-                Some((Kind::Attribution, Origin::System))
-            }
+            Self::PairingBackfill
+            | Self::AdoptClaim
+            | Self::DeploymentRollback
+            | Self::SlotRelease => Some((Kind::Attribution, Origin::System)),
             Self::CalibrationResolver => None,
         }
     }

@@ -355,3 +355,74 @@ fn test_a_step_another_calculation_still_reads_is_not_taken_back() {
         "the error names the reader: {err}"
     );
 }
+
+use super::{carry_renames, reads_of_former, renames_of};
+use uuid::Uuid;
+
+#[test]
+fn test_renames_of_names_each_formula_whose_code_moved() {
+    let a = Uuid::from_u128(1);
+    let b = Uuid::from_u128(2);
+    let stored = [(a, "CO2_HS_Um".to_string()), (b, "pCO2".to_string())];
+    let named = [
+        (Some(a), "CO2_HS_Um2".to_string()),
+        (Some(b), "pCO2".to_string()),
+        (None, "fresh".to_string()),
+    ];
+    assert_eq!(
+        renames_of(&stored, &named),
+        [("CO2_HS_Um".to_string(), "CO2_HS_Um2".to_string())]
+    );
+}
+
+#[test]
+fn test_carry_renames_rewrites_whole_identifiers_only() {
+    let renames = [("CO2_HS_Um".to_string(), "CO2_HS_Um2".to_string())];
+    assert_eq!(
+        carry_renames("CO2_HS_Um / kh + CO2_HS_Um_sd + xCO2_HS_Um", &renames),
+        "CO2_HS_Um2 / kh + CO2_HS_Um_sd + xCO2_HS_Um"
+    );
+    assert_eq!(
+        carry_renames("mean(CO2_HS_Um)*2", &renames),
+        "mean(CO2_HS_Um2)*2"
+    );
+}
+
+#[test]
+fn test_carry_renames_swaps_two_codes_in_one_pass() {
+    let renames = [
+        ("a".to_string(), "b".to_string()),
+        ("b".to_string(), "a".to_string()),
+    ];
+    // a - b, each carried once
+    assert_eq!(carry_renames("a - b", &renames), "b - a");
+}
+
+#[test]
+fn test_carry_renames_leaves_a_number_alone() {
+    let renames = [("e5".to_string(), "e6".to_string())];
+    assert_eq!(carry_renames("2e5 * e5", &renames), "2e5 * e6");
+}
+
+#[test]
+fn test_reads_of_former_names_a_reader_of_a_formula_the_set_dropped() {
+    let former = ["CO2_HS_Um".to_string()];
+    let readers = [
+        ("pCO2", "CO2_HS_Um / kh", None),
+        ("other", "x * 2", Some("CO2_HS_Um")),
+        ("clean", "kh * 2", None),
+    ];
+    assert_eq!(
+        reads_of_former(&readers, &former),
+        [
+            ("pCO2".to_string(), "CO2_HS_Um".to_string()),
+            ("other".to_string(), "CO2_HS_Um".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_reads_of_former_is_empty_when_nothing_was_dropped() {
+    let readers = [("pCO2", "CO2_HS_Um / kh", None)];
+    assert!(reads_of_former(&readers, &[]).is_empty());
+}

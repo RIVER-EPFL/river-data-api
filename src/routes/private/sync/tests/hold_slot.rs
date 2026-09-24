@@ -67,3 +67,31 @@ fn test_narrowing_only_adds_to_the_slot_predicate() {
         );
     }
 }
+
+/// A stream-keyed hold stands at its stream's pairing, a stream-less one at the slot it names.
+#[test]
+fn test_with_stream_slot_reads_the_hold_first_then_the_pairing() {
+    let out = with_stream_slot()
+        .expr(slot_site())
+        .expr(slot_parameter())
+        .to_owned()
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(
+        out.contains(r#"LEFT JOIN "data_streams" AS "ds" ON "ds"."id" = "h"."stream_id""#),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            r#"LEFT JOIN "site_parameters" AS "sp" ON "sp"."id" = "ds"."site_parameter_id""#
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"COALESCE("h"."site_id", "sp"."site_id")"#),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"COALESCE("h"."parameter_id", "sp"."parameter_id")"#),
+        "{out}"
+    );
+}

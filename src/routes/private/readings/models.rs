@@ -535,9 +535,9 @@ pub enum Kind {
     /// A `measurement_retag` run moved a reading's classification, and with it the arm it is
     /// served on and whether it rolls up (Q118, M363). Record only: the job's UPDATE writes it.
     Retag,
-    /// A pairing, an adopt or swap, or a deployment rollback wrote a reading's site, parameter,
-    /// instrument or deployment (Q118, M364). Record only: the write sets the columns, this says
-    /// what they were before; `reason` names which of the three it was.
+    /// A pairing, an adopt or swap, a deployment rollback, an unpair or a slot delete wrote a
+    /// reading's site, parameter, instrument, deployment, sample or visit (Q118). Record only: the
+    /// write sets the columns, this says what they were before; `reason` names which it was.
     Attribution,
     Rollback,
 }

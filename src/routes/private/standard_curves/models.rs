@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use crudcrate::EntityToModels;
+use sea_orm::ExprTrait;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -19,7 +20,11 @@ use super::service::StandardCurveOperations;
     name_singular = "standard_curve",
     name_plural = "standard_curves",
     generate_router,
-    operations = StandardCurveOperations
+    operations = StandardCurveOperations,
+    upsert_key(source_system, source_key),
+    upsert_where = Column::SourceSystem
+        .is_not_null()
+        .and(Column::SourceKey.is_not_null())
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

@@ -32,14 +32,15 @@ use super::models::{
 };
 use super::service::{
     FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
-    calculations_fed_by_subject, canonical_hash, check_engine, check_manifest_against_catalog,
-    check_manifest_codes_resolve, closure_subject, codes_held_elsewhere, coverage_for,
-    decommission_reason, find_active_tool, find_run_in_scope, formula_codes_held_elsewhere,
-    insert_version, lint_script, list_active_tools, load_parameter_catalog, load_script,
-    load_version, manifest_finding, manifest_json, mint_formula_version, normalise_name,
-    normalised_json, plan_formula_set, refuse_decommissioned, render, replicated_for,
-    require_context_in_scope, run_stored_cases, run_tool_body, runner_runtime, stamp_decommission,
-    stored_version_content, take_back_steps,
+    calculations_fed_by_subject, canonical_hash, carry_renames, check_engine,
+    check_manifest_against_catalog, check_manifest_codes_resolve, closure_subject,
+    codes_held_elsewhere, coverage_for, decommission_reason, find_active_tool, find_run_in_scope,
+    formula_codes_held_elsewhere, insert_version, lint_script, list_active_tools,
+    load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
+    mint_formula_version, normalise_name, normalised_json, plan_formula_set, reads_of_former,
+    refuse_decommissioned, renames_of, render, replicated_for, require_context_in_scope,
+    run_stored_cases, run_tool_body, runner_runtime, stamp_decommission, stored_version_content,
+    take_back_steps,
 };
 use crate::common::AppState;
 use crate::common::middleware::{AuthContext, ProjectScope, scope_site_ids};
@@ -986,6 +987,144 @@ async fn write_shared_steps(
     Ok(())
 }
 
+/// Carry each rename the save makes into every formula it carries: a formula reads another by its
+/// code, so a reader still naming the old code would otherwise bind whatever else answers to it.
+/// A shared step another calculation reads is refused its rename, since that calculation's own
+/// formulas name it too and are not this save's to rewrite.
+async fn carry_set_renames(
+    txn: &sea_orm::DatabaseTransaction,
+    script_id: Uuid,
+    payload: &mut SaveFormulaSetRequest,
+) -> AppResult<()> {
+    let ids: Vec<Uuid> = payload
+        .formulas
+        .iter()
+        .filter_map(|f| f.id)
+        .chain(payload.shared_steps.iter().filter_map(|s| s.id))
+        .collect();
+    let stored: Vec<(Uuid, String)> = formula_entity::Entity::find()
+        .filter(formula_entity::Column::Id.is_in(ids))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|f| (f.id, f.code))
+        .collect();
+
+    for step in &payload.shared_steps {
+        let Some(step_id) = step.id else { continue };
+        let Some((_, was)) = stored.iter().find(|(id, _)| *id == step_id) else {
+            continue;
+        };
+        if *was == step.code {
+            continue;
+        }
+        let dependents =
+            crate::routes::private::derived_parameters::service::dependents_of_step(txn, step_id)
+                .await?;
+        let readers: Vec<&str> = dependents
+            .calculations
+            .iter()
+            .filter(|c| c.tool_script_id != script_id && !c.formulas.is_empty())
+            .map(|c| c.name.as_str())
+            .collect();
+        if !readers.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "The shared step {was} cannot be renamed to {new} while {readers} read it as \
+                 {was}: their own formulas name it, and this save does not rewrite them",
+                new = step.code,
+                readers = readers.join(", "),
+            )));
+        }
+    }
+
+    let named: Vec<(Option<Uuid>, String)> = payload
+        .formulas
+        .iter()
+        .map(|f| (f.id, f.code.clone()))
+        .chain(payload.shared_steps.iter().map(|s| (s.id, s.code.clone())))
+        .collect();
+    let renames = renames_of(&stored, &named);
+    if renames.is_empty() {
+        return Ok(());
+    }
+    let carry = |formula: &mut String, per_replicate: &mut Option<String>| {
+        *formula = carry_renames(formula, &renames);
+        if let Some(over) = per_replicate.as_mut() {
+            *over = carry_renames(over, &renames);
+        }
+    };
+    for f in &mut payload.formulas {
+        carry(&mut f.formula, &mut f.per_replicate);
+    }
+    for s in &mut payload.shared_steps {
+        carry(&mut s.formula, &mut s.per_replicate);
+    }
+    Ok(())
+}
+
+/// Refuse a save whose formulas read a name that was a formula of this calculation and is not
+/// after the save, where that name is a catalog parameter's code: the reader would bind the
+/// catalog series in place of the formula it read, and compute from a value the set never made.
+async fn refuse_reads_of_former(
+    txn: &sea_orm::DatabaseTransaction,
+    script_id: Uuid,
+    payload: &SaveFormulaSetRequest,
+) -> AppResult<()> {
+    let own: Vec<String> = formula_entity::Entity::find()
+        .filter(formula_entity::Column::ToolScriptId.eq(script_id))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|f| f.code)
+        .collect();
+    let declared: Vec<String> =
+        crate::routes::private::derived_parameters::service::declared_steps(txn, script_id)
+            .await?
+            .into_iter()
+            .map(|f| f.code)
+            .collect();
+    let former: Vec<String> = own
+        .into_iter()
+        .filter(|code| {
+            !payload.formulas.iter().any(|f| f.code == *code)
+                && !payload.shared_steps.iter().any(|s| s.code == *code)
+                && !declared.contains(code)
+        })
+        .collect();
+    let readers: Vec<(&str, &str, Option<&str>)> = payload
+        .formulas
+        .iter()
+        .map(|f| {
+            (
+                f.code.as_str(),
+                f.formula.as_str(),
+                f.per_replicate.as_deref(),
+            )
+        })
+        .chain(payload.shared_steps.iter().map(|s| {
+            (
+                s.code.as_str(),
+                s.formula.as_str(),
+                s.per_replicate.as_deref(),
+            )
+        }))
+        .collect();
+    for (reader, name) in reads_of_former(&readers, &former) {
+        let catalog = crate::routes::private::parameters::Entity::find()
+            .filter(crate::routes::private::parameters::Column::Code.eq(name.as_str()))
+            .one(txn)
+            .await?;
+        if catalog.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "{reader} reads {name}, which was a formula of this calculation and is not after \
+                 this save, so it would read the catalog parameter {name} instead; restore the \
+                 formula, or change what {reader} reads"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Save a formula calculation's whole formula set as one version.
 ///
 /// The set is the request: a formula carrying an `id` updates that row, one without an id is
@@ -1010,7 +1149,7 @@ pub async fn save_formula_set(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<SaveFormulaSetRequest>,
+    Json(mut payload): Json<SaveFormulaSetRequest>,
 ) -> AppResult<Json<SaveFormulaSetResponse>> {
     let script = load_script(&state, id).await?;
     if Engine::parse(&script.engine) != Some(Engine::Formula) {
@@ -1031,6 +1170,8 @@ pub async fn save_formula_set(
         .ok_or_else(|| AppError::NotFound(format!("Tool script {id} not found")))?;
     let superseded = current.active_version_id;
 
+    carry_set_renames(&txn, id, &mut payload).await?;
+    refuse_reads_of_former(&txn, id, &payload).await?;
     let payload_ids: Vec<Uuid> = payload.formulas.iter().filter_map(|f| f.id).collect();
     take_back_steps(&txn, id, &script.name, &payload_ids).await?;
     super::service::saving_set(id, write_shared_steps(&txn, id, &payload.shared_steps)).await?;

@@ -137,6 +137,7 @@ fn an_unpaired_stream_is_announced_and_nothing_else() {
 fn the_chain_never_asks_for_its_own_recompute() {
     let touched = vec![TouchedEvent {
         id: Uuid::from_u128(7),
+        site_id: Uuid::from_u128(8),
         source: "manual".to_string(),
         parameter_ids: vec![Uuid::from_u128(10)],
     }];

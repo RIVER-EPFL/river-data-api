@@ -299,10 +299,10 @@ fn a_re_detection_refreshes_the_payload_and_promotes_a_deferred_hold_only() {
         sql.contains(r#""expected" = "excluded"."expected""#),
         "{sql}"
     );
-    assert!(sql.contains(r#""created_at" = NOW()"#), "{sql}");
+    assert!(sql.contains(r#""created_at" = CURRENT_TIMESTAMP"#), "{sql}");
     assert!(
         sql.contains(
-            r#""status" = CASE WHEN replicate_audit_holds.status = 'deferred' AND EXCLUDED.status = 'pending' THEN 'pending' ELSE replicate_audit_holds.status END"#
+            r#""status" = (CASE WHEN ("replicate_audit_holds"."status" = 'deferred' AND "excluded"."status" = 'pending') THEN 'pending' ELSE "replicate_audit_holds"."status" END)"#
         ),
         "{sql}"
     );

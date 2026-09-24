@@ -924,9 +924,15 @@ async fn apply_creates_the_group_the_source_registry_names() {
         recorded,
         vec![
             None,
-            Some(serde_json::json!({ "function": "calcPCO2", "inputs": ["WTW_pH_1"] })),
+            Some(serde_json::json!({
+                "function": "calcPCO2",
+                "inputs": ["WTW_pH_1"],
+                "source_system": "catsrc",
+                "column": "Field_BP",
+            })),
         ],
-        "the computed member records what the source computed it with, the entered one nothing"
+        "the computed member records what the source computed it with, in which system and \
+         column, the entered one nothing"
     );
 
     let groups = db

@@ -431,6 +431,7 @@ fn touched(
 ) -> crate::routes::private::collection_events::flows::TouchedEvent {
     crate::routes::private::collection_events::flows::TouchedEvent {
         id: Uuid::new_v4(),
+        site_id: Uuid::new_v4(),
         source: "manual".to_string(),
         parameter_ids,
     }
@@ -455,4 +456,55 @@ fn test_naming_target_names_a_target_once() {
 #[test]
 fn test_naming_target_empty() {
     assert!(naming_target(Vec::new(), Uuid::new_v4()).is_empty());
+}
+
+#[test]
+fn test_release_reason_names_the_operation_that_retired_the_slot() {
+    assert_eq!(SlotScope::Stream(Uuid::nil()).release_reason(), "unpaired");
+    assert_eq!(
+        SlotScope::SiteParameter(Uuid::nil()).release_reason(),
+        "slot deleted"
+    );
+}
+
+/// Scenario: a retired slot releases its readings' attribution (CID17). Expected behaviour: the
+/// ledger insert selects exactly the rows the release changes and names every released column on
+/// both sides, the stored value before and NULL after.
+#[test]
+fn test_release_ledger_records_the_rows_the_release_unattributes() {
+    let stream = Uuid::from_u128(7);
+    let target = RetireTarget {
+        rows: Condition::all().add(Expr::col(Alias::new("stream_id")).eq(stream)),
+        site_parameter_id: None,
+        reason: SlotScope::Stream(stream).release_reason(),
+    };
+    let columns = [
+        "site_id",
+        "parameter_id",
+        "sample_id",
+        "collection_event_id",
+    ];
+    let sql = release_ledger(&target, &columns).to_string(PostgresQueryBuilder);
+
+    assert!(
+        sql.starts_with(r#"INSERT INTO "reading_decisions""#),
+        "{sql}"
+    );
+    assert!(sql.contains("'attribution'"), "{sql}");
+    assert!(sql.contains("'unpaired'"), "{sql}");
+    assert!(sql.contains(&stream.to_string()), "{sql}");
+    for column in columns {
+        assert!(
+            sql.contains(&format!(r#"'{column}', "{column}""#)),
+            "{column} is recorded as it was: {sql}"
+        );
+        assert!(
+            sql.contains(&format!(r#"'{column}', NULL"#)),
+            "{column} is recorded as released: {sql}"
+        );
+        assert!(
+            sql.contains(&format!(r#""{column}" IS NOT NULL"#)),
+            "only a row carrying {column} is recorded: {sql}"
+        );
+    }
 }

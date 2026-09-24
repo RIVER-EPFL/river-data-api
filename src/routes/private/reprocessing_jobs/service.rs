@@ -1579,6 +1579,7 @@ async fn enqueue_under<C: ConnectionTrait>(
         category: Set(category.to_string()),
         params: Set(params.clone()),
         dedupe_key: Set(dedupe_key.map(ToString::to_string)),
+        site_id: Set(site_of(params)),
         parent_job_id: Set(parent_job_id),
         next_attempt_at: Set(chrono::Utc::now().into()),
         ..Default::default()
@@ -1596,6 +1597,15 @@ async fn enqueue_under<C: ConnectionTrait>(
         TryInsertResult::Inserted(_) => Some(id),
         TryInsertResult::Conflicted | TryInsertResult::Empty => None,
     })
+}
+
+/// The site a job's params name, which is the site the job belongs to from the moment it is
+/// queued: the listing confines a job by this column, and a job with none is global.
+pub fn site_of(params: &serde_json::Value) -> Option<Uuid> {
+    params
+        .get("site_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
 }
 
 /// A row claimed off the queue.

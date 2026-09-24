@@ -836,6 +836,70 @@ async fn the_cross_site_list_reports_fill_and_findings() {
     assert_eq!(visits[1]["findings_open"], 0);
 }
 
+/// Scenario: a calculation reads dissolved oxygen and temperature, and only the first of a site's
+/// two visits measured both.
+///
+/// Expected behaviour: the visit list and the site list count only visits holding a live value of
+/// every parameter named, so a withdrawn measurement no longer makes its visit one to offer.
+#[tokio::test]
+#[serial]
+async fn visits_and_sites_holding_every_input() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    let both = format!("{GLOBAL_PARAM_DO_ID},{GLOBAL_PARAM_TEMP_ID}");
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/visits?site_id={SITE1_ID}&holding={both}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["collected_at"], T1);
+
+    let sites = |holding: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let (status, body) = crate::common::get_json_with_token(
+                &app,
+                &format!("/api/visits/sites?holding={holding}"),
+                &token,
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            body
+        }
+    };
+    assert_eq!(
+        sites(both.clone()).await,
+        json!([{ "site_id": SITE1_ID, "visits": 1 }])
+    );
+    assert_eq!(
+        sites(GLOBAL_PARAM_DO_ID.to_string()).await,
+        json!([{ "site_id": SITE1_ID, "visits": 2 }])
+    );
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET withdrawn_at = NOW() \
+             WHERE parameter_id = '{GLOBAL_PARAM_TEMP_ID}' AND time = '{T1}'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        sites(both).await,
+        json!([]),
+        "a withdrawn input no longer holds"
+    );
+
+    let (status, _) =
+        crate::common::get_json_with_token(&app, "/api/visits/sites?holding=", &token).await;
+    assert_eq!(status, 400, "naming no parameter is refused");
+}
+
 /// Scenario: the lab opens a CNET station whose history was synced, expands a 2025 visit and
 /// presses Recompute tools.
 ///

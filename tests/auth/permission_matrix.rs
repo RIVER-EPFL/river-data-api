@@ -745,6 +745,7 @@ fn table() -> Table {
             ("GET", "/api/tool_runs/{id}/trace"),
             ("GET", "/api/sites/{id}/visits"),
             ("GET", "/api/visits"),
+            ("GET", "/api/visits/sites"),
             ("GET", "/api/collection_events/{id}/detail"),
             ("GET", "/api/actions/curation_drift"),
         ],

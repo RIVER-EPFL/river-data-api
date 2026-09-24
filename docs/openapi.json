@@ -13934,6 +13934,13 @@
       "PlanCalculationRef": {
         "description": "What the source computed a column with: its own calculation function and the columns that\nfunction reads.\n\nIt is the statement a formula set is authored against, and the one an output still waiting for\none is missing.",
         "properties": {
+          "column": {
+            "description": "The source's own column the function writes (`CO2_HS_Um_avg`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "function": {
             "description": "The source's own function name, verbatim (`calcPCO2`).",
             "type": "string"
@@ -13944,11 +13951,20 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "source_system": {
+            "description": "The source system the column belongs to (`cnet`).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "function",
-          "inputs"
+          "inputs",
+          "source_system",
+          "column"
         ],
         "type": "object"
       },
@@ -23460,6 +23476,24 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SiteVisitCount": {
+        "description": "A site with visits holding every parameter asked for, and how many.",
+        "properties": {
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "visits": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "site_id",
+          "visits"
+        ],
         "type": "object"
       },
       "SlotCoverage": {
@@ -52732,6 +52766,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Comma-separated parameter ids: only visits holding a live value of every one.",
+            "in": "query",
+            "name": "holding",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -52750,6 +52796,44 @@
           }
         },
         "summary": "List visits across sites with per-visit fill and finding counts. Requires `read_data`; a\nproject-scoped caller sees the visits of its projects' sites.",
+        "tags": [
+          "collection_events"
+        ]
+      }
+    },
+    "/api/visits/sites": {
+      "get": {
+        "operationId": "list_visit_sites",
+        "parameters": [
+          {
+            "description": "Comma-separated parameter ids a visit must hold a live value of every one of.",
+            "in": "query",
+            "name": "holding",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SiteVisitCount"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Sites and their visit counts"
+          },
+          "400": {
+            "description": "A parameter id is not a UUID"
+          }
+        },
+        "summary": "The sites with a visit holding a live value of every parameter named, each with how many such\nvisits it has: where a calculation reading those parameters can run. Requires `read_data`; a\nproject-scoped caller sees its projects' sites.",
         "tags": [
           "collection_events"
         ]
