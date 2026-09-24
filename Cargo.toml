@@ -96,12 +96,12 @@ async-trait = "0.1"
 migration = { path = "migration" }
 
 # Core library (sync control plane)
-river-data-core = { version = "0.14.1", features = ["openapi"] }
+river-data-core = { version = "0.15.0", features = ["openapi"] }
 
 [dev-dependencies]
 # The sync client, for the tests that drive a real `SyncDriver` against the API rather than
 # writing its requests by hand. The crate itself needs only the schema derives.
-river-data-core = { version = "0.14.1", features = ["openapi", "client"] }
+river-data-core = { version = "0.15.0", features = ["openapi", "client"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 serial_test = "3"

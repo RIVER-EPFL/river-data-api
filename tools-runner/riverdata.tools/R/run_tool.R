@@ -12,8 +12,10 @@ SCRIPT_PACKAGES <- c("dplyr", "tidyr", "magrittr")
 #' serialises back to JSON.
 #'
 #' The script is evaluated in a fresh environment. Curves and constants are resolved by the API
-#' and arrive as values; nothing here reads a database or the network.
+#' and arrive as values; nothing here reads a database or the network, and the run cannot open a
+#' network socket.
 run_tool <- function(script, entry = "tool", inputs = list(), constants = list(), curves = list()) {
+  deny_network()
   with_structured_error({
     if (!is.character(script) || length(script) != 1L || !nzchar(script)) {
       stop("script must be a single non-empty string", call. = FALSE)

@@ -73,5 +73,10 @@ container can reach. It runs as uid 10001 with no capabilities, a read-only file
 compiler, no package manager, no credentials and no database access. Each request runs in a
 fork with its own memory, file-size and process limits and a 30 second timeout. Everything a
 script needs (inputs, resolved constants, curve coefficients) arrives in the request body.
-Deny egress in deployments; the API-side lint is accident protection for authors, not the
-control.
+The container's network is not restricted (on k8s the runner shares the API pod's network), so
+`run_tool` takes it away from each run instead: before the script is evaluated, the fork installs
+a seccomp filter under which `socket()` for any domain but `AF_UNIX` and `io_uring_setup` fail
+with `EACCES`, and a syscall through any ABI but x86_64 kills the fork
+(`riverdata.tools/src/deny_network.c`). The server keeps its own network. A socket the fork
+inherits already open is not closed by it. The API-side lint is accident protection for authors,
+not the control.

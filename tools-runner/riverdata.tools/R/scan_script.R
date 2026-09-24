@@ -9,9 +9,8 @@
 # This reports structure, not verdicts: which names are refused is the API's list, and it changes
 # there alone. Nothing is evaluated, so scanning a hostile script is as safe as reading it.
 #
-# The runner container is the security boundary: it holds no database credentials, no secrets and
-# no network route to anything. The lint this feeds is accident protection, and a determined
-# author is not its subject.
+# The runner container is the security boundary: it holds no database credentials and no secrets.
+# The lint this feeds is accident protection, and a determined author is not its subject.
 
 # Call heads that are syntax rather than a name a policy could refuse.
 SCAN_SYNTAX_CALLS <- INSPECT_SYNTAX_CALLS

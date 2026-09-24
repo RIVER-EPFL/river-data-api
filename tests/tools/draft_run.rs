@@ -410,6 +410,50 @@ async fn a_draft_reports_its_lint_findings_alongside_the_result() {
     );
 }
 
+/// Scenario: a script opens a TCP connection to the runner's own listener, the one address every
+/// runner can reach, through a name the lint does not read.
+///
+/// Expected behaviour: the run comes back as a script error, because the runner takes network
+/// sockets away from each run before the script is evaluated.
+#[tokio::test]
+#[serial]
+async fn a_draft_that_opens_a_network_socket_is_refused_by_the_runner() {
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_draft_that_opens_a_network_socket_is_refused_by_the_runner")
+        .await
+    {
+        return;
+    }
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run_network")
+        .await
+    {
+        return;
+    }
+    let (_db, app, admin) = setup().await;
+
+    let script = r#"tool <- function(inputs, constants, curves) {
+  open_socket <- get(paste0("socket", "Connection"))
+  port <- as.integer(Sys.getenv("RUNNER_PORT", "80"))
+  open_socket("127.0.0.1", port, open = "r+b", timeout = 2)
+  list(doubled = 2 * inputs$x)
+}"#;
+    let (status, out) = draft_run(
+        &app,
+        &json!({
+            "script": script,
+            "manifest": { "label": "Network draft", "params": [
+                { "name": "x", "label": "X", "kind": "number", "required": true } ] },
+            "inputs": { "x": 2 },
+        }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out["ran"], false, "the socket is refused: {out}");
+    assert_eq!(out["failure"]["kind"], "script_error", "{out}");
+}
+
 /// A constant name being written is as likely half-typed as deleted, so the draft runs without it
 /// and says so. Ending the run instead would withhold the numbers and the finding together.
 #[tokio::test]

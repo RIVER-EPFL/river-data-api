@@ -106,10 +106,16 @@ fn sqlstate(err: &DbErr) -> Option<String> {
 }
 
 /// How many times a connection-level failure is tried again before the harness gives up.
-const LOCK_SESSION_ATTEMPTS: u32 = 5;
+const LOCK_SESSION_ATTEMPTS: u32 = 8;
 
-/// How long the harness waits between those attempts.
+/// How long the harness waits after the first failed attempt; each later wait doubles, so eight
+/// attempts span about half a minute of a loaded host.
 const LOCK_SESSION_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// The wait after failed attempt `attempt`, counted from one.
+fn retry_delay(attempt: u32) -> Duration {
+    LOCK_SESSION_RETRY_DELAY * 2u32.pow(attempt.saturating_sub(1))
+}
 
 /// Whether a failed connect is worth trying again: a failure at the transport, not an answer from
 /// the server. A reset on the first connect discards the whole binary's work, and the next connect
@@ -132,10 +138,10 @@ async fn connect_retrying(opts: ConnectOptions, what: &str) -> DatabaseConnectio
         match Database::connect(opts.clone()).await {
             Ok(db) => return db,
             Err(e) if transient(&e) && attempt < LOCK_SESSION_ATTEMPTS => {
+                tokio::time::sleep(retry_delay(attempt)).await;
                 attempt += 1;
-                tokio::time::sleep(LOCK_SESSION_RETRY_DELAY).await;
             }
-            Err(e) => panic!("Failed to connect to {what} in {attempt} attempts: {e}"),
+            Err(e) => panic!("Failed to connect to {what} in {attempt} attempts: {e} ({e:?})"),
         }
     }
 }
@@ -167,11 +173,11 @@ async fn open_lock_session(url: &str) -> DatabaseConnection {
                 );
             }
             Err(e) if transient(&e) && attempt < LOCK_SESSION_ATTEMPTS => {
+                tokio::time::sleep(retry_delay(attempt)).await;
                 attempt += 1;
-                tokio::time::sleep(LOCK_SESSION_RETRY_DELAY).await;
             }
             Err(e) => {
-                panic!("Failed to open the harness lock session in {attempt} attempts: {e}")
+                panic!("Failed to open the harness lock session in {attempt} attempts: {e} ({e:?})")
             }
         }
     }
