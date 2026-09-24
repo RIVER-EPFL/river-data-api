@@ -28,9 +28,8 @@ fn slot_uri(time: &str) -> String {
 }
 
 async fn save_grab(app: &axum::Router, token: &str) {
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [
@@ -683,8 +682,7 @@ async fn save_at_chain_instant(
     if let Some(run_id) = run_id {
         body["tool_run_id"] = run_id.clone();
     }
-    let (status, text) =
-        crate::common::post_json_with_token(app, "/api/grab_samples", &body, token).await;
+    let (status, text) = crate::common::post_checked_grab(app, &body, token).await;
     assert_eq!(status, 200, "save ({status}): {text}");
 }
 
@@ -860,6 +858,7 @@ async fn a_consumed_input_opens_the_reading_it_was_read_from() {
     )
     .await;
     assert!((200..300).contains(&status), "create ({status}): {def}");
+    crate::common::commit_calculation(&db, calculation).await;
     let output = def["output_parameter_id"].as_str().expect("output");
 
     let (status, body) = crate::common::post_json_with_token(

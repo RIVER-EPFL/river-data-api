@@ -250,9 +250,8 @@ async fn grab_and_tool_onboarding_produces_spot_series_with_sample_statistics() 
 
     // Three replicates whose mean and sample standard deviation are exact: 310, 320, 330 -> 320, 10.
     let replicates = [310.0, 320.0, 330.0];
-    let (status, saved) = crate::common::post_json_parse_with_token(
+    let (status, saved) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": track.site_id,
             "label": "track C",

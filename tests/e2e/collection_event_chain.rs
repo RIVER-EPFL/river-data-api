@@ -243,9 +243,8 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     .await;
     assert_eq!(status, 200, "calculate A ({status}): {a}");
     assert_eq!(a["results"]["out_a"], 42.0);
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site_id,
             "tool_run_id": a["run_id"],
@@ -297,9 +296,8 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
         "the resolution is recorded: {b}"
     );
     assert_eq!(b["event_inputs"][0]["value"], 42.0);
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site_id,
             "tool_run_id": b["run_id"],
@@ -600,9 +598,7 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
                 if replace {
                     body["mode"] = json!("replace");
                 }
-                let (status, resp) =
-                    crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river)
-                        .await;
+                let (status, resp) = crate::common::post_checked_grab(&app, &body, &river).await;
                 assert_eq!(status, 200, "save {output}: {resp}");
             }
         };
@@ -845,8 +841,7 @@ async fn an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once()
             if replace {
                 body["mode"] = json!("replace");
             }
-            let (status, resp) =
-                crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river).await;
+            let (status, resp) = crate::common::post_checked_grab(&app, &body, &river).await;
             assert_eq!(status, 200, "save out_a: {resp}");
         }
     };
@@ -1114,9 +1109,8 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     )
     .await;
     assert_eq!(status, 200, "calculate A ({status}): {a}");
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site_id,
             "tool_run_id": a["run_id"],
@@ -1368,8 +1362,7 @@ async fn a_corrected_input_recomputes_its_output_under_the_curve_the_run_chose()
             if replace {
                 body["mode"] = json!("replace");
             }
-            let (status, resp) =
-                crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river).await;
+            let (status, resp) = crate::common::post_checked_grab(&app, &body, &river).await;
             assert_eq!(status, 200, "save CurveIn: {resp}");
         }
     };
@@ -1410,9 +1403,8 @@ async fn a_corrected_input_recomputes_its_output_under_the_curve_the_run_chose()
     .await;
     assert_eq!(status, 200, "run with the curve: {run}");
     assert_eq!(run["results"]["CurveOut"], 21.0, "10 * 2 + 1: {run}");
-    let (status, resp) = crate::common::post_json_with_token(
+    let (status, resp) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site_id,
             "tool_run_id": run["run_id"],

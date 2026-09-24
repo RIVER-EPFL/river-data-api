@@ -123,9 +123,8 @@ async fn each_minting_path_stamps_what_it_made() {
     );
 
     // A hand-entered value: the slot's own entry channel, never the deployed probe.
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [{
@@ -249,5 +248,47 @@ async fn the_inventory_separates_the_kinds() {
     assert!(
         kinds.iter().all(|k| *k == "device" || *k == "lab"),
         "only the measuring kinds come back: {body}"
+    );
+}
+
+/// Scenario: a Vaisala channel's stream loses its `sensor_id` (a re-registered stream, a restored
+/// database) and the next registration mints for it again.
+///
+/// Expected behaviour: the mint resolves to the instrument the channel already has, by its
+/// `(source_system, source_key)`, rather than inserting a second.
+#[tokio::test]
+#[serial]
+async fn minting_a_channel_again_resolves_to_its_instrument() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let device = json!({"device": {"logger_serial": "LOG-2"}});
+    let first = mint_for_feed(&db, &app, &token, "vaisala", "kinds-remint", device.clone()).await;
+    crate::common::exec(
+        &db,
+        "UPDATE data_streams SET sensor_id = NULL \
+         WHERE source_system = 'vaisala' AND source_key = 'kinds-remint'",
+    )
+    .await;
+    let second = mint_for_feed(&db, &app, &token, "vaisala", "kinds-remint", device).await;
+
+    assert_eq!(first, second, "the channel keeps its instrument");
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM sensors \
+             WHERE source_system = 'vaisala' AND source_key = 'kinds-remint'"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("a count");
+    assert_eq!(
+        row.try_get::<i64>("", "n").expect("n"),
+        1,
+        "one instrument per channel"
     );
 }

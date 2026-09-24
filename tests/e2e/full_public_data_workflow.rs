@@ -4,7 +4,8 @@
 //!
 //! This mirrors the production migration/cutover: fresh schema → configure entities → ingest CSV →
 //! serve the public contract. Every entity is created and exposed through its real endpoint; the
-//! calculation row alone is seeded (`seed_formula_calculation`).
+//! calculation row alone is seeded (`seed_formula_calculation`) and its version committed
+//! (`commit_calculation`).
 //!
 //! Run with: cargo test --test e2e
 
@@ -221,6 +222,7 @@ async fn test_full_public_data_workflow() {
         (200..300).contains(&status),
         "create derived ({status}): {def}"
     );
+    crate::common::commit_calculation(&db, calculation).await;
     let derived_param_id = def["output_parameter_id"].as_str().unwrap().to_string();
 
     // Assign the derived parameter to the site.

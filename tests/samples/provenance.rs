@@ -82,13 +82,8 @@ async fn a_tool_save_builds_the_blob_from_the_stored_run() {
     let (db, app, token) = setup().await;
     let run_id = mint_run(&db, "doc", run_outputs(), json!([])).await;
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &tool_save_body(run_id),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::post_checked_grab(&app, &tool_save_body(run_id), &token).await;
     assert_eq!(status, 200, "tool save lands: {body}");
 
     let blobs = stored_blobs(&db).await;
@@ -130,8 +125,7 @@ async fn a_client_authored_blob_is_refused() {
 
     let mut body = tool_save_body(Uuid::new_v4());
     body["provenance"] = json!({ "tool": "forged" });
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &body, &token).await;
     assert_eq!(status, 422, "a client-authored blob is refused: {resp}");
     assert!(resp.contains("provenance"), "{resp}");
 }
@@ -142,13 +136,8 @@ async fn a_save_cannot_claim_a_run_it_did_not_make() {
     let (db, app, token) = setup().await;
 
     // A run that does not exist.
-    let (status, resp) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &tool_save_body(Uuid::new_v4()),
-        &token,
-    )
-    .await;
+    let (status, resp) =
+        crate::common::post_checked_grab(&app, &tool_save_body(Uuid::new_v4()), &token).await;
     assert_eq!(status, 400, "unknown run: {resp}");
     assert!(resp.contains("does not exist"), "{resp}");
 
@@ -157,16 +146,14 @@ async fn a_save_cannot_claim_a_run_it_did_not_make() {
     // A value the run did not produce.
     let mut edited = tool_save_body(run_id);
     edited["readings"][0]["value"] = json!(10.5);
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &edited, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &edited, &token).await;
     assert_eq!(status, 400, "an edited value is refused: {resp}");
     assert!(resp.contains("did not compute"), "{resp}");
 
     // An output the run does not have.
     let mut unknown = tool_save_body(run_id);
     unknown["readings"][0]["output"] = json!("DO_rep_Z");
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &unknown, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &unknown, &token).await;
     assert_eq!(status, 400, "an unknown output is refused: {resp}");
 
     // A reading of a tool save that names no output.
@@ -175,15 +162,13 @@ async fn a_save_cannot_claim_a_run_it_did_not_make() {
         .as_object_mut()
         .unwrap()
         .remove("output");
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &unnamed, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &unnamed, &token).await;
     assert_eq!(status, 400, "an unnamed reading is refused: {resp}");
 
     // An output claim without a run.
     let mut runless = tool_save_body(run_id);
     runless.as_object_mut().unwrap().remove("tool_run_id");
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &runless, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &runless, &token).await;
     assert_eq!(
         status, 400,
         "an output claim without a run is refused: {resp}"
@@ -207,19 +192,13 @@ async fn a_curve_consuming_run_refuses_a_standard_curve_id() {
 
     let mut body = tool_save_body(run_id);
     body["readings"][0]["standard_curve_id"] = json!(Uuid::new_v4());
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &body, &token).await;
     assert_eq!(status, 400, "double correction refused: {resp}");
     assert!(resp.contains("twice"), "{resp}");
 
     // The same save without the curve id is accepted.
-    let (status, resp) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &tool_save_body(run_id),
-        &token,
-    )
-    .await;
+    let (status, resp) =
+        crate::common::post_checked_grab(&app, &tool_save_body(run_id), &token).await;
     assert_eq!(status, 200, "the curveless save lands: {resp}");
 }
 
@@ -229,20 +208,14 @@ async fn a_replace_carries_the_new_runs_blob_and_a_plain_save_none() {
     let (db, app, token) = setup().await;
 
     let first = mint_run(&db, "doc", run_outputs(), json!([])).await;
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &tool_save_body(first),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::post_checked_grab(&app, &tool_save_body(first), &token).await;
     assert_eq!(status, 200, "{body}");
 
     let second = mint_run(&db, "doc", run_outputs(), json!([])).await;
     let mut replace = tool_save_body(second);
     replace["mode"] = json!("replace");
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &replace, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &replace, &token).await;
     assert_eq!(status, 200, "replace lands: {body}");
 
     for (_, blob) in stored_blobs(&db).await {
@@ -267,8 +240,7 @@ async fn a_replace_carries_the_new_runs_blob_and_a_plain_save_none() {
             { "parameter_id": GLOBAL_PARAM_TURB_ID, "value": 3.5, "time": GRAB_TIME },
         ],
     });
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &plain, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &plain, &token).await;
     assert_eq!(status, 200, "{body}");
     for (_, blob) in stored_blobs(&db).await {
         assert!(
@@ -294,9 +266,8 @@ async fn a_save_to_a_slot_the_site_does_not_hold_is_refused_however_it_is_verifi
     .await;
     let fresh = "00000000-0000-4000-b000-0000000000aa";
 
-    let (status, resp) = crate::common::post_json_with_token(
+    let (status, resp) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{ "parameter_id": fresh, "value": 1.0, "time": GRAB_TIME }],
@@ -312,8 +283,7 @@ async fn a_save_to_a_slot_the_site_does_not_hold_is_refused_however_it_is_verifi
         "tool_run_id": run_id,
         "readings": [{ "parameter_id": fresh, "value": 3.25, "time": GRAB_TIME, "output": "Fresh" }],
     });
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &tool_save, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &tool_save, &token).await;
     assert_eq!(status, 400, "nor does a verified one: {resp}");
     assert!(
         resp.contains(fresh),
@@ -336,16 +306,14 @@ async fn a_save_to_a_slot_the_site_does_not_hold_is_refused_however_it_is_verifi
     )
     .await;
 
-    let (status, resp) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &tool_save, &token).await;
+    let (status, resp) = crate::common::post_checked_grab(&app, &tool_save, &token).await;
     assert_eq!(status, 200, "the slot exists, so the save lands: {resp}");
 
     // A parameter the catalog does not hold has no slot either, and is refused the same way.
     let ghost = Uuid::new_v4();
     let run3 = mint_run(&db, "doc", json!({ "Ghost": 1.0 }), json!([])).await;
-    let (status, resp) = crate::common::post_json_with_token(
+    let (status, resp) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "tool_run_id": run3,
@@ -365,13 +333,7 @@ async fn the_blob_has_no_crud_surface() {
     let (db, app, token) = setup().await;
 
     let run_id = mint_run(&db, "doc", run_outputs(), json!([])).await;
-    let (status, _) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &tool_save_body(run_id),
-        &token,
-    )
-    .await;
+    let (status, _) = crate::common::post_checked_grab(&app, &tool_save_body(run_id), &token).await;
     assert_eq!(status, 200);
 
     let sample_id = db

@@ -361,6 +361,7 @@ async fn a_step_shared_with_a_visit_calculation_computes_on_the_stream_too() {
         .as_str()
         .expect("the formula minted its output")
         .to_string();
+    crate::common::commit_calculation(&db, stream_side.parse().expect("a uuid")).await;
 
     post(
         &app,
@@ -847,6 +848,7 @@ async fn a_calculation_receives_the_shared_steps_its_declared_steps_read() {
         &token,
     )
     .await;
+    crate::common::commit_calculation(&db, pco2real.parse().expect("a uuid")).await;
     let output_parameter_id = output["output_parameter_id"]
         .as_str()
         .expect("the formula minted its output")

@@ -219,6 +219,7 @@ async fn csv_import_recomputes_derived_via_worker() {
         &token,
     )
     .await;
+    crate::common::commit_calculation(&db, calculation).await;
     let output_parameter_id = def["output_parameter_id"].as_str().unwrap().to_string();
     crate::common::post_json_with_token(
         &app,
@@ -809,9 +810,8 @@ async fn an_overwritten_grab_keeps_the_lab_curve_it_was_measured_against() {
     )
     .await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [{
@@ -1192,6 +1192,7 @@ async fn a_csv_import_whose_derived_recompute_fails_recomputes_on_the_retry() {
         (200..300).contains(&status),
         "create derived ({status}): {def}"
     );
+    crate::common::commit_calculation(&db, calculation).await;
     let output = def["output_parameter_id"]
         .as_str()
         .expect("output_parameter_id")

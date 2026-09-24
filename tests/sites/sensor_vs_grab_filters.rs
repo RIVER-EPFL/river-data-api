@@ -53,9 +53,8 @@ async fn flagged_and_replicate_rows_are_excluded_from_the_sensor_average() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [{

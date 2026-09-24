@@ -19,7 +19,6 @@ use crate::routes::private::change_audit::service::{entity_revision, entity_revi
 use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
-use crate::routes::private::derived_parameters::service as derived;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::decision_model as reading_decisions;
 use crate::routes::private::readings::models as readings;
@@ -779,8 +778,7 @@ struct DerivedWorkRow {
 /// the sample holds any, else its calibrated value, else its raw value.
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct InputCandidate {
-    /// The instant the reading stands at, which is the instant being computed for a source read
-    /// exactly and an earlier visit's for one that is held (Q230).
+    /// The instant the reading stands at, the one being computed.
     pub time: DateTime<Utc>,
     pub measurement_type: Option<String>,
     pub replicate_index: i16,
@@ -1122,40 +1120,16 @@ fn build(query: impl sea_orm::sea_query::QueryStatementBuilder) -> Statement {
     Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
 }
 
-/// The last instant a parameter was measured at a site, at or before `time`: what a held source
-/// binds to (Q230). A withdrawn or flagged row is not a measurement, here as in the binder.
-fn last_measured_query(
-    site_id: Uuid,
-    parameter_id: Uuid,
-    time: chrono::DateTime<chrono::Utc>,
-) -> sea_orm::sea_query::SelectStatement {
-    let h = Alias::new("h");
-    SeaQuery::select()
-        .expr(Func::max(Expr::col((h.clone(), readings::Column::Time))))
-        .from_as(readings::Entity, h.clone())
-        .and_where(Expr::col((h.clone(), readings::Column::SiteId)).eq(site_id))
-        .and_where(Expr::col((h.clone(), readings::Column::ParameterId)).eq(parameter_id))
-        .and_where(Expr::col((h.clone(), readings::Column::Time)).lte(time))
-        .and_where(Expr::col((h, readings::Column::WithdrawnAt)).is_null())
-        .and_where(Expr::cust("h.is_flagged IS NOT TRUE"))
-        .take()
-}
-
 /// The value one derived input resolves to at `time`, and the cadence it came from.
 ///
 /// Deterministic input pick when a sensor point and a grab share the timestamp: prefer the
 /// continuous reading, then tie-break by stream_id (stable across VACUUM). A withdrawn or flagged
 /// row is not a measurement, and a sample whose members are all gone carries n = 0 with a NULL
 /// mean, so neither may reach the formula.
-///
-/// `held` is Q230's second rule: the rows of the last instant at or before `time` rather than the
-/// rows at it, for an input the lab measures at a visit and a calculation on a stream reads. The
-/// whole instant is taken either way, because a replicate group's mean stands on its members.
 fn input_value_query(
     site_id: Uuid,
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
-    held: bool,
 ) -> sea_orm::sea_query::SelectStatement {
     let r = Alias::new("r");
     let smp = Alias::new("smp");
@@ -1184,18 +1158,7 @@ fn input_value_query(
         )
         .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
         .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
-        .and_where(if held {
-            // The last instant this parameter was measured at, at or before the one being
-            // computed. A parameter with nothing before it selects NULL and binds nothing, which
-            // is what an input the instant holds no value for already does.
-            Expr::col((r.clone(), readings::Column::Time)).in_subquery(last_measured_query(
-                site_id,
-                parameter_id,
-                time,
-            ))
-        } else {
-            Expr::col((r.clone(), readings::Column::Time)).eq(time)
-        })
+        .and_where(Expr::col((r.clone(), readings::Column::Time)).eq(time))
         .and_where(Expr::col((r, readings::Column::WithdrawnAt)).is_null())
         .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
         .take()
@@ -1262,12 +1225,10 @@ async fn resolve_set_inputs(
             let Some(&parameter_id) = catalog.get(&code.to_lowercase()) else {
                 continue;
             };
-            let held = formula.held.iter().any(|v| v == variable);
             let candidates = InputCandidate::find_by_statement(build(input_value_query(
                 item.derived_site_id,
                 parameter_id,
                 time,
-                held,
             )))
             .all(db)
             .await?;
@@ -1286,10 +1247,6 @@ async fn resolve_set_inputs(
             };
             consumed.push(ConsumedInput {
                 variable: variable.clone(),
-                // The rule that reached this reading, so the record says why a member stands at
-                // an instant the run did not compute at, and a reader can tell a held value from
-                // a mis-stamped one (Q230).
-                alignment: held.then(|| derived::HOLD.to_string()),
                 kind: if input.from_mean { "mean" } else { "reading" }.to_string(),
                 subject: None,
                 property: None,
@@ -1317,7 +1274,6 @@ async fn resolve_set_inputs(
             }
             consumed.push(ConsumedInput {
                 variable: variable.clone(),
-                alignment: None,
                 kind: "site".to_string(),
                 subject: Some(subject.clone()),
                 property: Some(property.clone()),
@@ -1376,7 +1332,6 @@ async fn output_capture<C: ConnectionTrait>(
             let subject = format!("calculation_formula:{step_id}");
             consumed.push(ConsumedInput {
                 variable: variable.clone(),
-                alignment: None,
                 kind: "computed".to_string(),
                 revision: entity_revision(db, &subject)
                     .await
@@ -1390,7 +1345,6 @@ async fn output_capture<C: ConnectionTrait>(
         }
         consumed.push(ConsumedInput {
             variable: variable.clone(),
-            alignment: None,
             kind: "constant".to_string(),
             subject: None,
             property: None,
@@ -1408,7 +1362,6 @@ async fn output_capture<C: ConnectionTrait>(
     };
     consumed.push(ConsumedInput {
         variable: formula.code.clone(),
-        alignment: None,
         kind: "step".to_string(),
         revision,
         subject,
@@ -1495,7 +1448,6 @@ async fn constants_consumed<C: ConnectionTrait>(
             let subject = format!("constant:{}", c.id);
             ConsumedInput {
                 variable: c.name.clone(),
-                alignment: None,
                 kind: "constant".to_string(),
                 revision: revisions.get(&subject).copied(),
                 subject: Some(subject),
@@ -1838,7 +1790,7 @@ async fn evaluate_set_and_upsert(
                 site_id,
                 output.parameter_id,
                 time,
-                item.calculation.active_version_id,
+                Some(item.calculation.active_version_id),
                 &consumed,
             )
             .await?;
@@ -1849,7 +1801,7 @@ async fn evaluate_set_and_upsert(
             get_or_create_derived_stream(db, &item.calculation.name, site_id, output).await?;
         // The value names the version of the set that made it, which is what lets a reader open
         // the formula text behind a number computed months ago (C310).
-        let version = item.calculation.active_version_id;
+        let version = Some(item.calculation.active_version_id);
         let parameter_id = output.parameter_id;
         // A recompute that moves a stored value or the version it names records the move (Q116),
         // so a person opening the value reads what it was and which formula edit changed it.
@@ -2661,7 +2613,7 @@ pub async fn reprocess(
 
     let (readings_updated, moved, changed, visits) =
         crate::common::bulk_write::guarded(db, async |txn| {
-            let mut touched: Vec<(Uuid, DateTime<Utc>, Option<Uuid>)> = Vec::new();
+            let mut touched: Vec<(Uuid, DateTime<Utc>)> = Vec::new();
             let mut changed = crate::common::SlotTally::default();
             let mut readings_updated = 0usize;
             for query in [&steps.attribution, &steps.calibration] {
@@ -2694,11 +2646,9 @@ pub async fn reprocess(
 
     // The cascade runs over what this run moved, not over every instant in the scope: a derived
     // value at (site, time) is a function of the served values, and those changed only where a
-    // statement above wrote, and at the pulses that hold a value it moved (Q230). Costing a query
-    // per instant, the difference is the whole run.
-    let cascade = cascade_instants(db, &moved).await?;
+    // statement above wrote. Costing a query per instant, the difference is the whole run.
     let mut refused = crate::routes::private::derived_parameters::service::DerivedPass::default();
-    for (site_id, utc_time) in cascade {
+    for (site_id, utc_time) in moved {
         match recalculate_derived_at_timestamp(db, site_id, utc_time).await {
             Ok(slots) => refused.record(&slots, utc_time),
             Err(e) => tracing::warn!(
@@ -2746,50 +2696,6 @@ pub async fn reprocess(
     Ok(readings_updated)
 }
 
-/// The parameters a reprocess moved at one site, and the span it moved them over.
-struct SiteSpan {
-    parameters: Vec<Uuid>,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-}
-
-/// The instants a reprocess cascades to: every attributed instant it moved, plus the stream pulses
-/// that hold a parameter it moved at a site, up to that parameter's next measurement.
-async fn cascade_instants(
-    db: &DatabaseConnection,
-    moved: &[(Uuid, DateTime<Utc>, Option<Uuid>)],
-) -> Result<Vec<(Uuid, DateTime<Utc>)>, sea_orm::DbErr> {
-    let mut instants: std::collections::BTreeSet<(Uuid, DateTime<Utc>)> =
-        moved.iter().map(|(site, time, _)| (*site, *time)).collect();
-    let mut spans: HashMap<Uuid, SiteSpan> = HashMap::new();
-    for (site, time, parameter) in moved {
-        let Some(parameter) = parameter else { continue };
-        let span = spans.entry(*site).or_insert(SiteSpan {
-            parameters: Vec::new(),
-            start: *time,
-            end: *time,
-        });
-        if !span.parameters.contains(parameter) {
-            span.parameters.push(*parameter);
-        }
-        span.start = Ord::min(span.start, *time);
-        span.end = Ord::max(span.end, *time);
-    }
-    for (site, span) in spans {
-        let held = crate::routes::private::derived_parameters::flows::held_instants(
-            &[site],
-            &span.parameters,
-            span.start,
-            span.end,
-        );
-        for row in db.query_all_raw(build(held)).await? {
-            let at: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-            instants.insert((site, at.with_timezone(&Utc)));
-        }
-    }
-    Ok(instants.into_iter().collect())
-}
-
 /// One reading a recompute visited, the slot it belongs to, and whether its columns moved.
 #[derive(FromQueryResult)]
 struct MovedReading {
@@ -2818,7 +2724,7 @@ fn tally_moved(changed: &mut crate::common::SlotTally, moved: &MovedReading) {
 async fn write_and_collect<C: ConnectionTrait>(
     conn: &C,
     query: &WithQuery,
-    touched: &mut Vec<(Uuid, DateTime<Utc>, Option<Uuid>)>,
+    touched: &mut Vec<(Uuid, DateTime<Utc>)>,
     changed: &mut crate::common::SlotTally,
 ) -> Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr> {
     let rows = conn.query_all_raw(build(query.clone())).await?;
@@ -2827,7 +2733,7 @@ async fn write_and_collect<C: ConnectionTrait>(
         let moved = MovedReading::from_query_result(row, "")?;
         tally_moved(changed, &moved);
         if let Some(site_id) = moved.site_id {
-            touched.push((site_id, moved.time.with_timezone(&Utc), moved.parameter_id));
+            touched.push((site_id, moved.time.with_timezone(&Utc)));
         }
     }
     Ok(rows)

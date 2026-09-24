@@ -1269,9 +1269,8 @@ async fn collection_event_writes_refuse_a_site_outside_the_callers_grants() {
     };
 
     // Control: the sibling in the same router group already refuses the other project's site.
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": scene.site_b.as_str(),
             "readings": [{

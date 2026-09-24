@@ -28,9 +28,8 @@ async fn a_replicate_row_names_the_sample_the_instant_row_carries() {
     let site = crate::common::SITE1_ID;
     let parameter = crate::common::GLOBAL_PARAM_TURB_ID;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": site,
             "readings": [
@@ -106,9 +105,8 @@ async fn a_lone_measurement_has_no_replicate_rows() {
     let app = crate::common::build_test_app(db.clone());
     let site = crate::common::SITE1_ID;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": site,
             "readings": [{
@@ -156,9 +154,8 @@ async fn an_operator_authored_code_does_not_shift_the_columns() {
     )
     .await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": site,
             "readings": [

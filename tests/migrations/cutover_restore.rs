@@ -523,3 +523,71 @@ async fn a_sample_keeps_only_the_statistics_its_carried_readings_compute_to() {
         "the run names the sample it removed: {refused}"
     );
 }
+
+/// A reading written by batch ingest, on the `api` stream keyed by the dump's own site and
+/// parameter ids.
+const API_ENTRY: &str = r"
+INSERT INTO data_streams (source_system, source_key, site_parameter_id, sensor_id)
+     SELECT 'api', s.id::text || ':' || p.id::text, sp.id, n.id
+       FROM sites s, parameters p, site_parameters sp, sensors n
+      WHERE s.name = 'Martigny' AND p.code = 'doc' AND sp.name = 'Martigny DOC'
+        AND n.serial_number = 'SN-1';
+INSERT INTO readings (stream_id, time, replicate_index, site_id, parameter_id, raw_value,
+                      measurement_type, sensor_id)
+     SELECT d.id, '2024-09-01T09:00:00Z', 0, s.id, p.id, 7.5, 'spot', n.id
+       FROM data_streams d, sites s, parameters p, sensors n
+      WHERE d.source_system = 'api' AND s.name = 'Martigny' AND p.code = 'doc'
+        AND n.serial_number = 'SN-1';
+";
+
+/// Scenario: the dump holds readings on an `api` stream, whose key embeds the dump's uuids, and
+/// the rebuilt database has the same slot under new ids and no `api` stream for it yet (B644).
+///
+/// Expected behaviour: the reading arrives on the rebuilt database's own `api` stream for the
+/// slot, keyed by its ids, and nothing is refused.
+#[tokio::test]
+#[serial]
+async fn a_reading_on_an_api_stream_arrives_on_the_rebuilt_slot_s_api_stream() {
+    dotenvy::dotenv().ok();
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+    let pid = std::process::id();
+    let (source_name, target_name) = (
+        format!("river_cutover_api_src_{pid}"),
+        format!("river_cutover_api_dst_{pid}"),
+    );
+
+    let server = scratch::server(&base).await;
+    let source = build(&base, &server, &source_name).await;
+    let target = build(&base, &server, &target_name).await;
+    source
+        .execute_unprepared(API_ENTRY)
+        .await
+        .expect("the dump");
+
+    let report = river_db::restore::restore(&source, &target)
+        .await
+        .expect("the cutover runs");
+    let arrived = rows(
+        &target,
+        "SELECT d.source_key || ' ' || r.raw_value::text AS row
+           FROM readings r JOIN data_streams d ON d.id = r.stream_id
+          WHERE d.source_system = 'api'",
+    )
+    .await;
+    let slot = rows(
+        &target,
+        "SELECT s.id::text || ':' || p.id::text AS row FROM sites s, parameters p
+          WHERE s.name = 'Martigny' AND p.code = 'doc'",
+    )
+    .await;
+    let refused = report.refused.join(", ");
+
+    source.close().await.expect("close the source");
+    target.close().await.expect("close the target");
+    for name in [&source_name, &target_name] {
+        scratch::discard(&server, name).await;
+    }
+
+    assert!(refused.is_empty(), "refused: {refused}");
+    assert_eq!(arrived, vec![format!("{} 7.5", slot[0])]);
+}

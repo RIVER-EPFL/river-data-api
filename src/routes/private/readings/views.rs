@@ -2041,16 +2041,28 @@ pub async fn insert_grab_samples(
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<GrabSampleRequest>,
 ) -> AppResult<Json<GrabSampleResponse>> {
+    save_grab_samples(&state, auth, &scope, payload, GrabOrigin::Typed).await
+}
+
+/// Store a grab save. `origin` is what vouches for its values: the seasonal check a typed save
+/// names, or the chain, whose values are computed. It is never read from a request.
+pub async fn save_grab_samples(
+    state: &AppState,
+    auth: crate::common::middleware::AuthContext,
+    scope: &AccessScope,
+    payload: GrabSampleRequest,
+    origin: GrabOrigin,
+) -> AppResult<Json<GrabSampleResponse>> {
     let db = &state.db;
     let readings = &payload.readings;
     require_grab_readings(readings)?;
-    enforce_project_scope_for_sites(db, &scope, &[payload.site_id]).await?;
+    enforce_project_scope_for_sites(db, scope, &[payload.site_id]).await?;
     admit_grab_readings(readings)?;
     let site = find_grab_site(db, payload.site_id).await?;
     let slots = load_grab_slots(db, site.id, readings).await?;
     slots.require_configured(&site, readings)?;
     refuse_hand_values_over_calculations(db, payload.tool_run_id, site.id, readings).await?;
-    require_checked_values(db, payload.check_id, site.id, readings).await?;
+    require_checked_values(db, &payload, origin).await?;
     let indices = assign_replicate_indices(readings)?;
     let actor = label(&auth);
     let provenance =
@@ -2104,12 +2116,12 @@ pub async fn insert_grab_samples(
     };
     let (written, tail) = crate::common::bulk_write::guarded(db, async |txn| {
         let written = write.run(txn).await?;
-        let tail = write.tail(txn, &written).await?;
+        let tail = write.tail(&written);
         crate::routes::private::readings::service::queue(txn, &tail.0, &tail.1).await?;
         Ok((written, tail))
     })
     .await?;
-    crate::routes::private::readings::service::run(&state, &tail.0, &tail.1, &actor).await?;
+    crate::routes::private::readings::service::run(state, &tail.0, &tail.1, &actor).await?;
     let GrabWritten {
         inserted,
         replaced,

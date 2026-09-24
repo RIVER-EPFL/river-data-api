@@ -128,8 +128,8 @@ pub async fn declare_slot_decimal_places<C: sea_orm::ConnectionTrait>(
 /// Upserts on (source_system="api", source_key="{site_id}:{parameter_id}").
 /// The slot a (site, parameter) pair names, or `None` when the parameter is not assigned to the
 /// site. It is the one place a reading's attribution comes from.
-pub async fn site_parameter_of(
-    db: &sea_orm::DatabaseConnection,
+pub async fn site_parameter_of<C: sea_orm::ConnectionTrait>(
+    db: &C,
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> Result<Option<Uuid>, AppError> {
@@ -141,8 +141,8 @@ pub async fn site_parameter_of(
         .map(|row| row.id))
 }
 
-pub async fn get_or_create_api_stream(
-    db: &sea_orm::DatabaseConnection,
+pub async fn get_or_create_api_stream<C: sea_orm::ConnectionTrait>(
+    db: &C,
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> Result<Uuid, AppError> {

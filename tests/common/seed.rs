@@ -618,6 +618,14 @@ pub async fn seed_formula_calculation(db: &DatabaseConnection, name: &str) -> Uu
     seed_labelled_formula_calculation(db, name, name).await
 }
 
+/// Commit a calculation authored through its CRUD routes: mint and activate a version from its
+/// rows, as a Commit does (Q256), so the stream pass has a body to compute from.
+pub async fn commit_calculation(db: &DatabaseConnection, calculation: Uuid) {
+    river_db::routes::private::tools::service::mint_formula_version(db, calculation, Some("test"))
+        .await
+        .expect("commit the calculation");
+}
+
 /// The same calculation with a label of its own, for the tests that assert on what a person reads
 /// rather than on the machine name.
 pub async fn seed_labelled_formula_calculation(

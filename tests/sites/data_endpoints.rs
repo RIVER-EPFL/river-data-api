@@ -695,9 +695,8 @@ async fn a_replicate_export_dates_every_value_to_its_own_instant() {
     .await;
     assert_eq!(status, 200, "seed continuous: {body}");
 
-    let (status, body) = crate::common::post_json_parse_with_token(
+    let (status, body) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": site,
             "readings": [

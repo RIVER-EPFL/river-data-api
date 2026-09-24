@@ -401,9 +401,8 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
     .await;
 
     let grab_time = "2025-06-05T02:00:00Z";
-    let (status, grab) = crate::common::post_json_parse_with_token(
+    let (status, grab) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site,
             "label": "rd046",

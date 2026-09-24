@@ -74,9 +74,8 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
     }
 
     let grab_time = "2025-06-01T00:35:00Z";
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site,
             "readings": [

@@ -2,9 +2,9 @@
 //!
 //! Scenario: a member enters a value that is an outlier for the season. Check screens it against
 //! the site's multi-year distribution (entry month ±2 across all years, replicates pooled,
-//! min/Q10/Q90/max) and answers with an advisory warning and the distribution payload. The save
-//! proceeds (the warning gates nothing by force), but it is held to the check it names: values
-//! edited after the check are refused until re-checked. Authorization follows the documented
+//! min/Q10/Q90/max) and answers with an advisory warning and the distribution payload. Every save
+//! names a check, and is held to it: values edited after the check are refused until re-checked.
+//! The warning itself gates nothing, so a checked outlier saves (Q262). Authorization follows the documented
 //! layers: an intern may check and may enter a field measurement, which lands unverified, but may
 //! not replace a stored one (Q21, M44).
 //!
@@ -56,9 +56,8 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
             .iter()
             .map(|v| json!({ "parameter_id": parameter_id, "value": v, "time": at }))
             .collect();
-        let (status, body) = crate::common::post_json_with_token(
+        let (status, body) = crate::common::post_checked_grab(
             &app,
-            "/api/grab_samples",
             &json!({ "site_id": track.site_id, "readings": readings }),
             &river,
         )
@@ -98,14 +97,16 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     });
 
     // An intern enters a measurement of their own, at their own instant, and it lands unverified
-    // (Q21, M44). A value inside the season's range needs no check to name.
+    // (Q21, M44). A value inside the season's range still names the check that screened it.
     let intern_entry = json!({
         "site_id": track.site_id,
         "readings": [{ "parameter_id": parameter_id, "value": 12.0, "time": "2025-06-20T10:30:00Z" }],
     });
-    let (status, entered) =
+    let (status, unchecked) =
         crate::common::post_json_with_token(&app, "/api/grab_samples", &intern_entry, &intern)
             .await;
+    assert_eq!(status, 400, "an unchecked entry is refused: {unchecked}");
+    let (status, entered) = crate::common::post_checked_grab(&app, &intern_entry, &intern).await;
     assert_eq!(status, 200, "an intern enters a measurement: {entered}");
     assert_eq!(
         e2e::count(
@@ -125,8 +126,7 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     let mut rewrite = intern_entry.clone();
     rewrite["mode"] = json!("replace");
     rewrite["readings"][0]["value"] = json!(12.5);
-    let (status, refused) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &rewrite, &intern).await;
+    let (status, refused) = crate::common::post_checked_grab(&app, &rewrite, &intern).await;
     assert_eq!(
         status, 403,
         "an intern's entry cannot replace stored values: {refused}"
@@ -141,9 +141,7 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
         { "parameter_id": parameter_id, "value": 12.0, "time": "2025-06-20T10:30:00Z" },
         { "parameter_id": parameter_id, "value": 13.5, "time": "2025-06-20T10:30:00Z" },
     ]);
-    let (status, added) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &second_repeat, &intern)
-            .await;
+    let (status, added) = crate::common::post_checked_grab(&app, &second_repeat, &intern).await;
     assert_eq!(status, 200, "an intern enters a second repeat: {added}");
     assert_eq!(
         e2e::count(
@@ -163,9 +161,8 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     // stored repeat travels with the grid's post at its own number and stays verified, and a
     // reject of the entry withdraws only what the intern typed.
     let verified_at = "2025-06-20T11:30:00Z";
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "readings": [{ "parameter_id": parameter_id, "value": 101.0, "time": verified_at }],
@@ -174,9 +171,8 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     )
     .await;
     assert_eq!(status, 200, "a member stores a verified repeat: {body}");
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "mode": "replace",

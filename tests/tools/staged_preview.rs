@@ -192,9 +192,8 @@ async fn save_family(app: &axum::Router, token: &str, parameter_id: &str, values
             })
         })
         .collect();
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "mode": "replace", "readings": readings }),
         token,
     )
@@ -681,9 +680,8 @@ async fn a_staged_cell_is_corrected_by_the_instrument_and_the_chosen_curve() {
     );
 
     // The same cell saved, corrected by the same two curves on the way in.
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::post_checked_grab(
         &v.app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID, "mode": "replace",
             "readings": [{

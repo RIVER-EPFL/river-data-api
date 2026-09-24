@@ -179,7 +179,6 @@ fn resolve_one(
     ConsumedRef {
         variable: input.variable.clone(),
         kind: input.kind.clone(),
-        alignment: input.alignment.clone(),
         subject: input.subject.clone(),
         property: input.property.clone(),
         revision: input.revision,
@@ -681,7 +680,7 @@ pub async fn computed_at<C: ConnectionTrait>(
         .filter(|r| r.unverified)
         .map(|r| (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index))
         .collect();
-    // An input held from an earlier visit is not among this instant's rows.
+    // An input read at another instant is not among this instant's rows.
     let elsewhere: HashSet<ReadingKey> = outputs
         .values()
         .flatten()

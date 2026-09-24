@@ -4366,10 +4366,6 @@
       "ConsumedInput": {
         "description": "One input a calculation consumed, captured when it was read (Q215): what it was bound to and\nthe exact revision of every row behind it, so a later reader can say whether the source has\nmoved since. `kind` is `reading` (one row), `mean` (the sample statistic over `members`),\n`replicates` (a family, one member per index, a gap as a member with no value), `site` (a\ncolumn of the site row), `constant`, `curve` (a catalog curve, or entered coefficients with no\nsubject), `computed` (the number a step of the same set produced, under the step's own code)\nor `step` (a formula of the pinned set). An entity input names its `change_audit` subject and\nthe newest `seq` for it.",
         "properties": {
-          "alignment": {
-            "description": "How the reading it names was reached (Q230): absent where it was read at the instant the\nrun computed, `hold` where it is the last value measured at or before it, which a\ncalculation on a stream does for an input the lab measures at a visit. Without it a held\nvalue reads as a mis-stamped one, and a replay cannot tell which rule bound it.",
-            "type": "string"
-          },
           "kind": {
             "type": "string"
           },
@@ -4509,10 +4505,6 @@
       "ConsumedRef": {
         "description": "One input of the calculation that made this record, as it was consumed and as its source\nstands now (Q215). `kind`, `subject` and `property` are the captured binding.",
         "properties": {
-          "alignment": {
-            "description": "How the reading it names was reached (Q230), as the capture recorded it: absent where it\nwas read at the instant computed, `hold` where it is the last value measured at or before\nit. Without it a held member reads as one stamped at the wrong instant.",
-            "type": "string"
-          },
           "current_revision": {
             "format": "int64",
             "type": [
@@ -6076,10 +6068,6 @@
       },
       "DerivedParameterSource": {
         "properties": {
-          "alignment": {
-            "description": "How the binder reaches a reading for this variable (Q230): `exact` at the instant being\ncomputed, `hold` for the last value measured at or before it, which is what a\nvisit-measured input read by a calculation on a stream needs. DB CHECK over the two.",
-            "type": "string"
-          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -6120,19 +6108,12 @@
           "parameter_id",
           "site_property",
           "variable_name",
-          "alignment",
           "created_at"
         ],
         "type": "object"
       },
       "DerivedParameterSourceCreate": {
         "properties": {
-          "alignment": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "derived_definition_id": {
             "format": "uuid",
             "type": "string"
@@ -6162,10 +6143,6 @@
       },
       "DerivedParameterSourceList": {
         "properties": {
-          "alignment": {
-            "description": "How the binder reaches a reading for this variable (Q230): `exact` at the instant being\ncomputed, `hold` for the last value measured at or before it, which is what a\nvisit-measured input read by a calculation on a stream needs. DB CHECK over the two.",
-            "type": "string"
-          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -6206,17 +6183,12 @@
           "parameter_id",
           "site_property",
           "variable_name",
-          "alignment",
           "created_at"
         ],
         "type": "object"
       },
       "DerivedParameterSourceResponse": {
         "properties": {
-          "alignment": {
-            "description": "How the binder reaches a reading for this variable (Q230): `exact` at the instant being\ncomputed, `hold` for the last value measured at or before it, which is what a\nvisit-measured input read by a calculation on a stream needs. DB CHECK over the two.",
-            "type": "string"
-          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -6257,19 +6229,12 @@
           "parameter_id",
           "site_property",
           "variable_name",
-          "alignment",
           "created_at"
         ],
         "type": "object"
       },
       "DerivedParameterSourceUpdate": {
         "properties": {
-          "alignment": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "derived_definition_id": {
             "format": "uuid",
             "type": [
@@ -7877,7 +7842,7 @@
         "additionalProperties": false,
         "properties": {
           "check_id": {
-            "description": "A `seasonal_checks` row (from `/readings/seasonal_check`) covering this save's values.\nWhen present, every reading's (parameter, value) must have been screened by that check:\nthe portal's \"any edit resets Check\", enforced server-side. The check itself is advisory;\nnaming a check that does not cover the values is refused.",
+            "description": "The `seasonal_checks` row (from `/readings/seasonal_check`) that screened this save's\nvalues, required on every save that is not a dry run. Every reading's (parameter, value)\nmust have been screened by that check: the portal's \"any edit resets Check\", enforced\nserver-side. A warning the check reported does not block the save; a check that does not\ncover the values does.",
             "format": "uuid",
             "type": [
               "string",
@@ -9691,6 +9656,10 @@
             "format": "uuid",
             "type": "string"
           },
+          "spot": {
+            "description": "A grab value (a spot reading), whose correction names a seasonal check (Q262).",
+            "type": "boolean"
+          },
           "stream_id": {
             "format": "uuid",
             "type": "string"
@@ -9710,6 +9679,7 @@
           "time",
           "replicate_index",
           "raw_value",
+          "spot",
           "provenance",
           "options"
         ],
@@ -10435,10 +10405,6 @@
         "additionalProperties": false,
         "description": "A same-event parameter read: when the request does not carry `param`, its value is resolved\nfrom the collection event's stored readings (the served spot value: the sample mean, else the\nlowest unflagged replicate). This is the portal's cross-tool prefill (pCO2 pulling field\ntemperature, DOM pulling the DOC average) as a declaration instead of R code.",
         "properties": {
-          "alignment": {
-            "description": "How the value is reached (Q230): `exact` at the instant being computed, `hold` for the\nlast value measured at or before it. Absent is `exact`, which is what every manifest\nwritten before this meant.",
-            "type": "string"
-          },
           "param": {
             "description": "The manifest param this fills.",
             "type": "string"
@@ -32984,7 +32950,7 @@
     },
     "/api/derived_parameter_sources": {
       "get": {
-        "description": "Retrieves all derived_parameter_sources.\n\nThis resource manages derived_parameter_source items\n\nAdditional sortable columns: .\n\nAdditional filterable columns: \n- derived_definition_id\n- parameter_id\n- site_property\n- alignment.",
+        "description": "Retrieves all derived_parameter_sources.\n\nThis resource manages derived_parameter_source items\n\nAdditional sortable columns: .\n\nAdditional filterable columns: \n- derived_definition_id\n- parameter_id\n- site_property.",
         "operationId": "get_all_derived_parameter_sources",
         "parameters": [
           {

@@ -117,9 +117,7 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
             if replace {
                 body["mode"] = json!("replace");
             }
-            let (status, resp) =
-                crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &body, &river)
-                    .await;
+            let (status, resp) = crate::common::post_checked_grab_parse(&app, &body, &river).await;
             assert_eq!(status, 200, "save ReactA: {resp}");
             resp
         }
@@ -384,9 +382,8 @@ async fn detach_edit_and_return_on_an_output_slot() {
     let river = kc::get_keycloak_jwt("river1", "river1").await;
 
     // Seed A = 10 at the visit: the save fires B = 15.
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": site_id, "readings": [{ "parameter_id": pa, "value": 10.0, "time": VISIT }] }),
         &river,
     )
@@ -407,9 +404,8 @@ async fn detach_edit_and_return_on_an_output_slot() {
     assert_eq!(body["owner"], "manual");
 
     // The admin corrects B to 99: a value_correction decision, the tool's value is gone.
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site_id,
             "mode": "replace",
@@ -422,9 +418,8 @@ async fn detach_edit_and_return_on_an_output_slot() {
     assert_eq!(served(&db, &site_id, &pb).await, Some(99.0));
 
     // A correction to the input at the visit leaves the override standing.
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site_id,
             "mode": "replace",

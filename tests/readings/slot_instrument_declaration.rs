@@ -63,9 +63,8 @@ async fn one_curve_stamps_its_own_rows_and_the_slot_declares_the_rest() {
     )
     .await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -127,9 +126,8 @@ async fn a_curve_fitted_on_another_instrument_is_refused_against_the_declaration
     )
     .await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -292,9 +290,8 @@ async fn a_grab_cannot_name_a_bookkeeping_row_or_a_retired_instrument() {
         (LAB_INSTRUMENT, "entry_channel"),
         (SLOT_INSTRUMENT, "retired"),
     ] {
-        let (status, body) = crate::common::post_json_with_token(
+        let (status, body) = crate::common::post_checked_grab(
             &app,
-            "/api/grab_samples",
             &serde_json::json!({
                 "site_id": crate::common::SITE1_ID,
                 "readings": [

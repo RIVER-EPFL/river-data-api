@@ -54,7 +54,7 @@ fn grab(values: &[f64], mode: Option<&str>) -> serde_json::Value {
 }
 
 async fn save(fx: &Fixture, body: &serde_json::Value) -> (u16, serde_json::Value) {
-    crate::common::post_json_parse_with_token(&fx.app, "/api/grab_samples", body, &fx.token).await
+    crate::common::post_checked_grab_parse(&fx.app, body, &fx.token).await
 }
 
 fn grab_rows_where(extra: &str) -> String {

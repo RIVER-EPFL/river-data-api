@@ -595,8 +595,7 @@ async fn a_grab_replace_records_a_value_correction_only_where_the_value_moved() 
             if replace {
                 body["mode"] = serde_json::json!("replace");
             }
-            let (status, resp) =
-                crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &token).await;
+            let (status, resp) = crate::common::post_checked_grab(&app, &body, &token).await;
             assert_eq!(status, 200, "{resp}");
         }
     };
@@ -653,9 +652,7 @@ async fn a_grab_replace_records_its_decisions_as_one_set_the_save_rolls_back() {
             if replace {
                 body["mode"] = serde_json::json!("replace");
             }
-            let (status, resp) =
-                crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &body, &token)
-                    .await;
+            let (status, resp) = crate::common::post_checked_grab_parse(&app, &body, &token).await;
             assert_eq!(status, 200, "{resp}");
             resp
         }

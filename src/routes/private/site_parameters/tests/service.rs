@@ -179,36 +179,6 @@ fn test_applied_cadence_follows_the_inputs() {
     assert_eq!(super::applied_cadence(&[]), "low");
 }
 
-/// Scenario: a calculation reads the oxygen stream at the instant and a lab alkalinity held from
-/// the last visit (Q230). The site declares the first high and the second low.
-///
-/// Expected behaviour: the arm the outputs run on is decided over the inputs read at the instant
-/// alone, so the set publishes on the stream. Counting the held one would put it wholly on the
-/// visit arm, which is the case the hold exists for.
-#[test]
-fn test_a_held_input_does_not_decide_the_arm() {
-    let oxygen = (Uuid::from_u128(1), "Dissolved_O2".to_string());
-    let alkalinity = (Uuid::from_u128(2), "Alkalinity".to_string());
-    let inputs = [oxygen.clone(), alkalinity.clone()];
-
-    let deciding = super::cadence_deciding(&inputs, &["alkalinity".to_string()]);
-    assert_eq!(
-        deciding,
-        vec![&oxygen],
-        "the code matches whatever its case"
-    );
-
-    assert_eq!(super::cadence_deciding(&inputs, &[]).len(), 2);
-    assert!(
-        super::cadence_deciding(
-            &inputs,
-            &["dissolved_o2".to_string(), "alkalinity".to_string()]
-        )
-        .is_empty(),
-        "a set holding everything it reads decides nothing, and takes the visit arm"
-    );
-}
-
 fn member(id: Uuid, code: &str) -> super::GroupMember {
     (id, code.to_string(), code.to_string())
 }
@@ -253,4 +223,35 @@ fn test_another_sites_assignment_does_not_suppress_this_one() {
         assignment_dedupe_key(calculation, martigny),
         assignment_dedupe_key(Uuid::from_u128(11), martigny),
     );
+}
+
+fn read(code: &str, cadence: Option<&str>) -> (String, Option<String>) {
+    (code.to_string(), cadence.map(str::to_string))
+}
+
+/// Expected behaviour: one measured input on the stream is a stream calculation (Q252).
+#[test]
+fn test_stream_refusal_one_stream_input_runs() {
+    assert_eq!(
+        super::stream_refusal(&[read("Vaisala_CO2", Some("high"))]),
+        None
+    );
+    assert_eq!(super::stream_refusal(&[]), None);
+}
+
+#[test]
+fn test_stream_refusal_names_a_second_measured_input() {
+    let refusal = super::stream_refusal(&[
+        read("Vaisala_DO", Some("high")),
+        read("Vaisala_Temp", Some("high")),
+    ])
+    .expect("refused");
+    assert!(refusal.contains("Vaisala_DO, Vaisala_Temp"), "{refusal}");
+}
+
+#[test]
+fn test_stream_refusal_names_a_visit_only_input() {
+    let refusal = super::stream_refusal(&[read("Alkalinity", Some("low"))]).expect("refused");
+    assert!(refusal.contains("Alkalinity"), "{refusal}");
+    assert!(super::stream_refusal(&[read("Alkalinity", None)]).is_some());
 }

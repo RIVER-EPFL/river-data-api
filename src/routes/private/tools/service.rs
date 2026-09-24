@@ -423,9 +423,8 @@ pub async fn load_formulas<C: ConnectionTrait>(
     Ok(formulas)
 }
 
-/// A formula's parameter sources, its site sources, and the variables among the first that are
-/// held rather than read at the instant (Q230).
-type StepSources = (Vec<(String, String)>, Vec<(String, String)>, Vec<String>);
+/// A formula's parameter sources and its site sources.
+type StepSources = (Vec<(String, String)>, Vec<(String, String)>);
 
 /// The sources of each given formula, keyed by formula id, each list sorted by variable.
 async fn formula_sources<C: ConnectionTrait>(
@@ -442,9 +441,6 @@ async fn formula_sources<C: ConnectionTrait>(
     let mut by_formula: HashMap<Uuid, StepSources> = HashMap::new();
     for (row, parameter) in sources {
         let entry = by_formula.entry(row.derived_definition_id).or_default();
-        if row.alignment == derived::HOLD {
-            entry.2.push(row.variable_name.clone());
-        }
         if let Some(parameter) = parameter {
             entry.0.push((row.variable_name.clone(), parameter.code));
         }
@@ -455,7 +451,6 @@ async fn formula_sources<C: ConnectionTrait>(
     for pairs in by_formula.values_mut() {
         pairs.0.sort();
         pairs.1.sort();
-        pairs.2.sort();
     }
     Ok(by_formula)
 }
@@ -466,7 +461,7 @@ fn pinned_formula(
     sources: Option<&StepSources>,
     output_parameter_code: Option<String>,
 ) -> PinnedFormula {
-    let (sources, site_sources, held) = sources.cloned().unwrap_or_default();
+    let (sources, site_sources) = sources.cloned().unwrap_or_default();
     PinnedFormula {
         code: row.code.clone(),
         label: row.name.clone(),
@@ -475,7 +470,6 @@ fn pinned_formula(
         ordinal: row.ordinal,
         output_parameter_code,
         sources,
-        held,
         site_sources,
         curve_slot: row.curve_slot.clone(),
         per_replicate: row.per_replicate.clone(),
@@ -647,15 +641,13 @@ pub async fn calculations_writing<C: ConnectionTrait>(
         .collect())
 }
 
-/// The formula set a calculation computes on a stream with, as its formulas stand.
+/// The formula set a calculation computes on a stream with: the body its active version pins,
+/// never the rows as they stand, so the version a stored value names is the arithmetic that made
+/// it (Q256). An edit reaches the stream once a version holding it is activated.
 ///
-/// The set is read from the formulas rather than from the active version: a stream pass recomputes
-/// continuously and an edit is meant to reach the values it already stored, which is what the
-/// janitor's drift sweep and `formula_transition` are for. The version a value names is its
-/// provenance, not the set that produced it.
-///
-/// `None` where the id names nothing, the calculation is switched off (Q174), or it is a script
-/// calculation: a script runs at a visit, where somebody chose its inputs.
+/// `None` where the id names nothing, the calculation is switched off (Q174), it is a script
+/// calculation (a script runs at a visit, where somebody chose its inputs), or no version is
+/// active: a set nobody has saved computes nothing.
 pub async fn stream_calculation<C: ConnectionTrait>(
     db: &C,
     script_id: Uuid,
@@ -666,15 +658,17 @@ pub async fn stream_calculation<C: ConnectionTrait>(
     if !row.enabled || Engine::parse(&row.engine) != Some(Engine::Formula) {
         return Ok(None);
     }
-    let formulas: Vec<PinnedFormula> = load_formulas(db, &[script_id])
-        .await?
-        .into_iter()
-        .map(|(_, formula)| formula)
-        .collect();
+    let Some(version_id) = row.active_version_id else {
+        return Ok(None);
+    };
+    let Some(version) = version_entity::Entity::find_by_id(version_id).one(db).await? else {
+        return Ok(None);
+    };
+    let formulas = version_formulas(&row.name, Engine::Formula, &version.script)?;
     Ok(Some(StreamCalculation {
         id: script_id,
         name: row.name,
-        active_version_id: row.active_version_id,
+        active_version_id: version_id,
         formulas,
     }))
 }
@@ -683,10 +677,8 @@ pub async fn stream_calculation<C: ConnectionTrait>(
 pub struct StreamCalculation {
     pub id: Uuid,
     pub name: String,
-    /// The version a value it stores names. `None` until the set has been saved through
-    /// `/tool_scripts/{id}/formulas`: one save is one version (Q186), so a calculation nobody has
-    /// saved has no version to pin and its values say so rather than naming a made-up one.
-    pub active_version_id: Option<Uuid>,
+    /// The version a value it stores names, and whose body `formulas` is.
+    pub active_version_id: Uuid,
     pub formulas: Vec<PinnedFormula>,
 }
 
@@ -1053,7 +1045,6 @@ pub(crate) async fn resolve_constants(
         let subject = format!("constant:{}", constant.id);
         consumed.push(ConsumedInput {
             variable: constant.name.clone(),
-            alignment: None,
             kind: "constant".to_string(),
             revision: revisions.get(&subject).copied(),
             subject: Some(subject),
@@ -1185,7 +1176,6 @@ pub async fn resolve_site_inputs(
                 body.insert(s.target().to_string(), value.clone());
                 consumed.push(ConsumedInput {
                     variable: s.target().to_string(),
-                    alignment: None,
                     kind: "site".to_string(),
                     subject: Some(subject.clone()),
                     property: Some(s.property.clone()),
@@ -1520,7 +1510,6 @@ pub async fn resolve_event_inputs(
         body.insert(e.param.clone(), serde_json::json!(value));
         consumed.push(ConsumedInput {
             variable: e.param.clone(),
-            alignment: None,
             kind: kind.to_string(),
             subject: None,
             property: None,
@@ -1587,7 +1576,6 @@ pub async fn resolve_replicate_inputs(
         body.insert(param.name.clone(), serde_json::Value::Array(values.clone()));
         consumed.push(ConsumedInput {
             variable: param.name.clone(),
-            alignment: None,
             kind: "replicates".to_string(),
             subject: None,
             property: None,
@@ -1835,7 +1823,6 @@ pub async fn resolve_run(
                 };
                 consumed.push(ConsumedInput {
                     variable: slot.name.clone(),
-                    alignment: None,
                     kind: "curve".to_string(),
                     subject,
                     property: None,
@@ -1874,7 +1861,6 @@ pub async fn resolve_run(
                 // Supplied by the caller in the catalog's place: a value with no source row.
                 consumed.push(ConsumedInput {
                     variable: name.clone(),
-                    alignment: None,
                     kind: "constant".to_string(),
                     subject: None,
                     property: None,
@@ -1946,7 +1932,6 @@ async fn formula_revisions(
                 .map(|id| format!("calculation_formula:{id}"));
             ConsumedInput {
                 variable: f.code.clone(),
-                alignment: None,
                 kind: "step".to_string(),
                 revision: subject.as_ref().and_then(|s| revisions.get(s).copied()),
                 subject,
@@ -2509,9 +2494,6 @@ pub(crate) async fn pin_draft_formulas(
             ordinal: draft.ordinal,
             output_parameter_code: (!draft.intermediate).then(|| code.to_string()),
             sources,
-            // A draft runs at one instant it is given, so there is nothing to hold and no stored
-            // source row to declare it on.
-            held: Vec::new(),
             site_sources: resolved.site_properties,
             curve_slot: draft.curve_slot.clone().filter(|c| !c.trim().is_empty()),
             per_replicate: draft.per_replicate.clone().filter(|p| !p.trim().is_empty()),
@@ -3121,13 +3103,7 @@ pub fn manifest_json(
                 "kind": "number",
                 "required": false,
             }));
-            let mut input = json!({ "param": variable, "parameter_code": parameter_code });
-            // Declared only when held: an input that says nothing is read at the instant, which
-            // is what every manifest written before Q230 meant.
-            if formula.held.iter().any(|v| v == variable) {
-                input["alignment"] = json!(derived::HOLD);
-            }
-            event_inputs.push(input);
+            event_inputs.push(json!({ "param": variable, "parameter_code": parameter_code }));
         }
         for (variable, property) in &formula.site_sources {
             if seen.contains(variable) {

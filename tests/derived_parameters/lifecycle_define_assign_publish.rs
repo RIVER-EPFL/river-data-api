@@ -30,6 +30,7 @@ async fn create_derived(
         (200..300).contains(&status),
         "create derived ({status}): {def}"
     );
+    crate::common::commit_calculation(db, calculation).await;
     let output = def["output_parameter_id"]
         .as_str()
         .expect("output_parameter_id")

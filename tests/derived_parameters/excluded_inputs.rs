@@ -82,6 +82,7 @@ async fn define_assign_recompute(
         (200..300).contains(&status),
         "create derived ({status}): {def_json}"
     );
+    crate::common::commit_calculation(db, calculation).await;
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .expect("output parameter id")

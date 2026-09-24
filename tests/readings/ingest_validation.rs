@@ -966,9 +966,8 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
     let day = "2025-06-14";
 
     let lone_grab_at = format!("{day}T06:00:00Z");
-    let (status, lone) = crate::common::post_json_parse_with_token(
+    let (status, lone) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "readings": [{
@@ -991,9 +990,8 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
     );
 
     let paired_grab_at = format!("{day}T14:00:00Z");
-    let (status, pair) = crate::common::post_json_parse_with_token(
+    let (status, pair) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "readings": tracks::grab_replicates(&parameter_id, &paired_grab_at, &[320.0, 322.0]),

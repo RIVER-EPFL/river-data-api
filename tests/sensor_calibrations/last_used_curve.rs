@@ -45,9 +45,8 @@ async fn create_curve(fx: &Fixture, sensor_id: Uuid, name: &str) -> Uuid {
 }
 
 async fn post_grab(fx: &Fixture, reading: serde_json::Value) {
-    let (status, body) = post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &fx.app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "readings": [reading] }),
         &fx.token,
     )

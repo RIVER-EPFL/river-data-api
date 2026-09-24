@@ -94,9 +94,8 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 async fn label_and_notes_land_on_every_replicate() {
     let (db, app, token) = setup().await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &payload(&[10.0, 12.0], Some("batch 7"), Some("filtered on site")),
         &token,
     )
@@ -111,8 +110,7 @@ async fn label_and_notes_land_on_every_replicate() {
 
     let mut repost = payload(&[10.0, 12.0], None, Some("corrected note"));
     repost["mode"] = serde_json::json!("replace");
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &repost, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &repost, &token).await;
     assert_eq!(status, 200, "replace re-post ({status}): {body}");
 
     let (label, notes, _, _) = reading_facts(&db).await.expect("the rewritten readings");
@@ -133,9 +131,8 @@ async fn label_and_notes_land_on_every_replicate() {
 async fn a_single_reading_keeps_its_note_without_a_sample() {
     let (db, app, token) = setup().await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &payload(&[42.0], None, Some("lone value with context")),
         &token,
     )

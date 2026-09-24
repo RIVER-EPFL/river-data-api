@@ -361,6 +361,56 @@ pub async fn post_screened_import(
     post_json_parse_with_token(app, "/api/readings/import_csv", &commit, token).await
 }
 
+/// Save grab values the way every client must: screen them with a seasonal check first and name
+/// it. A body that names a check or asks for a dry run is posted as it is, and so is one whose
+/// check is refused, so the save's own refusal is what the caller sees.
+pub async fn post_checked_grab(
+    app: &Router,
+    body: &serde_json::Value,
+    token: &str,
+) -> (u16, String) {
+    let mut body = body.clone();
+    let dry_run = body["dry_run"].as_bool().unwrap_or(false);
+    if body.get("check_id").is_none()
+        && !dry_run
+        && let Some(check_id) = grab_check(app, &body, token).await
+    {
+        body["check_id"] = serde_json::json!(check_id);
+    }
+    post_json_with_token(app, "/api/grab_samples", &body, token).await
+}
+
+/// [`post_checked_grab`] with the response parsed.
+pub async fn post_checked_grab_parse(
+    app: &Router,
+    body: &serde_json::Value,
+    token: &str,
+) -> (u16, serde_json::Value) {
+    let (status, text) = post_checked_grab(app, body, token).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!("Failed to parse JSON from /api/grab_samples: {e}\nBody: {text}")
+    });
+    (status, json)
+}
+
+/// The seasonal check covering a grab save's values, anchored at its first reading's instant.
+async fn grab_check(app: &Router, body: &serde_json::Value, token: &str) -> Option<String> {
+    let readings = body["readings"].as_array()?;
+    let time = readings.first()?.get("time")?.clone();
+    let values: Vec<serde_json::Value> = readings
+        .iter()
+        .map(|r| serde_json::json!({ "parameter_id": r["parameter_id"], "value": r["value"] }))
+        .collect();
+    let check = serde_json::json!({ "site_id": body["site_id"], "time": time, "values": values });
+    let (status, text) =
+        post_json_with_token(app, "/api/readings/seasonal_check", &check, token).await;
+    if status != 200 {
+        return None;
+    }
+    let resp: serde_json::Value = serde_json::from_str(&text).ok()?;
+    resp["check_id"].as_str().map(str::to_string)
+}
+
 /// Serve a router on a loopback port and return its base URL, for the tests that need a real
 /// HTTP client rather than `oneshot`: a mock upstream the app calls out to, and the sync driver,
 /// which reaches the API through `API_BASE_URL` and cannot be handed a `Router`.

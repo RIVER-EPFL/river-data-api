@@ -297,14 +297,13 @@ async fn applying_a_calculation_the_site_cannot_feed_is_refused_naming_the_missi
 }
 
 /// Scenario: the calculation reads the oxygen the site streams and a lab value it records at
-/// visits, the second declared held (Q230).
+/// visits.
 ///
-/// Expected behaviour: the output joins the stream arm. The arm is decided over the inputs read at
-/// the instant alone: a held source stands between visits whatever the stream does, so counting it
-/// would put the set wholly on the visit arm, which is the case the hold exists for.
+/// Expected behaviour: the output takes the visit arm. Every input decides the arm, since a source
+/// is read at the instant computed and the lab value exists only at visits (Q252).
 #[tokio::test]
 #[serial]
-async fn a_held_input_does_not_pull_the_output_onto_the_visit_arm() {
+async fn a_visit_input_puts_the_output_on_the_visit_arm() {
     let f = crate::common::seeded_app().await;
     let db = f.db.clone();
     let script_id = seed_calculation(&db).await;
@@ -315,7 +314,7 @@ async fn a_held_input_does_not_pull_the_output_onto_the_visit_arm() {
         &db,
         &format!(
             "INSERT INTO parameters (id, code, name, category) \
-             VALUES ('{lab}', 'Held_lab_value', 'Held lab value', 'measurement')"
+             VALUES ('{lab}', 'Lab_value', 'Lab value', 'measurement')"
         ),
     )
     .await;
@@ -324,13 +323,13 @@ async fn a_held_input_does_not_pull_the_output_onto_the_visit_arm() {
         &format!(
             "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
                                           is_active, entry_mode, cadence) \
-             VALUES (gen_random_uuid(), '{SITE1_ID}', '{lab}', 'Held lab value', '', true, \
+             VALUES (gen_random_uuid(), '{SITE1_ID}', '{lab}', 'Lab value', '', true, \
                      'manual', 'low')"
         ),
     )
     .await;
 
-    let (status, text) = add_formula(&f, &script_id, "Dissolved_O2 * Held_lab_value").await;
+    let (status, text) = add_formula(&f, &script_id, "Dissolved_O2 * Lab_value").await;
     assert!(
         (200..300).contains(&status),
         "add the formula ({status}): {text}"
@@ -339,7 +338,6 @@ async fn a_held_input_does_not_pull_the_output_onto_the_visit_arm() {
         .await
         .expect("the formula save minted the output parameter");
 
-    // Without the declaration the low slot decides, and the whole set falls to the visit arm.
     let (status, applied) = apply(&f, &script_id, false).await;
     assert_eq!(status, 200, "{applied}");
     assert_eq!(
@@ -347,36 +345,68 @@ async fn a_held_input_does_not_pull_the_output_onto_the_visit_arm() {
         "low",
         "read at the instant, the lab value is a visit slot and the set is the chain's"
     );
+}
 
-    // Declared held, the lab value says nothing about the arm, and the set publishes on the
-    // stream. The apply is idempotent, so the slot is cleared for it to mint again.
-    exec(
-        &db,
-        &format!(
-            "DELETE FROM site_parameters WHERE site_id = '{SITE1_ID}' \
-               AND parameter_id = '{output_id}'"
-        ),
-    )
-    .await;
-    exec(
-        &db,
-        &format!(
-            "UPDATE derived_parameter_sources SET alignment = 'hold' \
-                   WHERE parameter_id = '{lab}'"
-        ),
-    )
-    .await;
-    let (status, text) = add_formula(&f, &script_id, "Dissolved_O2 * Held_lab_value").await;
+/// Scenario: the calculation reads the oxygen and the temperature the site streams.
+///
+/// Expected behaviour: the apply is refused naming both. A stream calculation transforms one
+/// measured input at the same pulse (Q252), so two stream inputs have no instant to meet at.
+#[tokio::test]
+#[serial]
+async fn a_calculation_reading_two_stream_inputs_is_not_applied_on_the_stream() {
+    let f = crate::common::seeded_app().await;
+    let db = f.db.clone();
+    let script_id = seed_calculation(&db).await;
+
+    let (status, text) = add_formula(&f, &script_id, "Dissolved_O2 * DO_Temperature").await;
+    assert!((200..300).contains(&status), "({status}): {text}");
+    let output_id = parameter_id(&db, OUTPUT_CODE).await.expect("the output");
+
+    let (status, refused) = apply(&f, &script_id, false).await;
+    assert_eq!(status, 400, "{refused}");
+    let message = refused.to_string();
     assert!(
-        (200..300).contains(&status),
-        "the save pins a version carrying the declaration ({status}): {text}"
+        message.contains("Dissolved_O2") && message.contains("DO_Temperature"),
+        "{message}"
     );
+    assert_eq!(
+        slot(&db, &output_id).await,
+        None,
+        "a refused apply writes no slot"
+    );
+}
 
+/// Scenario: a calculation on the stream arm at a site gains a second input in a save.
+///
+/// Expected behaviour: the save is refused naming the site, and the version the stream runs stays
+/// the one it was.
+#[tokio::test]
+#[serial]
+async fn a_save_giving_a_stream_calculation_a_second_input_is_refused() {
+    let f = crate::common::seeded_app().await;
+    let db = f.db.clone();
+    let script_id = seed_calculation(&db).await;
+
+    let (status, text) = add_formula(&f, &script_id, "DO_Temperature * 2").await;
+    assert!((200..300).contains(&status), "({status}): {text}");
     let (status, applied) = apply(&f, &script_id, false).await;
     assert_eq!(status, 200, "{applied}");
+    let output_id = parameter_id(&db, OUTPUT_CODE).await.expect("the output");
+    assert_eq!(slot(&db, &output_id).await.expect("the slot").2, "high");
+
+    let (status, refused) = add_formula(&f, &script_id, "DO_Temperature * Dissolved_O2").await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused.contains("Dissolved_O2") && refused.contains("DO_Temperature"),
+        "{refused}"
+    );
+    let formula = crate::common::e2e::scalar(
+        &db,
+        &format!("SELECT formula FROM calculation_formulas WHERE code = '{OUTPUT_CODE}'"),
+    )
+    .await;
     assert_eq!(
-        slot(&db, &output_id).await.expect("the slot").2,
-        "high",
-        "the held value stands between visits, so the stream decides the arm: {applied}"
+        formula, "DO_Temperature * 2",
+        "the refused save wrote nothing"
     );
 }

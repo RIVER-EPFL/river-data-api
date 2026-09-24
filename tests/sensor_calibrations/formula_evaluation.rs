@@ -117,6 +117,7 @@ async fn test_derived_parameter_skips_infinity() {
         ),
     )
     .await;
+    crate::common::commit_calculation(&db, calculation).await;
 
     // The slot the calculation publishes here: computed rather than typed into, on the stream arm.
     crate::common::exec(

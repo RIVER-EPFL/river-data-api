@@ -19,9 +19,8 @@ async fn seed_visit(app: &axum::Router, token: &str, at: &str, values: &[f64]) {
         .iter()
         .map(|v| json!({ "parameter_id": GLOBAL_PARAM_DO_ID, "value": v, "time": at }))
         .collect();
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "readings": readings }),
         token,
     )
@@ -229,9 +228,8 @@ async fn seed_calculation(db: &DatabaseConnection, app: &axum::Router, token: &s
             .iter()
             .map(|v| json!({ "parameter_id": output_id, "value": v, "time": at }))
             .collect();
-        let (status, body) = crate::common::post_json_with_token(
+        let (status, body) = crate::common::post_checked_grab(
             app,
-            "/api/grab_samples",
             &json!({ "site_id": SITE1_ID, "readings": readings }),
             token,
         )

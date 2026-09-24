@@ -53,12 +53,12 @@ fn test_gap_scan_is_the_anti_join_over_active_tool_slots() {
     }
 }
 
-/// Expected behaviour: the gap scan looks for instants the same way (Q230), so the sweep that
-/// fills what a write missed does not mint a pulse at every visit a held source was measured at.
+/// Expected behaviour: the gap scan counts every source's instants, each read at the instant
+/// computed (Q252).
 #[test]
-fn test_the_gap_scan_counts_only_sources_read_at_the_instant() {
+fn test_the_gap_scan_reads_every_source_at_the_instant() {
     let sql = sql(None);
-    assert!(sql.contains(r#""dps"."alignment" = 'exact'"#), "{sql}");
+    assert!(!sql.contains("alignment"), "{sql}");
 }
 
 #[test]

@@ -66,8 +66,7 @@ async fn dry_run_returns_the_result_and_writes_nothing() {
             "time": GRAB_TIME,
         }],
     });
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &payload, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &payload, &token).await;
     assert_eq!(status, 200, "dry run ({status}): {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["dry_run"], true);
@@ -111,8 +110,7 @@ async fn dry_run_returns_the_result_and_writes_nothing() {
 
     let mut save = payload;
     save["dry_run"] = json!(false);
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &save, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &save, &token).await;
     assert_eq!(status, 200, "save ({status}): {body}");
     let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(saved["inserted"], 1);
@@ -163,9 +161,8 @@ async fn a_negative_intercept_reads_as_a_subtraction() {
     assert!((200..300).contains(&status), "curve create: {body}");
     let curve: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "dry_run": true,

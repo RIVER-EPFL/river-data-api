@@ -66,9 +66,8 @@ async fn grab_at(db: &DatabaseConnection, time: &str) -> StoredGrab {
 }
 
 async fn post_grab(fx: &Fixture, reading: serde_json::Value) -> (u16, String) {
-    post_json_with_token(
+    crate::common::post_checked_grab(
         &fx.app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "readings": [reading] }),
         &fx.token,
     )

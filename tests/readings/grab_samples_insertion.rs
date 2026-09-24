@@ -17,9 +17,8 @@ async fn test_insert_triplicate_grab_samples() {
     let (app, token, db) = setup().await;
 
     let time = "2025-06-15T10:00:00Z";
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -124,9 +123,8 @@ async fn test_insert_triplicate_grab_samples() {
 async fn test_single_grab_sample_mints_no_sample_row() {
     let (app, token, db) = setup().await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -172,9 +170,8 @@ async fn test_multi_parameter_grab_samples() {
     let (app, token, _db) = setup().await;
 
     let time = "2025-06-15T12:00:00Z";
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -204,9 +201,8 @@ async fn test_multi_parameter_grab_samples() {
 async fn test_grab_sample_creates_stream() {
     let (app, token, db) = setup().await;
 
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -246,9 +242,8 @@ async fn test_grab_sample_creates_stream() {
 async fn test_grab_sample_invalid_site() {
     let (app, token, _db) = setup().await;
 
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": "00000000-0000-4000-a000-999999999999",
             "readings": [
@@ -271,9 +266,8 @@ async fn test_grab_sample_invalid_parameter() {
     let (app, token, _db) = setup().await;
 
     // Site2 doesn't have DEPTH parameter
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE2_ID,
             "readings": [
@@ -295,9 +289,8 @@ async fn test_grab_sample_invalid_parameter() {
 async fn test_grab_sample_empty_readings() {
     let (app, token, _db) = setup().await;
 
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": []
@@ -326,9 +319,8 @@ async fn test_grab_samples_require_write_data() {
     .await;
     let app = crate::common::build_test_app(db);
 
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -375,9 +367,8 @@ async fn test_grab_applies_standard_curve_server_side() {
     .unwrap();
 
     let time = "2025-07-01T09:00:00Z";
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -423,9 +414,8 @@ async fn test_grab_applies_standard_curve_server_side() {
 #[serial]
 async fn test_grab_rejects_unknown_curve() {
     let (app, token, _db) = setup().await;
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -469,9 +459,8 @@ async fn test_grab_rejects_curve_without_an_instrument() {
     .await
     .unwrap();
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -523,9 +512,8 @@ async fn a_posted_value_is_stored_bit_for_bit() {
         })
         .collect();
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": readings,
@@ -607,9 +595,8 @@ async fn a_hand_entered_triplicate_carries_its_curve_into_the_statistics() {
             })
         })
         .collect();
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({ "site_id": crate::common::SITE1_ID, "readings": readings }),
         &token,
     )
@@ -702,9 +689,8 @@ async fn a_replace_from_a_stale_read_is_refused() {
     let time = "2025-08-04T09:00:00Z";
     let parameter_id = crate::common::GLOBAL_PARAM_TEMP_ID;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [
@@ -725,8 +711,7 @@ async fn a_replace_from_a_stale_read_is_refused() {
         ],
         "readings": [{ "parameter_id": parameter_id, "value": 11.5, "time": time }]
     });
-    let (status, refused) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &stale, &token).await;
+    let (status, refused) = crate::common::post_checked_grab(&app, &stale, &token).await;
     assert_eq!(
         status, 409,
         "the group grew since it was read, so the replace is refused: {refused}"
@@ -738,8 +723,7 @@ async fn a_replace_from_a_stale_read_is_refused() {
         { "parameter_id": parameter_id, "value": 11.5, "time": time },
         { "parameter_id": parameter_id, "value": 12.0, "time": time },
     ]);
-    let (status, written) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &fresh, &token).await;
+    let (status, written) = crate::common::post_checked_grab(&app, &fresh, &token).await;
     assert_eq!(
         status, 200,
         "a save that read the whole group writes: {written}"
@@ -764,9 +748,8 @@ async fn test_grab_save_author_is_the_caller() {
         b
     };
 
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &body(serde_json::json!({ "created_by": "someone else" })),
         &token,
     )
@@ -776,13 +759,8 @@ async fn test_grab_save_author_is_the_caller() {
         "a client-named author is refused ({status}): {text}"
     );
 
-    let (status, text) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &body(serde_json::json!({})),
-        &token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_checked_grab(&app, &body(serde_json::json!({})), &token).await;
     assert_eq!(status, 200, "insert should succeed: {text}");
 
     let row = db
@@ -837,9 +815,8 @@ async fn a_hand_value_over_a_calculated_parameter_is_refused() {
     }
 
     let time = "2025-06-15T10:00:00Z";
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [

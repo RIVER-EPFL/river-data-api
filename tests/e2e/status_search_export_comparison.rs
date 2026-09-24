@@ -103,9 +103,8 @@ async fn grabs_are_tagged_alongside_continuous_readings() {
     let grab_time = "2025-01-15T06:05:00Z"; // off the 10-min grid so it never collides with a sensor point
 
     // A grab sample with three replicates → one `samples` row (mean 9.2) + three 'spot' readings.
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": site1,
             "readings": [

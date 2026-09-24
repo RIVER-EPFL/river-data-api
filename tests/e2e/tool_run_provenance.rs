@@ -103,9 +103,8 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
             r
         })
         .collect();
-    let (status, entered) = crate::common::post_json_parse_with_token(
+    let (status, entered) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "tool_run_id": run_id,
@@ -148,9 +147,7 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
         "tool_run_id": run_id,
         "readings": replicates,
     });
-    let (status, saved) =
-        crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &save_body, &river)
-            .await;
+    let (status, saved) = crate::common::post_checked_grab_parse(&app, &save_body, &river).await;
     assert_eq!(status, 200, "the member saves ({status}): {saved}");
     assert_eq!(saved["inserted"], 3);
 
@@ -241,9 +238,8 @@ async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
     let doc_avg = tool["results"]["DOC_avg_ppb"].as_f64().expect("DOC avg");
 
     // A value the run did not produce.
-    let (status, resp) = crate::common::post_json_with_token(
+    let (status, resp) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "tool_run_id": run_id,
@@ -260,9 +256,8 @@ async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
     assert_eq!(status, 400, "an edited value is refused: {resp}");
 
     // The retired field: a client-authored blob is refused, not silently dropped.
-    let (status, resp) = crate::common::post_json_with_token(
+    let (status, resp) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "provenance": { "tool": "doc", "outputs": {} },
@@ -394,9 +389,8 @@ async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused()
     assert_eq!(tool["site_inputs"][0]["value"], 512.0);
 
     // The save carries the resolution into the blob's context.
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "tool_run_id": tool["run_id"],
@@ -518,8 +512,7 @@ async fn a_save_needs_the_site_to_carry_the_slot() {
         "readings": [{ "parameter_id": doc_param, "value": 120.0, "replicate_index": 0,
                         "time": "2025-06-15T13:00:00Z", "input": "DOC" }],
     });
-    let (status, refused) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &save, &river).await;
+    let (status, refused) = crate::common::post_checked_grab(&app, &save, &river).await;
     assert_eq!(
         status, 400,
         "a save may not mint the declaration it is checked against: {refused}"
@@ -551,8 +544,7 @@ async fn a_save_needs_the_site_to_carry_the_slot() {
     )
     .await;
 
-    let (status, saved) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &save, &river).await;
+    let (status, saved) = crate::common::post_checked_grab(&app, &save, &river).await;
     assert_eq!(
         status, 200,
         "the declared slot admits the same save: {saved}"
@@ -572,8 +564,7 @@ async fn a_save_needs_the_site_to_carry_the_slot() {
 
     let mut second = save.clone();
     second["mode"] = json!("replace");
-    let (status, saved) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &second, &river).await;
+    let (status, saved) = crate::common::post_checked_grab(&app, &second, &river).await;
     assert_eq!(status, 200, "{saved}");
     let slots = crate::common::e2e::count(
         &db,
@@ -693,9 +684,8 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
 
     let reading = |time: &str| json!([{ "parameter_id": echo_param, "value": 512.0, "time": time, "output": "ctx_echo" }]);
 
-    let (status, resp) = crate::common::post_json_with_token(
+    let (status, resp) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": other_site, "tool_run_id": run_id, "readings": reading(VISIT) }),
         &river,
     )
@@ -706,9 +696,8 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
         "the refusal names the site the run was calculated for: {resp}"
     );
 
-    let (status, resp) = crate::common::post_json_with_token(
+    let (status, resp) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "tool_run_id": run_id,
@@ -723,9 +712,8 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
         "the refusal names both instants: {resp}"
     );
 
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": track.site_id, "tool_run_id": run_id, "readings": reading(VISIT) }),
         &river,
     )
@@ -773,9 +761,8 @@ async fn an_aggregate_output_cannot_be_saved_as_a_measurement() {
     let doc_avg = tool["results"]["DOC_avg_ppb"].as_f64().expect("avg");
 
     for output in ["DOC_avg_ppb", "DOC_sd_ppb"] {
-        let (status, refused) = crate::common::post_json_with_token(
+        let (status, refused) = crate::common::post_checked_grab(
             &app,
-            "/api/grab_samples",
             &json!({
                 "site_id": track.site_id,
                 "tool_run_id": run_id,
@@ -798,9 +785,8 @@ async fn an_aggregate_output_cannot_be_saved_as_a_measurement() {
                      "replicate_index": i as i16, "input": "DOC" })
         })
         .collect();
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": track.site_id, "tool_run_id": run_id, "readings": readings }),
         &river,
     )

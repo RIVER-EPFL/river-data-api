@@ -32,10 +32,11 @@ use super::models::GroupMember;
 use super::service::CalculationMember;
 use super::service::MergeSiteParametersRequest;
 use super::service::MergeSiteParametersResponse;
+use super::service::applied_cadence;
 use super::service::partition_calculation;
 use super::service::partition_members;
 use super::service::slot_cadence;
-use super::service::{applied_cadence, cadence_deciding};
+use super::service::stream_refusal;
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::common::scope::Unowned;
@@ -285,13 +286,28 @@ pub async fn apply_calculation(
     }
 
     // The cadence the outputs take is read before the transaction opens: it is the site's
-    // declaration for the inputs it reads at the instant, which this call does not touch.
-    let deciding = cadence_deciding(&partition.inputs_present, &tool.manifest.held_codes());
-    let mut input_cadences = Vec::with_capacity(deciding.len());
-    for (parameter_id, _) in &deciding {
-        input_cadences.push(slot_cadence(&state.db, site_id, *parameter_id).await?);
+    // declaration for the inputs the calculation reads, which this call does not touch.
+    let mut input_cadences = Vec::with_capacity(partition.inputs_present.len());
+    for (parameter_id, code) in &partition.inputs_present {
+        input_cadences.push((
+            code.clone(),
+            slot_cadence(&state.db, site_id, *parameter_id).await?,
+        ));
     }
-    let cadence = applied_cadence(&input_cadences);
+    let cadence = applied_cadence(
+        &input_cadences
+            .iter()
+            .map(|(_, cadence)| cadence.clone())
+            .collect::<Vec<_>>(),
+    );
+    if cadence == "high"
+        && let Some(reason) = stream_refusal(&input_cadences)
+    {
+        return Err(AppError::BadRequest(format!(
+            "'{}' cannot run on the stream at {}: {reason}",
+            tool.name, site.name
+        )));
+    }
 
     // One transaction: a half-applied calculation is one whose chain writes some of its outputs
     // and mints the rest flagged for review, which is the state this action exists to prevent.

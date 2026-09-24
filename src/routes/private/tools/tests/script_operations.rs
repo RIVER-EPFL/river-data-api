@@ -123,7 +123,6 @@ mod activation_migration {
                 .iter()
                 .map(|v| ((*v).to_string(), "Source".to_string()))
                 .collect(),
-            held: Vec::new(),
             site_sources: Vec::new(),
             curve_slot: None,
             per_replicate: None,

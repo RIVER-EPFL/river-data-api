@@ -420,9 +420,8 @@ async fn a_grab_on_the_second_channel_carries_that_channels_deployment() {
     let (sensor, temp_deployment, cond_deployment, _cond_stream) =
         seed_two_channel_deployments(&db).await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
             "readings": [

@@ -1242,6 +1242,7 @@ pub async fn save_formula_set(
 
     // One version for the whole save, whatever it touched.
     let version_id = mint_formula_version(&txn, id, Some(&actor)).await?;
+    refuse_off_stream_version(&txn, version_id).await?;
 
     // A formula this save turned into a step stops publishing. Nothing is deleted, so the response
     // says what stays behind under each parameter and who still reads it.
@@ -1291,6 +1292,24 @@ pub async fn save_formula_set(
         given_up,
         taken_over: takeovers.into_iter().map(|t| t.code).collect(),
     }))
+}
+
+/// Refuse a minted version that breaks the stream rule where the calculation runs on the stream.
+async fn refuse_off_stream_version(
+    txn: &sea_orm::DatabaseTransaction,
+    version_id: Option<Uuid>,
+) -> AppResult<()> {
+    let Some(version_id) = version_id else {
+        return Ok(());
+    };
+    let Some(version) = super::models::version::Entity::find_by_id(version_id)
+        .one(txn)
+        .await?
+    else {
+        return Ok(());
+    };
+    let manifest = super::models::parse_manifest(&version.manifest).map_err(AppError::Internal)?;
+    crate::routes::private::site_parameters::service::refuse_off_stream_reads(txn, &manifest).await
 }
 
 /// What each version of the calculation has already produced, newest first. Requires

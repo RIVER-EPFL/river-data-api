@@ -96,9 +96,8 @@ async fn save_replicates(
             })
         })
         .collect();
-    let (status, body) = crate::common::post_json_parse_with_token(
+    let (status, body) = crate::common::post_checked_grab_parse(
         app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "readings": readings }),
         token,
     )
@@ -355,9 +354,8 @@ async fn a_gapped_replicate_set_saves_and_keeps_its_letters_only_when_indices_ar
         .iter()
         .map(|v| json!({ "parameter_id": GLOBAL_PARAM_DO_ID, "value": v, "time": OTHER_TIME }))
         .collect();
-    let (status, body) = crate::common::post_json_parse_with_token(
+    let (status, body) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "readings": readings }),
         &token,
     )
@@ -384,9 +382,8 @@ async fn a_mixed_or_duplicated_index_set_is_refused() {
     let (_db, app, token) = setup().await;
 
     let post = async |readings: serde_json::Value| {
-        crate::common::post_json_parse_with_token(
+        crate::common::post_checked_grab_parse(
             &app,
-            "/api/grab_samples",
             &json!({ "site_id": SITE1_ID, "readings": readings }),
             &token,
         )

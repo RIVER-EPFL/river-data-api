@@ -313,35 +313,6 @@ mod ownership {
     }
 }
 
-// Scenario: a save rewrites a definition's source rows, and one of its variables was declared held
-// rather than read at the instant (Q230).
-//
-// Expected behaviour: the alignment is a declaration about the input, not about the text of the
-// formula that reads it, so the variable keeps it across the rewrite and every other variable
-// takes `exact`.
-mod alignment {
-    use super::super::{EXACT, HOLD, alignment_of};
-
-    #[test]
-    fn test_a_variable_declared_held_keeps_it_across_a_rewrite() {
-        let held = vec!["alkalinity".to_string()];
-        assert_eq!(alignment_of(&held, "alkalinity"), HOLD);
-    }
-
-    #[test]
-    fn test_every_other_variable_is_read_at_the_instant() {
-        let held = vec!["alkalinity".to_string()];
-        assert_eq!(alignment_of(&held, "co2"), EXACT);
-        assert_eq!(alignment_of(&[], "alkalinity"), EXACT);
-    }
-
-    #[test]
-    fn test_the_match_is_the_whole_variable_name() {
-        let held = vec!["alkalinity".to_string()];
-        assert_eq!(alignment_of(&held, "alkalinity_avg"), EXACT);
-    }
-}
-
 mod formula_syntax {
     use super::super::validate_formula;
 

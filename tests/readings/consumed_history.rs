@@ -70,6 +70,7 @@ async fn computed_slot(formula: &str, constants: &[(&str, f64)]) -> Fixture {
     )
     .await;
     assert!((200..300).contains(&status), "create ({status}): {def}");
+    crate::common::commit_calculation(&f.db, calculation).await;
     let output = def["output_parameter_id"]
         .as_str()
         .expect("output")
@@ -446,6 +447,7 @@ async fn an_edited_step_reads_as_changed_and_an_unmoved_value_keeps_its_record()
     )
     .await;
     assert!((200..300).contains(&status), "edit ({status}): {body}");
+    crate::common::commit_calculation(&f.db, f.calculation.parse().expect("a uuid")).await;
     let uri = format!(
         "/api/actions/derived_parameters/{}/recompute",
         f.calculation

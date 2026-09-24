@@ -21,9 +21,8 @@ async fn seed_visit(app: &axum::Router, token: &str, at: &str, values: &[f64]) {
         .iter()
         .map(|v| json!({ "parameter_id": GLOBAL_PARAM_DO_ID, "value": v, "time": at }))
         .collect();
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "readings": readings }),
         token,
     )
@@ -278,4 +277,47 @@ async fn the_response_describes_its_method() {
             .unwrap()
             .contains("highest")
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_save_naming_no_check_is_refused() {
+    let (_db, app, token) = setup().await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 10.2, "time": "2025-06-15T10:00:00Z" }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("/readings/seasonal_check"), "{body}");
+}
+
+/// A warning is for the person saving to read, never a refusal: a value beyond the recorded range
+/// saves under the check that reported it.
+#[tokio::test]
+#[serial]
+async fn a_value_beyond_the_range_saves_under_its_check() {
+    let (_db, app, token) = setup().await;
+    seed_history(&app, &token).await;
+
+    let (status, resp) = check(&app, &token, "2025-06-15T10:00:00Z", 55.0).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["warnings"], 1, "{resp}");
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "check_id": resp["check_id"],
+            "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 55.0, "time": "2025-06-15T10:00:00Z" }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
 }

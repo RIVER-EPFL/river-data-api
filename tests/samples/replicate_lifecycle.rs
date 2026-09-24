@@ -59,9 +59,7 @@ async fn grab_replicates_form_sample_and_serve_mean() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
-            .await;
+    let (status, body) = crate::common::post_checked_grab(&app, &grab_payload(), &token).await;
     assert_eq!(status, 200, "grab insert ({status}): {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["inserted"], 3);
@@ -152,14 +150,10 @@ async fn grab_repost_conflicts_then_replace_rewrites_the_group() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, _body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
-            .await;
+    let (status, _body) = crate::common::post_checked_grab(&app, &grab_payload(), &token).await;
     assert_eq!(status, 200);
 
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
-            .await;
+    let (status, body) = crate::common::post_checked_grab(&app, &grab_payload(), &token).await;
     assert_eq!(status, 409, "bare re-post is refused ({status}): {body}");
     let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
     let groups = conflict["detail"].as_array().unwrap();
@@ -185,8 +179,7 @@ async fn grab_repost_conflicts_then_replace_rewrites_the_group() {
         "value": 60.0,
         "time": GRAB_TIME,
     }]);
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &replace, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &replace, &token).await;
     assert_eq!(status, 200, "replace ({status}): {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
@@ -232,9 +225,7 @@ async fn flagging_replicate_zero_keeps_the_grab_served() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, _body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
-            .await;
+    let (status, _body) = crate::common::post_checked_grab(&app, &grab_payload(), &token).await;
     assert_eq!(status, 200);
 
     let (status, body) = crate::common::patch_json_with_token(
@@ -316,16 +307,14 @@ async fn duplicate_explicit_replicate_indices_are_refused() {
         "time": GRAB_TIME,
         "replicate_index": 1,
     }]);
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &payload, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &payload, &token).await;
     assert_eq!(
         status, 409,
         "a duplicate index is refused ({status}): {body}"
     );
 
     payload["readings"][1]["replicate_index"] = serde_json::Value::Null;
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &payload, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &payload, &token).await;
     assert_eq!(
         status, 400,
         "mixing explicit and automatic indices is refused ({status}): {body}"
@@ -362,9 +351,7 @@ async fn a_withdrawn_replicate_is_served_marked_and_outside_n() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
-            .await;
+    let (status, body) = crate::common::post_checked_grab(&app, &grab_payload(), &token).await;
     assert_eq!(status, 200, "grab insert ({status}): {body}");
 
     crate::common::exec(

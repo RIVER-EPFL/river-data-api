@@ -192,9 +192,8 @@ async fn a_reading_with_no_instrument_anywhere_is_refused_unless_derived() {
 async fn a_grab_save_naming_no_instrument_is_attributed_to_the_slot_s_entry_instrument() {
     let (app, db, token) = setup().await;
 
-    let (status, body) = crate::common::post_json_parse_with_token(
+    let (status, body) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{

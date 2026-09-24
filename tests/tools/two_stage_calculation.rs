@@ -186,9 +186,8 @@ async fn a_stage_one_family_is_stored_per_index_and_stage_two_reads_its_mean() {
             })
         })
         .collect();
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": crate::common::SITE1_ID,
             "tool_run_id": run["run_id"],
@@ -310,9 +309,8 @@ async fn a_gap_in_the_family_stays_a_gap() {
         { "parameter_id": s1_id, "value": 2.0, "time": AT, "replicate_index": 0, "output": "S1" },
         { "parameter_id": s1_id, "value": 6.0, "time": AT, "replicate_index": 2, "output": "S1" },
     ]);
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": crate::common::SITE1_ID,
             "tool_run_id": run["run_id"],

@@ -519,7 +519,6 @@ mod replay {
     fn input(variable: &str, kind: &str, value: serde_json::Value) -> ConsumedInput {
         ConsumedInput {
             variable: variable.to_string(),
-            alignment: None,
             kind: kind.to_string(),
             subject: None,
             property: None,
@@ -616,7 +615,6 @@ mod a_set_is_one_unit_of_work {
                 .iter()
                 .map(|s| ((*s).to_string(), (*s).to_string()))
                 .collect(),
-            held: Vec::new(),
             site_sources: Vec::new(),
             curve_slot: None,
             per_replicate: None,
@@ -696,7 +694,7 @@ fn test_an_unevaluable_set_reports_every_output_slot() {
         calculation: crate::routes::private::tools::service::StreamCalculation {
             id: calculation,
             name: "broken".to_string(),
-            active_version_id: None,
+            active_version_id: Uuid::nil(),
             formulas: Vec::new(),
         },
         derived_site_id: site,
@@ -714,71 +712,17 @@ fn test_an_unevaluable_set_reports_every_output_slot() {
     );
 }
 
-// Scenario: a calculation on a high-frequency stream reads one input from the stream and one the
-// lab measures at a visit, the second declared held (Q230).
-//
-// Expected behaviour: the source read exactly binds at the instant being computed; the held one
-// binds at the last instant its parameter was measured at or before it, so it stands at every
-// pulse until the next visit. Both take the whole instant, because a replicate group's mean
-// stands on its members, and neither takes a withdrawn or flagged row.
-mod held_sources {
-    use super::*;
-
-    fn at(hour: u32) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(&format!("2026-02-01T{hour:02}:00:00Z"))
-            .expect("an instant")
-            .with_timezone(&Utc)
-    }
-
-    #[test]
-    fn test_a_source_read_exactly_binds_at_the_instant_being_computed() {
-        let sql = rendered(input_value_query(Uuid::nil(), Uuid::nil(), at(10), false));
-        assert!(
-            sql.contains(r#""r"."time" = $"#),
-            "it reads the instant itself: {sql}"
-        );
-        assert!(
-            !sql.contains(r#"MAX("h"."time")"#),
-            "and looks no further back than it: {sql}"
-        );
-    }
-
-    #[test]
-    fn test_a_held_source_binds_at_the_last_instant_measured_at_or_before_it() {
-        let sql = rendered(input_value_query(Uuid::nil(), Uuid::nil(), at(10), true));
-        assert!(
-            sql.contains(r#""r"."time" IN (SELECT MAX("h"."time")"#),
-            "it reads the last instant the parameter was measured at: {sql}"
-        );
-        assert!(
-            sql.contains(r#""h"."time" <= $"#),
-            "at or before the one being computed: {sql}"
-        );
-    }
-
-    #[test]
-    fn test_the_instant_a_held_source_looks_back_over_takes_no_retracted_row() {
-        let sql = rendered(input_value_query(Uuid::nil(), Uuid::nil(), at(10), true));
-        assert!(
-            sql.contains(r#""h"."withdrawn_at" IS NULL"#),
-            "a withdrawn row is not a measurement to hold: {sql}"
-        );
-        assert!(
-            sql.contains("h.is_flagged IS NOT TRUE"),
-            "nor a flagged one: {sql}"
-        );
-    }
-
-    #[test]
-    fn test_both_arms_carry_the_instant_the_reading_stands_at() {
-        for held in [false, true] {
-            let sql = rendered(input_value_query(Uuid::nil(), Uuid::nil(), at(10), held));
-            assert!(
-                sql.contains(r#"SELECT "r"."time""#),
-                "the record names the reading's own instant, not the one computed: {sql}"
-            );
-        }
-    }
+/// Expected behaviour: a source binds at the instant being computed and at no earlier one (Q252),
+/// and the row it binds names its own instant.
+#[test]
+fn test_a_source_binds_at_the_instant_being_computed() {
+    let at = DateTime::parse_from_rfc3339("2026-02-01T10:00:00Z")
+        .expect("an instant")
+        .with_timezone(&Utc);
+    let sql = rendered(input_value_query(Uuid::nil(), Uuid::nil(), at));
+    assert!(sql.contains(r#""r"."time" = $"#), "{sql}");
+    assert!(!sql.contains(r#"MAX("h"."time")"#), "{sql}");
+    assert!(sql.contains(r#"SELECT "r"."time""#), "{sql}");
 }
 
 /// The order a site's calculations evaluate in, from what each set reads and produces.
@@ -800,7 +744,6 @@ mod evaluation_order {
                 .iter()
                 .map(|s| ((*s).to_string(), (*s).to_string()))
                 .collect(),
-            held: Vec::new(),
             site_sources: Vec::new(),
             curve_slot: None,
             per_replicate: None,
@@ -813,7 +756,7 @@ mod evaluation_order {
             calculation: StreamCalculation {
                 id: Uuid::nil(),
                 name: name.to_string(),
-                active_version_id: None,
+                active_version_id: Uuid::nil(),
                 formulas,
             },
             derived_site_id: Uuid::nil(),

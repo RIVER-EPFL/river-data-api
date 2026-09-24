@@ -444,6 +444,7 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
         ),
     )
     .await;
+    crate::common::commit_calculation(&db, calculation).await;
     exec(
         &db,
         &format!(

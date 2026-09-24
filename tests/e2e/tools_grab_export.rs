@@ -291,8 +291,7 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
             .collect::<Vec<_>>(),
     });
     let (status, entered) =
-        crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &intern_body, &intern)
-            .await;
+        crate::common::post_checked_grab_parse(&app, &intern_body, &intern).await;
     assert_eq!(
         status, 200,
         "an intern enters field data ({status}): {entered}"
@@ -314,8 +313,7 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         "nothing an intern entered is verified"
     );
 
-    let (status, saved) =
-        crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &body, &river).await;
+    let (status, saved) = crate::common::post_checked_grab_parse(&app, &body, &river).await;
     assert_eq!(
         status, 200,
         "a river member saves the grab ({status}): {saved}"
@@ -531,9 +529,8 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
         "all five continuous points land: {batch}"
     );
 
-    let (status, grab) = crate::common::post_json_parse_with_token(
+    let (status, grab) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "readings": tracks::grab_replicates(&cdom, &format!("{DAY}T06:00:00Z"), &[312.0, 314.0]),
@@ -690,9 +687,8 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
 
     // The afternoon grab is entered second but collected later, so ordering cannot come from
     // insertion order alone.
-    let (status, afternoon) = crate::common::post_json_parse_with_token(
+    let (status, afternoon) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "notes": "single bottle",
@@ -711,9 +707,8 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
         "one bottle is a measurement, not a group: {afternoon}"
     );
 
-    let (status, morning) = crate::common::post_json_parse_with_token(
+    let (status, morning) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "readings": tracks::grab_replicates(&cdom, &format!("{DAY}T06:00:00Z"), &[312.0, 314.0]),
@@ -904,9 +899,8 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
     .await;
     assert_eq!(status, 200, "continuous batch ({status}): {batch}");
 
-    let (status, grab) = crate::common::post_json_parse_with_token(
+    let (status, grab) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "readings": tracks::grab_replicates(&cdom, &format!("{DAY}T06:00:00Z"), &[312.0, 314.0]),

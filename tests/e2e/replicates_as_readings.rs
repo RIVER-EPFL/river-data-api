@@ -96,9 +96,8 @@ async fn typed_replicates_are_stored_at_their_index_with_the_curve_the_run_appli
     // (1.05 * 120 - 2) and (1.05 * 118 - 2), the middle vial a gap.
     assert!((shown_avg - 122.95).abs() < 1e-9, "{shown_avg}");
 
-    let (status, saved) = crate::common::post_json_parse_with_token(
+    let (status, saved) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site,
             "tool_run_id": run_id,
@@ -215,9 +214,8 @@ async fn a_replicate_the_run_did_not_consume_is_refused() {
             "not a replicates input",
         ),
     ] {
-        let (status, refused) = crate::common::post_json_with_token(
+        let (status, refused) = crate::common::post_checked_grab(
             &app,
-            "/api/grab_samples",
             &json!({ "site_id": site, "tool_run_id": run_id, "readings": readings }),
             &token,
         )
@@ -226,9 +224,8 @@ async fn a_replicate_the_run_did_not_consume_is_refused() {
         assert!(refused.contains(expected), "{refused}");
     }
 
-    let (status, refused) = crate::common::post_json_with_token(
+    let (status, refused) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": site, "readings": [reading(&sensor_id, &curve_id, 120.0, 0)] }),
         &token,
     )
@@ -282,9 +279,8 @@ async fn the_sd_the_tool_displays_is_the_sd_the_database_serves() {
                    "value": v, "replicate_index": i, "input": "DOC"})
         })
         .collect();
-    let (status, saved) = crate::common::post_json_parse_with_token(
+    let (status, saved) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": site, "tool_run_id": run_id, "readings": readings }),
         &token,
     )

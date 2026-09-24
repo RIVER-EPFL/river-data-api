@@ -466,24 +466,90 @@ pub fn applied_cadence(input_cadences: &[Option<String>]) -> &'static str {
     if all_high { "high" } else { "low" }
 }
 
-/// The inputs whose declaration decides the arm a calculation's outputs run on (Q230): the ones
-/// read at the instant computed. A source held from the last visit says nothing about the arm,
-/// because it stands between visits whatever the stream does; counting it would put a set that
-/// mixes a stream reading and a lab value wholly on the visit arm, which is the case the hold
-/// exists for.
+/// Why a calculation cannot run on the stream arm (Q252), given each measured input it reads and
+/// the cadence a site declares for it, or `None` when it can. A stream calculation transforms one
+/// measured input at the same pulse, so it reads exactly one, and that one on the stream.
 #[must_use]
-pub fn cadence_deciding<'a>(
-    inputs_present: &'a [(Uuid, String)],
-    held_codes: &[String],
-) -> Vec<&'a (Uuid, String)> {
-    inputs_present
+pub fn stream_refusal(inputs: &[(String, Option<String>)]) -> Option<String> {
+    let codes: Vec<&str> = inputs.iter().map(|(code, _)| code.as_str()).collect();
+    if inputs.len() > 1 {
+        return Some(format!(
+            "a calculation on the stream reads one measured input, and this one reads {}",
+            codes.join(", ")
+        ));
+    }
+    let visit_only: Vec<&str> = inputs
         .iter()
-        .filter(|(_, code)| {
-            !held_codes
-                .iter()
-                .any(|held| held.eq_ignore_ascii_case(code))
-        })
-        .collect()
+        .filter(|(_, cadence)| cadence.as_deref() != Some("high"))
+        .map(|(code, _)| code.as_str())
+        .collect();
+    if visit_only.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "a calculation on the stream reads its input on the stream, and {} is not a stream here",
+        visit_only.join(", ")
+    ))
+}
+
+/// Refuse a version whose outputs are on the stream arm at a site where its measured inputs break
+/// the stream rule (Q252), naming the site. What a commit checks before it activates.
+pub async fn refuse_off_stream_reads<C: ConnectionTrait>(
+    db: &C,
+    manifest: &crate::routes::private::tools::models::Manifest,
+) -> AppResult<()> {
+    let catalog = crate::routes::private::tools::service::load_parameter_catalog(
+        db,
+        std::iter::once(manifest),
+    )
+    .await?;
+    let inputs: Vec<CalculationMember> = manifest
+        .read_codes()
+        .iter()
+        .filter_map(|code| catalog.resolve_code(code).map(|p| (p.id, p.code)))
+        .collect();
+    let outputs: Vec<Uuid> = manifest
+        .outputs
+        .iter()
+        .filter_map(|o| catalog.resolve(o).map(|p| p.id))
+        .collect();
+    for site_id in stream_sites(db, &outputs).await? {
+        let mut cadences = Vec::with_capacity(inputs.len());
+        for (parameter_id, code) in &inputs {
+            cadences.push((
+                code.clone(),
+                slot_cadence(db, site_id, *parameter_id).await?,
+            ));
+        }
+        let Some(reason) = stream_refusal(&cadences) else {
+            continue;
+        };
+        let site = crate::routes::private::sites::models::Entity::find_by_id(site_id)
+            .one(db)
+            .await?
+            .map_or_else(|| site_id.to_string(), |s| s.name);
+        return Err(AppError::BadRequest(format!(
+            "{} runs on the stream at {site}: {reason}",
+            manifest.label
+        )));
+    }
+    Ok(())
+}
+
+/// The sites holding one of `outputs` as a stream slot.
+async fn stream_sites<C: ConnectionTrait>(db: &C, outputs: &[Uuid]) -> AppResult<Vec<Uuid>> {
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(Entity::find()
+        .filter(Column::ParameterId.is_in(outputs.to_vec()))
+        .filter(Column::Cadence.eq("high"))
+        .select_only()
+        .column(Column::SiteId)
+        .distinct()
+        .into_tuple::<Uuid>()
+        .all(db)
+        .await?)
 }
 
 // --- Absorbing one slot into another ---

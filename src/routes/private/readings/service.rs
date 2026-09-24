@@ -3987,6 +3987,13 @@ pub(super) fn stored_rows() -> sea_orm::sea_query::SelectStatement {
             "withdrawn",
         ),
         flag(Expr::cust("COALESCE(r.unverified, false)"), "unverified"),
+        flag(
+            Expr::from(Func::coalesce([
+                Expr::col((r.clone(), readings::Column::MeasurementType)).eq(SPOT),
+                Expr::val(false),
+            ])),
+            "spot",
+        ),
     ] {
         query.expr_as(expr, name);
     }
@@ -4065,6 +4072,7 @@ pub(super) async fn inspect_rows<C: ConnectionTrait>(
             parameter_id: row.parameter_id,
             replicate_index: row.replicate_index,
             raw_value: row.raw_value,
+            spot: row.spot,
             options: edit_options(&provenance),
             provenance,
             tool_run_id,
@@ -10473,19 +10481,41 @@ pub(super) async fn load_grab_slots(
     Ok(GrabSlots::of(&site_params))
 }
 
-/// A save that names a seasonal check is held to it: every (parameter, value) pair must have been
-/// screened by exactly that check.
+/// What vouches for a grab save's values (Q262).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrabOrigin {
+    /// Values a person or a client typed: the save names the seasonal check that screened them.
+    Typed,
+    /// Outputs the chain computed at a visit, which no person typed and no check screens.
+    Chain,
+}
+
+/// A typed save names the seasonal check that screened exactly its values: every (parameter,
+/// value) pair must have been screened by that check. A dry run stores nothing and needs none.
 pub(super) async fn require_checked_values(
     db: &DatabaseConnection,
-    check_id: Option<Uuid>,
-    site_id: Uuid,
-    readings: &[GrabSampleReading],
+    payload: &GrabSampleRequest,
+    origin: GrabOrigin,
 ) -> AppResult<()> {
-    let Some(check_id) = check_id else {
+    if origin == GrabOrigin::Chain {
         return Ok(());
+    }
+    let Some(check_id) = payload.check_id else {
+        if payload.dry_run {
+            return Ok(());
+        }
+        return Err(AppError::BadRequest(
+            "A grab save names the seasonal check that screened its values: post them to \
+             /api/readings/seasonal_check and pass its check_id"
+                .to_string(),
+        ));
     };
-    let pairs: Vec<(Uuid, f64)> = readings.iter().map(|r| (r.parameter_id, r.value)).collect();
-    validate_check_claim(db, check_id, site_id, &pairs).await
+    let pairs: Vec<(Uuid, f64)> = payload
+        .readings
+        .iter()
+        .map(|r| (r.parameter_id, r.value))
+        .collect();
+    validate_check_claim(db, check_id, payload.site_id, &pairs).await
 }
 
 /// What the operator picked, held to the same rule as a slot's declaration and a deployment: a
@@ -10878,17 +10908,9 @@ impl GrabWrite<'_> {
     /// calculations that read it run without anyone asking (ADR 0007), the sampled slots are
     /// reconciled and their episodes rebuilt inline (one `reprocessing_jobs` row per field
     /// campaign entry would be the noise), and the site's cached responses go. Grabs are excluded
-    /// from the rollups, so there is nothing to refresh. A stream calculation holding a saved
-    /// parameter (Q230) is recomputed over the pulses that read it, as a job.
-    pub(super) async fn tail<C: ConnectionTrait>(
-        &self,
-        txn: &C,
-        written: &GrabWritten,
-    ) -> AppResult<(Written, Axes)> {
+    /// from the rollups, so there is nothing to refresh.
+    pub(super) fn tail(&self, written: &GrabWritten) -> (Written, Axes) {
         let saved: Vec<Uuid> = self.streams.keys().copied().collect();
-        let holds =
-            crate::routes::private::derived_parameters::flows::held_by_a_calculation(txn, &saved)
-                .await?;
         let tail =
             Written::new(u64::try_from(written.inserted + written.replaced).unwrap_or(u64::MAX))
                 .over(grab_span(&self.payload.readings))
@@ -10903,10 +10925,10 @@ impl GrabWrite<'_> {
             announce: false,
             reconcile_alarms: true,
             episodes: Episodes::Inline,
-            recompute_derived: holds,
+            recompute_derived: false,
             writer: self.writer,
         };
-        Ok((tail, axes))
+        (tail, axes)
     }
 
     fn replaces(&self) -> bool {
@@ -12556,7 +12578,7 @@ pub(super) async fn import_tool_csv(
     use super::models::GrabSampleReading;
     use super::models::GrabSampleRequest;
     use super::models::GrabWriteMode;
-    use super::views::insert_grab_samples;
+    use super::views::save_grab_samples;
     use crate::routes::private::tools::flows::{execute_and_store_run, preview_run};
     use crate::routes::private::tools::service as engine;
 
@@ -12960,14 +12982,7 @@ pub(super) async fn import_tool_csv(
                 // the slot's declaration.
                 readings,
             };
-            match insert_grab_samples(
-                axum::extract::State(state.clone()),
-                axum::Extension(auth.clone()),
-                crate::common::middleware::ProjectScope(scope.clone()),
-                axum::Json(request),
-            )
-            .await
-            {
+            match save_grab_samples(state, auth.clone(), scope, request, GrabOrigin::Typed).await {
                 Ok(axum::Json(resp)) => inserted_total += resp.inserted,
                 Err(e) => record_error(line, e.to_string(), &mut errors, &mut error_count),
             }

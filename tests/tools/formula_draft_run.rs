@@ -103,9 +103,8 @@ async fn count(db: &DatabaseConnection, table: &str) -> i64 {
 async fn an_unsaved_formula_set_runs_at_a_visit_and_stores_nothing() {
     let (db, app, token, admin) = setup().await;
     let (script_id, _peak_id) = seed_calculation(&db).await;
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 8.0, "time": AT }],

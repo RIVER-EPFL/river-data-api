@@ -219,6 +219,9 @@ async fn an_output_ticked_as_a_step_and_back_keeps_its_parameter_readings_and_ve
     let id = created["id"].as_str().expect("id").to_string();
     let definition = Uuid::parse_str(&id).expect("a uuid");
     let output = output_of(&created);
+    let calculation = Uuid::parse_str(created["tool_script_id"].as_str().expect("tool_script_id"))
+        .expect("a uuid");
+    crate::common::commit_calculation(&f.db, calculation).await;
 
     let (status, sp) = crate::common::post_json_with_token(
         &f.app,
@@ -244,18 +247,6 @@ async fn an_output_ticked_as_a_step_and_back_keeps_its_parameter_readings_and_ve
     .await;
     assert!(readings > 0, "the output has a history to keep");
 
-    // A version to lose: the formula was authored one at a time, which mints none, and an
-    // assertion over an empty list would hold whatever either tick did to it.
-    crate::common::exec(
-        &f.db,
-        &format!(
-            "INSERT INTO tool_script_versions \
-                 (tool_script_id, version_no, script, manifest, content_hash) \
-             SELECT d.tool_script_id, 1, '', '{{}}'::jsonb, 'm291_round' \
-               FROM calculation_formulas d WHERE d.id = '{definition}'"
-        ),
-    )
-    .await;
     let versions_before = versions(&f.db, definition).await;
     assert_eq!(versions_before, "1", "the calculation holds one version");
 

@@ -29,7 +29,8 @@ use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::models::{
     GrabSampleReading, GrabSampleRequest, GrabWriteMode,
 };
-use crate::routes::private::readings::views::insert_grab_samples;
+use crate::routes::private::readings::service::GrabOrigin;
+use crate::routes::private::readings::views::save_grab_samples;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
 use crate::routes::private::sync::hold_model;
 use crate::routes::private::sync::models::HoldKind;
@@ -1100,13 +1101,12 @@ async fn walk_event(
             // the slot's declaration.
             readings,
         };
-        let saved = insert_grab_samples(
-            axum::extract::State(state.clone()),
-            axum::Extension(auth),
-            crate::common::middleware::ProjectScope(
-                crate::common::authz::AccessScope::Unrestricted,
-            ),
-            axum::Json(request),
+        let saved = save_grab_samples(
+            state,
+            auth,
+            &crate::common::authz::AccessScope::Unrestricted,
+            request,
+            GrabOrigin::Chain,
         )
         .await?;
         outcome.tools_run += 1;

@@ -179,13 +179,8 @@ async fn grab_samples_reconcile_and_reconstruct_episodes() {
         })
     };
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &grab("2025-02-01T00:00:00Z", BREACH),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::post_checked_grab(&app, &grab("2025-02-01T00:00:00Z", BREACH), &token).await;
     assert_eq!(status, 200, "grab insert: {body}");
     assert_eq!(
         open_turb_event_count(&db).await,
@@ -193,13 +188,9 @@ async fn grab_samples_reconcile_and_reconstruct_episodes() {
         "grab breach opens without a sweep"
     );
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &grab("2025-02-01T01:00:00Z", IN_RANGE),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::post_checked_grab(&app, &grab("2025-02-01T01:00:00Z", IN_RANGE), &token)
+            .await;
     assert_eq!(status, 200, "grab insert: {body}");
     assert_eq!(
         open_turb_event_count(&db).await,

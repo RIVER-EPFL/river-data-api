@@ -180,9 +180,8 @@ async fn visit_state(db: &DatabaseConnection) -> (Uuid, bool, bool) {
 /// A field day an intern opened with two measurements, each with its own hold, and the visit's
 /// hold pending a manager's ruling.
 async fn seed_pending_visit(f: &Fixture) -> (Uuid, Uuid, [Uuid; 2]) {
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &f.app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [

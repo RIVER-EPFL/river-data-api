@@ -20,9 +20,8 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 }
 
 async fn save_two_visits(app: &axum::Router, token: &str) {
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [
@@ -35,9 +34,8 @@ async fn save_two_visits(app: &axum::Router, token: &str) {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.0, "time": T2 }],

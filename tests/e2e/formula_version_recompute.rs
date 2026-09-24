@@ -239,9 +239,8 @@ async fn every_version_change_moves_what_the_replaced_version_stored() {
         let site_id = site_id.clone();
         let input = input.clone();
         async move {
-            let (status, resp) = crate::common::post_json_with_token(
+            let (status, resp) = crate::common::post_checked_grab(
                 &app,
-                "/api/grab_samples",
                 &json!({
                     "site_id": site_id,
                     "readings": [{ "parameter_id": input, "value": 10.0, "time": at }],

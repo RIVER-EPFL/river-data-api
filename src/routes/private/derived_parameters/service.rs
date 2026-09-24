@@ -1,7 +1,7 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IdenStatic, Iterable,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -437,7 +437,6 @@ pub(crate) fn shared_cycle(steps: &[(String, String)]) -> Result<(), String> {
             ordinal: 0,
             output_parameter_code: None,
             sources: Vec::new(),
-            held: Vec::new(),
             site_sources: Vec::new(),
             curve_slot: None,
             per_replicate: None,
@@ -702,10 +701,6 @@ async fn sync_sources<C: ConnectionTrait>(
     resolved: &ResolvedSources,
 ) -> Result<Vec<source::DerivedParameterSource>, ApiError> {
     let resolved_params = &resolved.parameters;
-    // A save rewrites the rows, so the alignment a person declared per variable (Q230) is read
-    // back first and carried onto the variable's new row: it is a declaration about the input,
-    // not about the text of the formula that reads it.
-    let held = held_variables(db, definition_id).await?;
     // Delete existing rows
     delete_sources(db, definition_id)
         .await
@@ -719,7 +714,6 @@ async fn sync_sources<C: ConnectionTrait>(
             derived_definition_id: Set(definition_id),
             parameter_id: Set(Some(*param_id)),
             variable_name: Set(var_name.clone()),
-            alignment: Set(alignment_of(&held, var_name)),
             ..Default::default()
         }
         .insert(db)
@@ -750,37 +744,6 @@ async fn sync_sources<C: ConnectionTrait>(
 
     Ok(written)
 }
-
-/// The variables of a definition whose sources are held rather than read at the instant (Q230).
-async fn held_variables<C: ConnectionTrait>(
-    db: &C,
-    definition_id: Uuid,
-) -> Result<Vec<String>, ApiError> {
-    source::Entity::find()
-        .filter(source::Column::DerivedDefinitionId.eq(definition_id))
-        .filter(source::Column::Alignment.eq(HOLD))
-        .select_only()
-        .column(source::Column::VariableName)
-        .into_tuple::<String>()
-        .all(db)
-        .await
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
-}
-
-/// What a rewritten source row declares, given the variables the definition held before it.
-#[must_use]
-pub fn alignment_of(held: &[String], variable: &str) -> String {
-    if held.iter().any(|v| v == variable) {
-        HOLD.to_string()
-    } else {
-        EXACT.to_string()
-    }
-}
-
-/// A source read at the instant being computed.
-pub const EXACT: &str = "exact";
-/// A source holding the last value measured at or before the instant being computed (Q230).
-pub const HOLD: &str = "hold";
 
 /// Every source row a definition owns, cleared.
 async fn delete_sources<C: ConnectionTrait>(

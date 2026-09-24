@@ -56,13 +56,7 @@ async fn a_grab_measured_once_mints_no_sample_row() {
     let (app, token, db) = setup().await;
     let time = "2025-09-01T08:00:00Z";
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &grab(time, &[12.5]),
-        &token,
-    )
-    .await;
+    let (status, body) = crate::common::post_checked_grab(&app, &grab(time, &[12.5]), &token).await;
     assert_eq!(status, 200, "grab entry ({status}): {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
@@ -77,8 +71,7 @@ async fn a_grab_measured_once_mints_no_sample_row() {
     // A second measurement at the same instant is what makes it a sample.
     let mut rewrite = grab(time, &[12.5, 13.5]);
     rewrite["mode"] = serde_json::json!("replace");
-    let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &rewrite, &token).await;
+    let (status, body) = crate::common::post_checked_grab(&app, &rewrite, &token).await;
     assert_eq!(status, 200, "second replicate ({status}): {body}");
     let (n, mean) = sample_stats(&db, time)
         .await
@@ -130,13 +123,8 @@ async fn replicates_of_one_grab_share_one_sample_row() {
     let (app, token, db) = setup().await;
     let time = "2025-09-01T09:00:00Z";
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &grab(time, &[10.0, 11.0, 12.0]),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::post_checked_grab(&app, &grab(time, &[10.0, 11.0, 12.0]), &token).await;
     assert_eq!(status, 200, "grab entry ({status}): {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["inserted"], 3);
@@ -161,13 +149,8 @@ async fn flagging_a_replicate_leaves_the_sample_on_the_rest() {
     let (app, token, db) = setup().await;
     let time = "2025-09-01T10:00:00Z";
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &grab(time, &[20.0, 30.0]),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::post_checked_grab(&app, &grab(time, &[20.0, 30.0]), &token).await;
     assert_eq!(status, 200, "grab entry ({status}): {body}");
 
     let (status, flagged) = crate::common::patch_json_with_token(

@@ -93,9 +93,8 @@ async fn a_grab_save_whose_recompute_cannot_be_queued_still_answers_the_write_it
     install_calculation(&db).await;
     break_the_enqueue(&db).await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [

@@ -386,9 +386,8 @@ async fn coverage_and_health_are_confined_to_the_callers_projects() {
 async fn the_visit_detail_marks_each_cell_s_role() {
     let (_db, app, token) = setup().await;
 
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [

@@ -18,7 +18,6 @@ fn pco2(expr: &str) -> PinnedFormula {
             ("kh".to_string(), "KH".to_string()),
             ("p".to_string(), "Pressure".to_string()),
         ],
-        held: Vec::new(),
         site_sources: Vec::new(),
         curve_slot: None,
         per_replicate: None,

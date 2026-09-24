@@ -352,6 +352,7 @@ async fn a_derived_value_replays_its_own_formula_over_what_it_consumed() {
     )
     .await;
     assert!((200..300).contains(&status), "create ({status}): {def}");
+    crate::common::commit_calculation(&db, calculation).await;
     let output = def["output_parameter_id"]
         .as_str()
         .expect("output")
@@ -454,4 +455,79 @@ async fn an_instant_with_no_computation_has_nothing_to_replay() {
     );
     let (status, body) = crate::common::get_with_token(&app, &uri, &token).await;
     assert_eq!(status, 404, "{body}");
+}
+
+/// Scenario: a saved calculation's formula row is edited through CRUD, which mints no version,
+/// and a reading then arrives on the stream.
+///
+/// Expected behaviour: the stream pass computes from the active version's body, so the stored
+/// value is the one the version it names produces, never the edited row's (Q256).
+#[tokio::test]
+#[serial]
+async fn the_stream_pass_computes_from_the_active_version_not_the_edited_row() {
+    let (db, app, token) = setup().await;
+
+    let code = format!("fpin_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
+    save_set(
+        &app,
+        &token,
+        calculation,
+        &code,
+        None,
+        "Dissolved_O2 * 0.032",
+    )
+    .await;
+    let (definition_id, output) = saved_formula(&db, &code).await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output,
+            "name": code,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "cadence": "high",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign ({status}): {body}");
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{definition_id}"),
+        &serde_json::json!({ "formula": "Dissolved_O2 * 0.064" }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "edit the row ({status}): {body}"
+    );
+
+    let at: DateTime<Utc> = Utc::now() - Duration::hours(7);
+    let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 250.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+
+    assert_eq!(
+        derived_value(&db, output, at).await,
+        Some(8.0), // 250.0 * 0.032, the active body, not 250.0 * 0.064
+        "the stored value is the active version's"
+    );
 }

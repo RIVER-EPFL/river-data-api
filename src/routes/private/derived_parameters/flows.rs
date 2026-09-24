@@ -13,7 +13,6 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::common::sync_state;
-use crate::routes::private::derived_parameters::service as derived;
 use crate::routes::private::derived_parameters::service::DerivedPass;
 use crate::routes::private::readings;
 use crate::routes::private::reprocessing_jobs::flows::{
@@ -60,32 +59,8 @@ pub async fn site_has_active_derived<C: ConnectionTrait>(
     Ok(row.is_some())
 }
 
-/// Whether any calculation holds one of these parameters from the last visit (Q230), so a value
-/// written or curated at a visit moves stream pulses beside the instant it was written at.
-pub async fn held_by_a_calculation<C: ConnectionTrait>(
-    db: &C,
-    parameter_ids: &[Uuid],
-) -> Result<bool, sea_orm::DbErr> {
-    if parameter_ids.is_empty() {
-        return Ok(false);
-    }
-    Ok(source::Entity::find()
-        .filter(source::Column::ParameterId.is_in(parameter_ids.to_vec()))
-        .filter(source::Column::Alignment.eq(derived::HOLD))
-        .one(db)
-        .await?
-        .is_some())
-}
-
 /// The gap scan, as the statement it emits.
 ///
-/// A source read at the instant being computed rather than held from an earlier one (Q230). Only
-/// these make an instant one a calculation computes at: a held source stands between visits, so
-/// counting its own instants would put a pulse at every visit the lab recorded.
-fn exact_source(dps: &Alias) -> Expr {
-    Expr::col((dps.clone(), source::Column::Alignment)).eq(derived::EXACT)
-}
-
 /// `since` bounds the readings side by time. Unbounded, the anti-join hashes the whole hypertable:
 /// on the production shape that is a parallel hash whose 16MB doubling step does not fit the DB
 /// pod's 64MB `/dev/shm` when another parallel query holds shared memory, so the run aborts and no
@@ -175,8 +150,7 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
                 .and(
                     Expr::col((dps.clone(), source::Column::ParameterId))
                         .equals((r.clone(), readings::Column::ParameterId)),
-                )
-                .and(exact_source(&dps)),
+                ),
         )
         .and_where(Expr::exists(derived_written).not())
         .group_by_col((r.clone(), readings::Column::SiteId))
@@ -606,8 +580,7 @@ fn derived_instants(
                         .add(
                             sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
                                 .equals((r.clone(), readings::Column::ParameterId)),
-                        )
-                        .add(exact_source(&dps)),
+                        ),
                 );
         }
         // Every formula that reads the parameter this reading carries.
@@ -617,12 +590,10 @@ fn derived_instants(
                     sea_query::JoinType::Join,
                     source::Entity,
                     dps.clone(),
-                    sea_query::Condition::all()
-                        .add(
-                            sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
-                                .equals((r.clone(), readings::Column::ParameterId)),
-                        )
-                        .add(exact_source(&dps)),
+                    sea_query::Condition::all().add(
+                        sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
+                            .equals((r.clone(), readings::Column::ParameterId)),
+                    ),
                 )
                 .join_as(
                     sea_query::JoinType::Join,
@@ -683,97 +654,6 @@ fn derived_instants(
         .to_owned()
 }
 
-/// The pulses that read one of `parameter_ids` as a held source (Q230) after it changed at
-/// `start..=end`: each holding calculation's own stream instants at the site, from `start` up to
-/// the next live measurement of the parameter it holds. Every pulse in between binds the changed
-/// value, or, once it is gone, the one measured before it.
-pub(crate) fn held_instants(
-    site_ids: &[Uuid],
-    parameter_ids: &[Uuid],
-    start: chrono::DateTime<chrono::Utc>,
-    end: chrono::DateTime<chrono::Utc>,
-) -> sea_query::SelectStatement {
-    let r = sea_query::Alias::new("r");
-    let f = sea_query::Alias::new("f");
-    let h = sea_query::Alias::new("h");
-    let hs = sea_query::Alias::new("hs");
-    let hf = sea_query::Alias::new("hf");
-    let holds = |hs: &sea_query::Alias| {
-        sea_query::Condition::all()
-            .add(
-                sea_query::Expr::col((hs.clone(), source::Column::ParameterId))
-                    .is_in(parameter_ids.to_vec()),
-            )
-            .add(sea_query::Expr::col((hs.clone(), source::Column::Alignment)).eq(derived::HOLD))
-    };
-    let holding = sea_query::Query::select()
-        .column((hf.clone(), definition::Column::ToolScriptId))
-        .from_as(definition::Entity, hf.clone())
-        .join_as(
-            sea_query::JoinType::Join,
-            source::Entity,
-            hs.clone(),
-            sea_query::Expr::col((hs.clone(), source::Column::DerivedDefinitionId))
-                .equals((hf.clone(), definition::Column::Id)),
-        )
-        .cond_where(holds(&hs))
-        .to_owned();
-    let next = sea_query::SimpleExpr::SubQuery(
-        None,
-        Box::new(sea_query::SubQueryStatement::SelectStatement(
-            sea_query::Query::select()
-                .expr(Func::min(sea_query::Expr::col((
-                    h.clone(),
-                    readings::Column::Time,
-                ))))
-                .from_as(readings::Entity, h.clone())
-                .join_as(
-                    sea_query::JoinType::Join,
-                    source::Entity,
-                    hs.clone(),
-                    sea_query::Expr::col((hs.clone(), source::Column::ParameterId))
-                        .equals((h.clone(), readings::Column::ParameterId)),
-                )
-                .join_as(
-                    sea_query::JoinType::Join,
-                    definition::Entity,
-                    hf.clone(),
-                    sea_query::Expr::col((hf.clone(), definition::Column::Id))
-                        .equals((hs.clone(), source::Column::DerivedDefinitionId)),
-                )
-                .cond_where(holds(&hs))
-                .and_where(
-                    sea_query::Expr::col((hf, definition::Column::ToolScriptId))
-                        .equals((f.clone(), definition::Column::ToolScriptId)),
-                )
-                .and_where(
-                    sea_query::Expr::col((h.clone(), readings::Column::SiteId))
-                        .equals((r.clone(), readings::Column::SiteId)),
-                )
-                .and_where(sea_query::Expr::col((h.clone(), readings::Column::Time)).gt(end))
-                .and_where(
-                    sea_query::Expr::col((h.clone(), readings::Column::WithdrawnAt)).is_null(),
-                )
-                .and_where(
-                    sea_query::Expr::col((h.clone(), readings::Column::IsFlagged))
-                        .ne(true)
-                        .or(sea_query::Expr::col((h, readings::Column::IsFlagged)).is_null()),
-                )
-                .to_owned(),
-        )),
-    );
-    let scope = sea_query::Condition::all()
-        .add(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).is_in(site_ids.to_vec()))
-        .add(sea_query::Expr::col((r.clone(), readings::Column::Time)).gte(start))
-        .add(sea_query::Expr::col((f, definition::Column::ToolScriptId)).in_subquery(holding))
-        .add(
-            sea_query::Condition::any()
-                .add(sea_query::Expr::expr(next.clone()).is_null())
-                .add(sea_query::Expr::col((r, readings::Column::Time)).lt(next)),
-        );
-    derived_instants(scope, None)
-}
-
 /// The instants at one site where a calculation's inputs were recorded. Every formula of the set
 /// counts, a step included: a step's source is an input the set reads.
 fn instants_a_calculation_reads(calculation_id: Uuid, site_id: Uuid) -> sea_query::SelectStatement {
@@ -788,12 +668,10 @@ fn instants_a_calculation_reads(calculation_id: Uuid, site_id: Uuid) -> sea_quer
             sea_query::JoinType::Join,
             source::Entity,
             dps.clone(),
-            sea_query::Condition::all()
-                .add(
-                    sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
-                        .equals((r.clone(), readings::Column::ParameterId)),
-                )
-                .add(exact_source(&dps)),
+            sea_query::Condition::all().add(
+                sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
+                    .equals((r.clone(), readings::Column::ParameterId)),
+            ),
         )
         .join_as(
             sea_query::JoinType::Join,
@@ -851,10 +729,7 @@ fn derived_recompute_instants(params: &serde_json::Value) -> Result<Vec<Statemen
         )
         .add(sea_query::Expr::col((r.clone(), readings::Column::Time)).gte(start))
         .add(sea_query::Expr::col((r, readings::Column::Time)).lte(end));
-    Ok(vec![
-        build(&derived_instants(window, None)),
-        build(&held_instants(&site_ids, &parameter_ids, start, end)),
-    ])
+    Ok(vec![build(&derived_instants(window, None))])
 }
 
 #[async_trait]

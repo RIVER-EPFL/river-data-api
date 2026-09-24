@@ -36,6 +36,7 @@ async fn configure_derived_and_exposure(
         token,
     )
     .await;
+    crate::common::commit_calculation(db, calculation).await;
     let output_parameter_id = def["output_parameter_id"].as_str().unwrap().to_string();
 
     crate::common::post_json_with_token(

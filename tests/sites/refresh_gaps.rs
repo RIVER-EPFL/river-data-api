@@ -336,9 +336,8 @@ async fn merging_site_parameters_carries_samples_and_annotations() {
 
     let day = "2026-04-14";
     let grab_at = format!("{day}T09:00:00Z");
-    let (status, grab) = crate::common::post_json_parse_with_token(
+    let (status, grab) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": track.site_id,
             "label": "merge fixture",

@@ -960,3 +960,35 @@ async fn an_edit_set_lists_every_decision_it_recorded_with_its_parameter() {
     .await;
     assert_eq!(status, 404);
 }
+
+/// A grab value inspects as one, so the edit dialog knows to screen its correction (Q262); a
+/// sensor reading does not.
+#[tokio::test]
+#[serial]
+async fn an_inspected_row_says_whether_it_is_a_grab_value() {
+    let f = setup(&[10.0]).await;
+    let (status, inspected) = post(
+        &f,
+        "/api/readings/edits/inspect",
+        &json!({ "selection": one_key(f.stream, 0) }),
+    )
+    .await;
+    assert_eq!(status, 200, "{inspected}");
+    assert_eq!(inspected["rows"][0]["spot"], true, "{inspected}");
+
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "UPDATE readings SET measurement_type = 'continuous' WHERE stream_id = '{}'",
+            f.stream
+        ),
+    )
+    .await;
+    let (_, inspected) = post(
+        &f,
+        "/api/readings/edits/inspect",
+        &json!({ "selection": one_key(f.stream, 0) }),
+    )
+    .await;
+    assert_eq!(inspected["rows"][0]["spot"], false, "{inspected}");
+}

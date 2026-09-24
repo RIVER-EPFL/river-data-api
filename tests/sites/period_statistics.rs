@@ -108,9 +108,8 @@ async fn a_spot_period_summarises_instants_not_replicates() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [
@@ -168,9 +167,8 @@ async fn an_export_carries_the_statistics_without_a_divisor_column() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [

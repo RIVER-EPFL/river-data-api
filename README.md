@@ -115,7 +115,11 @@ window applies only its new rows and raises a hold for a person to release. Ever
 commits a receipt, so what a cycle did is queryable afterwards.
 
 The other write paths are `POST /readings/batch`, `POST /readings/import_csv` and
-`POST /grab_samples`.
+`POST /grab_samples`. Grab values are screened against the site's seasonal history before they are
+stored: post them to `POST /readings/seasonal_check` first, read its warnings, and pass its
+`check_id` on the save (or on the commit of a spot or tool CSV, whose `dry_run` stores the check).
+The save is held to exactly the values the check screened, and a correction of a stored grab value
+through `POST /readings/edits` names one in its decision the same way.
 
 ## Measurement cadence
 

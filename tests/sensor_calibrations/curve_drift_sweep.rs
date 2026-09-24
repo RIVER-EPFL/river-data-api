@@ -74,9 +74,8 @@ async fn post_grab(
     if let Some(curve) = curve {
         reading["standard_curve_id"] = serde_json::json!(curve);
     }
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &serde_json::json!({ "site_id": SITE1_ID, "readings": [reading] }),
         token,
     )
@@ -312,9 +311,8 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
             })
         })
         .collect();
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &serde_json::json!({ "site_id": SITE1_ID, "readings": readings }),
         &token,
     )
@@ -676,6 +674,7 @@ async fn the_janitor_recomputes_a_stream_calculation_whose_continuous_input_it_r
     )
     .await;
     assert!((200..300).contains(&status), "create derived: {definition}");
+    crate::common::commit_calculation(&db, calculation).await;
     let output: Uuid = definition["output_parameter_id"]
         .as_str()
         .expect("the output parameter is created with the formula")

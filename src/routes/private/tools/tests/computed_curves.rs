@@ -12,7 +12,6 @@ fn formula(code: &str, expr: &str, slot: Option<&str>, intermediate: bool) -> Pi
         ordinal: 0,
         output_parameter_code: (!intermediate).then(|| code.to_uppercase()),
         sources: vec![("raw".to_string(), "RAW".to_string())],
-        held: Vec::new(),
         site_sources: Vec::new(),
         curve_slot: slot.map(str::to_string),
         per_replicate: None,

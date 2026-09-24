@@ -592,9 +592,8 @@ async fn grab_readings_receive_their_resolved_curve() {
 
     // The grab names the instrument but no curve, so the curve is resolved from the instrument's
     // windows, the case the lab-grab model leaves to window resolution.
-    let (status, body) = post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &f.app,
-        "/api/grab_samples",
         &json!({
             "site_id": f.site,
             "readings": [{

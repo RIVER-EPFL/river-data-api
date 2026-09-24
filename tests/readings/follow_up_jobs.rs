@@ -211,63 +211,6 @@ async fn a_batch_whose_alarm_backfill_cannot_be_queued_stores_nothing() {
     crate::common::cleanup_test_db(&fx.db).await;
 }
 
-/// A calculation that holds temperature from the last visit, so a grab save of it moves the
-/// stream pulses beside it.
-async fn hold_temperature(db: &DatabaseConnection) {
-    let formula = Uuid::new_v4();
-    crate::common::exec(
-        db,
-        &format!(
-            "INSERT INTO calculation_formulas (id, code, name, formula, intermediate) \
-             VALUES ('{formula}', 'held_temp', 'Held temperature', 't * 2', true)"
-        ),
-    )
-    .await;
-    crate::common::exec(
-        db,
-        &format!(
-            "INSERT INTO derived_parameter_sources \
-                 (derived_definition_id, parameter_id, variable_name, alignment) \
-             VALUES ('{formula}', '{GLOBAL_PARAM_TEMP_ID}', 't', 'hold')"
-        ),
-    )
-    .await;
-}
-
-async fn grab(fx: &Fixture) -> (u16, String) {
-    crate::common::post_json_with_token(
-        &fx.app,
-        "/api/grab_samples",
-        &json!({
-            "site_id": SITE1_ID,
-            "readings": [{ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 14.2, "time": AT }]
-        }),
-        &fx.token,
-    )
-    .await
-}
-
-#[tokio::test]
-#[serial]
-async fn a_grab_whose_derived_recompute_cannot_be_queued_stores_nothing() {
-    let fx = setup().await;
-    hold_temperature(&fx.db).await;
-
-    refuse_enqueue(&fx.db, "derived_recompute").await;
-    let (status, body) = grab(&fx).await;
-    restore_enqueue(&fx.db).await;
-
-    assert_ne!(status, 200, "the save reports the failure: {body}");
-    assert_eq!(stored_at(&fx.db, AT).await, 0, "and stores nothing");
-
-    let (status, body) = grab(&fx).await;
-    assert_eq!(status, 200, "a retry saves the reading: {body}");
-    assert_eq!(stored_at(&fx.db, AT).await, 1);
-    assert_eq!(queued(&fx.db, "derived_recompute").await, 1);
-
-    crate::common::cleanup_test_db(&fx.db).await;
-}
-
 /// A stored instrument pin on one reading, recorded as its own set. Nothing records a pin (Q117),
 /// so the one a rollback inverts is a stored row. Returns the decision and its set.
 async fn stored_pin(db: &DatabaseConnection) -> (Uuid, Uuid) {

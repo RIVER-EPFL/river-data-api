@@ -24,9 +24,8 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
             json!({ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": v, "time": T, "replicate_index": i })
         })
         .collect();
-    let (status, body) = crate::common::post_json_parse_with_token(
+    let (status, body) = crate::common::post_checked_grab_parse(
         &app,
-        "/api/grab_samples",
         &json!({ "site_id": SITE1_ID, "readings": readings }),
         &token,
     )

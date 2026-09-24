@@ -125,8 +125,7 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
             if replace {
                 body["mode"] = json!("replace");
             }
-            let (status, resp) =
-                crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river).await;
+            let (status, resp) = crate::common::post_checked_grab(&app, &body, &river).await;
             assert_eq!(status, 200, "save ScopeA: {resp}");
         }
     };
@@ -388,9 +387,8 @@ async fn a_correction_cascades_is_recorded_and_is_reversible() {
         }
     };
 
-    let (status, saved) = crate::common::post_json_with_token(
+    let (status, saved) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": site_id,
             "readings": [{ "parameter_id": pa, "value": 10.0, "time": AT }],

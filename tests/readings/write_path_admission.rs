@@ -113,9 +113,8 @@ async fn ingest_skips_what_batch_and_grab_samples_refuse() {
             "/readings/batch refuses a {label} timestamp ({status}): {body}"
         );
 
-        let (status, body) = crate::common::post_json_with_token(
+        let (status, body) = crate::common::post_checked_grab(
             &app,
-            "/api/grab_samples",
             &json!({
                 "site_id": SITE1_ID,
                 "readings": [{

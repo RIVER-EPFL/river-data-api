@@ -70,6 +70,7 @@ async fn test_janitor_fills_derived_gaps() {
     )
     .await;
     assert!((200..300).contains(&status));
+    crate::common::commit_calculation(&db, calculation).await;
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .unwrap()
@@ -210,6 +211,7 @@ async fn declare_do_calculation(
     )
     .await;
     assert!((200..300).contains(&status), "{def}");
+    crate::common::commit_calculation(db, calculation).await;
     let output = Uuid::parse_str(def["output_parameter_id"].as_str().unwrap()).unwrap();
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,

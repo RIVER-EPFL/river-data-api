@@ -1320,6 +1320,8 @@ pub struct InspectedRow {
     pub parameter_id: Option<Uuid>,
     pub replicate_index: i16,
     pub raw_value: f64,
+    /// A grab value (a spot reading), whose correction names a seasonal check (Q262).
+    pub spot: bool,
     pub provenance: RowProvenance,
     pub options: Vec<EditOption>,
     /// The run to reopen, when the route is the tool.
@@ -1349,6 +1351,7 @@ pub(super) struct StoredRow {
     pub(super) is_flagged: bool,
     pub(super) withdrawn: bool,
     pub(super) unverified: bool,
+    pub(super) spot: bool,
     pub(super) source_system: String,
 }
 
@@ -2051,13 +2054,6 @@ pub struct ConsumedInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub revision: Option<i64>,
-    /// How the reading it names was reached (Q230): absent where it was read at the instant the
-    /// run computed, `hold` where it is the last value measured at or before it, which a
-    /// calculation on a stream does for an input the lab measures at a visit. Without it a held
-    /// value reads as a mis-stamped one, and a replay cannot tell which rule bound it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub alignment: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ConsumedReading>,
     #[schema(value_type = Object)]
@@ -2102,12 +2098,6 @@ pub struct ConsumedMemberRef {
 pub struct ConsumedRef {
     pub variable: String,
     pub kind: String,
-    /// How the reading it names was reached (Q230), as the capture recorded it: absent where it
-    /// was read at the instant computed, `hold` where it is the last value measured at or before
-    /// it. Without it a held member reads as one stamped at the wrong instant.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub alignment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub subject: Option<String>,
@@ -2542,10 +2532,11 @@ pub struct GrabSampleRequest {
     /// run's outputs and carry that output's value.
     #[serde(default)]
     pub tool_run_id: Option<Uuid>,
-    /// A `seasonal_checks` row (from `/readings/seasonal_check`) covering this save's values.
-    /// When present, every reading's (parameter, value) must have been screened by that check:
-    /// the portal's "any edit resets Check", enforced server-side. The check itself is advisory;
-    /// naming a check that does not cover the values is refused.
+    /// The `seasonal_checks` row (from `/readings/seasonal_check`) that screened this save's
+    /// values, required on every save that is not a dry run. Every reading's (parameter, value)
+    /// must have been screened by that check: the portal's "any edit resets Check", enforced
+    /// server-side. A warning the check reported does not block the save; a check that does not
+    /// cover the values does.
     #[serde(default)]
     pub check_id: Option<Uuid>,
     /// What the client believes each group it replaces already holds. A replace retracts the

@@ -131,15 +131,13 @@ async fn external_push_key_confined_to_its_project_on_every_write_path() {
         "site_id": SITE1_ID,
         "readings": [{ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 1.5, "time": t }]
     });
-    let (s, body) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_in, &key).await;
+    let (s, body) = crate::common::post_checked_grab(&app, &grab_in, &key).await;
     assert_eq!(s, 200, "in-scope grab must succeed: {body}");
     let grab_out = serde_json::json!({
         "site_id": SITE_B_ID,
         "readings": [{ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 1.5, "time": t }]
     });
-    let (s, _) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_out, &key).await;
+    let (s, _) = crate::common::post_checked_grab(&app, &grab_out, &key).await;
     assert_eq!(s, 403, "cross-project grab must be forbidden");
 
     // Status events batch: out-of-scope forbidden.

@@ -54,9 +54,8 @@ async fn event_row(db: &DatabaseConnection, time: &str) -> Option<(String, Strin
 async fn a_grab_save_attaches_a_manual_event_to_its_readings() {
     let (db, app, token) = setup().await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [
@@ -86,9 +85,8 @@ async fn a_grab_save_attaches_a_manual_event_to_its_readings() {
     );
 
     // A second save at the same instant reuses the event rather than minting a sibling.
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 5.0, "time": T1 }],
@@ -238,9 +236,8 @@ async fn the_staging_endpoint_creates_a_manual_event() {
     assert_eq!(event["source"], "manual");
 
     // A later grab at the staged instant lands on the staged event.
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.0, "time": T1 }],
@@ -464,9 +461,8 @@ async fn an_event_with_readings_cannot_be_deleted() {
     .await;
     assert_eq!(status, 200, "{event}");
     let event_id = event["id"].as_str().unwrap().to_string();
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.0, "time": T1 }],
@@ -729,9 +725,8 @@ async fn a_field_day_saves_each_station_independently() {
     assert_eq!(status, 200, "check the first station: {checked}");
     let check_id = checked["check_id"].as_str().unwrap().to_string();
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "check_id": check_id,
@@ -744,9 +739,8 @@ async fn a_field_day_saves_each_station_independently() {
 
     // The second station is sent under the first station's check, which screened neither its
     // values nor its site: the save is refused rather than admitted on someone else's screening.
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": crate::common::SITE2_ID,
             "check_id": check_id,
@@ -804,9 +798,8 @@ async fn a_field_day_saves_each_station_independently() {
 async fn a_visit_is_withdrawn_and_re_asserted_as_one_set() {
     let (db, app, token) = setup().await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [
@@ -1027,9 +1020,8 @@ async fn a_refused_station_leaves_the_stations_already_saved_alone() {
         let app = app.clone();
         let token = token.clone();
         async move {
-            crate::common::post_json_with_token(
+            crate::common::post_checked_grab(
                 &app,
-                "/api/grab_samples",
                 &json!({
                     "site_id": site,
                     "mode": "replace",
@@ -1274,9 +1266,8 @@ async fn a_verified_stager_opens_a_verified_field_day() {
 async fn verifying_a_measurement_is_refused_while_its_field_day_is_unruled() {
     let (db, app, token) = setup().await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.0, "time": T1 }],
@@ -1325,9 +1316,8 @@ async fn verifying_a_measurement_is_refused_while_its_field_day_is_unruled() {
 async fn rejecting_a_field_day_withdraws_it_with_its_readings() {
     let (db, app, token) = setup().await;
 
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         &app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": [

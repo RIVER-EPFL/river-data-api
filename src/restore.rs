@@ -225,10 +225,20 @@ fn natural_keys() -> Vec<(&'static str, String)> {
             "parameters",
             "SELECT id, lower(code) AS k FROM public.parameters".to_string(),
         ),
+        // An `api` stream's key embeds the site and parameter ids its database minted, so it is
+        // recognised by the slot those ids name instead.
         (
             "data_streams",
             format!(
-                "SELECT id, source_system || '{SEP}' || source_key AS k FROM public.data_streams"
+                "SELECT d.id,
+                        CASE WHEN s.id IS NOT NULL AND p.id IS NOT NULL
+                             THEN 'api{SEP}' || lower(s.name) || '{SEP}' || lower(p.code)
+                             ELSE d.source_system || '{SEP}' || d.source_key END AS k
+                   FROM public.data_streams d
+                   LEFT JOIN public.sites s
+                          ON d.source_system = 'api' AND s.id::text = split_part(d.source_key, ':', 1)
+                   LEFT JOIN public.parameters p
+                          ON d.source_system = 'api' AND p.id::text = split_part(d.source_key, ':', 2)"
             ),
         ),
         (
@@ -824,6 +834,66 @@ async fn not_carried<S: ConnectionTrait>(source: &S) -> Result<Vec<(String, usiz
     Ok(left)
 }
 
+/// Give the target an `api` stream for every slot the source ingested through one, so the source's
+/// readings on it have a stream to arrive on. A slot the target does not hold is left to the key
+/// map, which reports it.
+async fn ensure_api_streams<S: ConnectionTrait, T: ConnectionTrait>(
+    source: &S,
+    target: &T,
+) -> Result<(), DbErr> {
+    use crate::routes::private::data_streams::models as data_streams;
+    use crate::routes::private::parameters::models as parameters;
+    use crate::routes::private::sites::models as sites;
+    use sea_orm::sea_query::ExprTrait as _;
+
+    let streams = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq("api"))
+        .all(source)
+        .await?;
+    for stream in streams {
+        let Some((site, parameter)) = stream.source_key.split_once(':') else {
+            continue;
+        };
+        let (Ok(site), Ok(parameter)) = (site.parse::<Uuid>(), parameter.parse::<Uuid>()) else {
+            continue;
+        };
+        let (Some(site), Some(parameter)) = (
+            sites::Entity::find_by_id(site).one(source).await?,
+            parameters::Entity::find_by_id(parameter)
+                .one(source)
+                .await?,
+        ) else {
+            continue;
+        };
+        let (Some(site), Some(parameter)) = (
+            sites::Entity::find()
+                .filter(
+                    Expr::expr(Func::lower(Expr::col(sites::Column::Name)))
+                        .eq(site.name.to_lowercase()),
+                )
+                .one(target)
+                .await?,
+            parameters::Entity::find()
+                .filter(
+                    Expr::expr(Func::lower(Expr::col(parameters::Column::Code)))
+                        .eq(parameter.code.to_lowercase()),
+                )
+                .one(target)
+                .await?,
+        ) else {
+            continue;
+        };
+        crate::routes::private::data_streams::service::get_or_create_api_stream(
+            target,
+            site.id,
+            parameter.id,
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Carry the curated state of `source` into `target`, which is a database built from the baseline
 /// and rebuilt to the point where its streams, sites, parameters and instruments exist.
 ///
@@ -834,6 +904,8 @@ pub async fn restore(
 ) -> Result<Restored, DbErr> {
     let mut report = Restored::default();
     let transaction = target.begin().await?;
+    // Before the triggers go off: a stream this creates takes its instrument the way any does.
+    ensure_api_streams(source, &transaction).await?;
     transaction
         .execute_unprepared("SET LOCAL session_replication_role = replica")
         .await?;

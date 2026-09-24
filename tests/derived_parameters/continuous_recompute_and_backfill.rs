@@ -109,6 +109,7 @@ async fn test_continuous_derived_recompute_after_ingest() {
         (200..300).contains(&status),
         "create derived ({status}): {def_json}"
     );
+    crate::common::commit_calculation(&db, calculation).await;
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .expect("derived output parameter_id must be populated by after_create hook")
@@ -225,6 +226,7 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
     )
     .await;
     assert!((200..300).contains(&status));
+    crate::common::commit_calculation(&db, calculation).await;
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .unwrap()
@@ -312,6 +314,7 @@ async fn test_continuous_derived_binds_a_constant_by_name() {
         (200..300).contains(&status),
         "create derived ({status}): {def_json}"
     );
+    crate::common::commit_calculation(&db, calculation).await;
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .unwrap()
@@ -403,6 +406,7 @@ async fn na_clears_the_value_the_formula_no_longer_produces_and_a_divide_by_zero
                 (200..300).contains(&status),
                 "create derived ({status}): {def}"
             );
+            crate::common::commit_calculation(&db, calculation).await;
             let parameter_id = def["output_parameter_id"]
                 .as_str()
                 .expect("derived output parameter_id")
@@ -683,6 +687,7 @@ async fn a_set_with_a_step_and_two_outputs_publishes_both_from_one_pass() {
         false,
     )
     .await;
+    crate::common::commit_calculation(&db, calculation).await;
 
     let output_id = |formula: &serde_json::Value| {
         Uuid::parse_str(formula["output_parameter_id"].as_str().expect("an output"))

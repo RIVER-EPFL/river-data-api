@@ -25,9 +25,8 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 }
 
 async fn save_group(app: &axum::Router, token: &str) {
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::post_checked_grab(
         app,
-        "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
             "readings": REPLICATES

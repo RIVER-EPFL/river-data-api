@@ -62,7 +62,6 @@ fn test_a_subject_is_read_by_its_own_prefix_only() {
 fn test_a_capture_round_trips_through_the_stored_json() {
     let input = ConsumedInput {
         variable: "WTW_Temp_degC_1".to_string(),
-        alignment: None,
         kind: "mean".to_string(),
         subject: None,
         property: None,
@@ -81,52 +80,23 @@ fn test_a_capture_round_trips_through_the_stored_json() {
     assert_eq!(back, input);
 }
 
-// Scenario: a calculation on a stream consumed an input held from the last visit (Q230).
-//
-// Expected behaviour: the record names the reading at the visit's instant and says it was held,
-// so a reader can tell a held value from a mis-stamped one. An input read at the instant says
-// nothing, which is what every blob written before the rule meant.
+/// Expected behaviour: a record captured while a source could be held (Q230, withdrawn by Q252)
+/// still reads back, the rule it named dropped.
 #[test]
-fn test_a_held_input_says_so_and_an_exact_one_says_nothing() {
-    let visit = Utc.with_ymd_and_hms(2026, 8, 1, 9, 14, 32).unwrap();
-    let held = ConsumedInput {
-        variable: "alkalinity".to_string(),
-        alignment: Some("hold".to_string()),
-        kind: "reading".to_string(),
-        subject: None,
-        property: None,
-        revision: None,
-        members: vec![ConsumedReading {
-            stream_id: Uuid::new_v4(),
-            time: visit,
-            replicate_index: 0,
-            revision: None,
-            value: Some(7.0),
-        }],
-        value: serde_json::json!(7.0),
-    };
-    let stored = serde_json::to_value(&held).unwrap();
-    assert_eq!(stored["alignment"], "hold");
-    assert_eq!(
-        stored["members"][0]["time"],
-        serde_json::to_value(visit).unwrap(),
-        "and the member stands at the instant it was measured, not at the one computed"
-    );
-    assert_eq!(
-        serde_json::from_value::<ConsumedInput>(stored).unwrap(),
-        held
-    );
-
-    let exact = ConsumedInput {
-        alignment: None,
-        ..held
-    };
-    let stored = serde_json::to_value(&exact).unwrap();
-    assert!(stored.get("alignment").is_none(), "{stored}");
-    assert_eq!(
-        serde_json::from_value::<ConsumedInput>(stored).unwrap(),
-        exact,
-        "a blob written before the rule reads back as read at the instant"
+fn test_a_capture_naming_a_hold_still_reads() {
+    let stored = serde_json::json!({
+        "variable": "alkalinity",
+        "alignment": "hold",
+        "kind": "reading",
+        "value": 7.0,
+    });
+    let back: ConsumedInput = serde_json::from_value(stored).unwrap();
+    assert_eq!(back.variable, "alkalinity");
+    assert!(
+        serde_json::to_value(&back)
+            .unwrap()
+            .get("alignment")
+            .is_none()
     );
 }
 
@@ -138,7 +108,6 @@ fn captured(
 ) -> ConsumedInput {
     ConsumedInput {
         variable: variable.to_string(),
-        alignment: None,
         kind: "constant".to_string(),
         subject: subject.map(str::to_string),
         property: None,
@@ -219,7 +188,6 @@ mod resolve {
             subject: subject.map(str::to_string),
             property: None,
             revision: Some(4),
-            alignment: None,
             members,
             value: serde_json::json!(2.0),
         }
