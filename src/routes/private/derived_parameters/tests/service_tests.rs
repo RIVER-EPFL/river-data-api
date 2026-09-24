@@ -1,4 +1,7 @@
-use super::{DerivedGraph, StepRef, shared_cycle, unread_steps, validate_dependency_chain};
+use super::{
+    DerivedGraph, OwnedStep, StepRef, owned_chain, shared_cycle, unread_steps,
+    validate_dependency_chain,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -413,4 +416,44 @@ fn test_a_shared_step_cycle_names_its_members() {
         err.contains("loop_a") && err.contains("loop_b") && !err.contains("apart"),
         "{err}"
     );
+}
+
+fn owned(code: &str, formula: &str) -> OwnedStep {
+    OwnedStep {
+        id: Uuid::new_v4(),
+        code: code.to_string(),
+        formula: formula.to_string(),
+    }
+}
+
+#[test]
+fn test_owned_chain_brings_the_owned_step_a_step_reads() {
+    let water_k = owned("water_k", "WTW_Temp_degC_1 + 273.15");
+    let steps = [water_k.clone(), owned("unread", "1")];
+    let chain = owned_chain("0.034 * exp(c_const * (1 / water_k - 1 / 298.15))", &steps);
+    assert_eq!(chain, [water_k.id]);
+}
+
+#[test]
+fn test_owned_chain_puts_each_step_after_the_steps_it_reads() {
+    let a = owned("a", "Dissolved_O2 + 1");
+    let b = owned("b", "a * 2");
+    let c = owned("c", "b + a");
+    let steps = [c.clone(), b.clone(), a.clone()];
+    assert_eq!(owned_chain("c / 2", &steps), [a.id, b.id, c.id]);
+}
+
+#[test]
+fn test_owned_chain_is_empty_for_a_step_reading_no_owned_step() {
+    let steps = [owned("water_k", "Dissolved_O2 + 273.15")];
+    assert!(owned_chain("shared_k * 2 + Dissolved_O2", &steps).is_empty());
+}
+
+#[test]
+fn test_owned_chain_names_a_step_reached_twice_once() {
+    let base = owned("base", "Dissolved_O2");
+    let left = owned("left", "base + 1");
+    let right = owned("right", "base - 1");
+    let steps = [base.clone(), left.clone(), right.clone()];
+    assert_eq!(owned_chain("left * right", &steps), [base.id, left.id, right.id]);
 }

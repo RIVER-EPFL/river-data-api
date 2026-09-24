@@ -7707,6 +7707,150 @@ pub(super) async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> A
     Ok(plan)
 }
 
+/// Write a plan's reviewed documents and bump its version, only where the row is still at the
+/// version the writer read. Zero rows affected means another writer got there first.
+pub(super) async fn write_plan_revision(
+    db: &sea_orm::DatabaseConnection,
+    id: Uuid,
+    expected_version: i32,
+    revision: pairing_plans::models::ActiveModel,
+) -> AppResult<u64> {
+    let version = pairing_plans::models::Column::Version;
+    let written = pairing_plans::models::Entity::update_many()
+        .set(revision)
+        .col_expr(version, Expr::col(version).add(1))
+        .filter(pairing_plans::models::Column::Id.eq(id))
+        .filter(version.eq(expected_version))
+        .exec(db)
+        .await?;
+    Ok(written.rows_affected)
+}
+
+/// Paired and unpaired stream counts per source system, ordered by source system.
+pub(super) async fn unpaired_summary(
+    db: &sea_orm::DatabaseConnection,
+) -> AppResult<Vec<UnpairedSummaryRow>> {
+    use data_streams::models::{Column, Entity};
+    let query = SeaQuery::select()
+        .column(Column::SourceSystem)
+        .expr_as(
+            count_where(Condition::all().add(Column::SiteParameterId.is_null())),
+            Alias::new("unpaired"),
+        )
+        .expr_as(
+            count_where(Condition::all().add(Column::SiteParameterId.is_not_null())),
+            Alias::new("paired"),
+        )
+        .from(Entity)
+        .group_by_col(Column::SourceSystem)
+        .order_by(Column::SourceSystem, Order::Asc)
+        .take();
+    Ok(UnpairedSummaryRow::find_by_statement(built(query))
+        .all(db)
+        .await?)
+}
+
+/// `metadata-><object>->>'<field>'`, one text field of a stream's source metadata.
+fn stream_metadata(object: &str, field: &str) -> Expr {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    Expr::col(data_streams::models::Column::Metadata)
+        .get_json_field(object)
+        .cast_json_field(field)
+}
+
+/// `metadata->>'<field>'`, a top-level text field of a stream's source metadata.
+fn stream_metadata_top(field: &str) -> Expr {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    Expr::col(data_streams::models::Column::Metadata).cast_json_field(field)
+}
+
+/// One metadata row per site the given streams name, as the streams' source metadata carries it.
+pub(super) async fn plan_site_metadata_rows(
+    db: &sea_orm::DatabaseConnection,
+    stream_ids: &[Uuid],
+) -> AppResult<Vec<PlanSiteMetadataRow>> {
+    let site_name = Alias::new("site_name");
+    let query = SeaQuery::select()
+        .distinct_on([site_name.clone()])
+        .expr_as(stream_metadata("hierarchy", "site"), site_name.clone())
+        .expr_as(
+            stream_metadata("coordinates", "latitude"),
+            Alias::new("latitude"),
+        )
+        .expr_as(
+            stream_metadata("coordinates", "longitude"),
+            Alias::new("longitude"),
+        )
+        .expr_as(
+            stream_metadata("coordinates", "altitude_m"),
+            Alias::new("altitude_m"),
+        )
+        .expr_as(
+            stream_metadata("glacier", "name"),
+            Alias::new("glacier_name"),
+        )
+        .expr_as(
+            stream_metadata("glacier", "rgi_v6"),
+            Alias::new("glacier_rgi"),
+        )
+        .expr_as(
+            stream_metadata("location", "type"),
+            Alias::new("location_type"),
+        )
+        .expr_as(
+            stream_metadata("station", "catchment"),
+            Alias::new("catchment"),
+        )
+        .expr_as(
+            stream_metadata("station", "full_name"),
+            Alias::new("full_name"),
+        )
+        .expr_as(
+            stream_metadata("station", "elevation"),
+            Alias::new("elevation"),
+        )
+        .expr_as(stream_metadata_top("channel_id"), Alias::new("channel_id"))
+        .expr_as(
+            stream_metadata_top("sample_interval_sec"),
+            Alias::new("sample_interval_sec"),
+        )
+        .from(data_streams::models::Entity)
+        .and_where(data_streams::models::Column::Id.is_in(stream_ids.iter().copied()))
+        .order_by(site_name, Order::Asc)
+        .take();
+    Ok(PlanSiteMetadataRow::find_by_statement(built(query))
+        .all(db)
+        .await?)
+}
+
+/// The loggers the given streams name, one row per site and serial with its stream count.
+pub(super) async fn plan_site_device_rows(
+    db: &sea_orm::DatabaseConnection,
+    stream_ids: &[Uuid],
+) -> AppResult<Vec<PlanSiteDeviceRow>> {
+    let (site_name, serial_name) = (Alias::new("site_name"), Alias::new("serial"));
+    let serial = stream_metadata("device", "logger_serial");
+    let query = SeaQuery::select()
+        .expr_as(stream_metadata("hierarchy", "site"), site_name.clone())
+        .expr_as(serial.clone(), serial_name.clone())
+        .expr_as(
+            Func::max(stream_metadata("device", "logger_device")),
+            Alias::new("model"),
+        )
+        .expr_as(Func::count(Expr::val(1)), Alias::new("streams"))
+        .from(data_streams::models::Entity)
+        .and_where(data_streams::models::Column::Id.is_in(stream_ids.iter().copied()))
+        .and_where(serial.ne(""))
+        .group_by_col(site_name.clone())
+        .group_by_col(serial_name.clone())
+        .order_by(site_name, Order::Asc)
+        .order_by(serial_name, Order::Asc)
+        .take();
+    Ok(PlanSiteDeviceRow::find_by_statement(built(query))
+        .all(db)
+        .await?)
+}
+
 #[cfg(test)]
 #[path = "tests/service.rs"]
 mod tests;

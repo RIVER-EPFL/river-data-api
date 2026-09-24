@@ -1040,8 +1040,8 @@ pub struct LedgerQuery {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LedgerEntry {
     pub at: DateTime<Utc>,
-    /// Which record this came from: `decision`, `ingest`, `hold`, `tool_run`, `job`, `job_log`,
-    /// `change` or `alarm`.
+    /// Which record this came from: `arrival`, `pairing`, `decision`, `ingest`, `hold`,
+    /// `tool_run`, `job`, `job_log`, `change` or `alarm`.
     pub source: String,
     /// `error`, `warning` or `info`, derived per source shape at the read.
     pub severity: String,
@@ -1058,6 +1058,11 @@ pub struct LedgerEntry {
     pub new: Option<serde_json::Value>,
     /// The row this entry is, so a reader can open it where it lives.
     pub id: Uuid,
+    /// On a `decision` entry, the decision itself: its kind, reason, origin, set and whether it
+    /// may still be rolled back, so the history renders and undoes it from this read alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub decision: Option<DecisionRow>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1076,6 +1081,8 @@ pub struct LedgerResponse {
 pub(super) struct ReceiptRow {
     pub(super) id: Uuid,
     pub(super) at: DateTime<Utc>,
+    pub(super) window_from: Option<DateTime<Utc>>,
+    pub(super) window_to: Option<DateTime<Utc>>,
     pub(super) submitted: i32,
     pub(super) new_rows: i32,
     pub(super) changed: i32,
@@ -1687,6 +1694,10 @@ pub struct PortalCalculation {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PortalInput {
     pub column: String,
+    /// The stream of the same source at the same site that carries the column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub stream_id: Option<Uuid>,
     /// The record it opens, where a stream of the same source at the same site holds it at the
     /// same instant.
     #[serde(skip_serializing_if = "Option::is_none")]

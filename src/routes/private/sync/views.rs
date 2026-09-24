@@ -1732,35 +1732,35 @@ pub async fn update_pairing_plan(
         }
     }
 
-    let summary = serde_json::to_value(crate::routes::private::sync::service::compute_summary_pub(
-        &entries,
-    ))
-    .unwrap_or_default();
+    let summary = crate::routes::private::sync::service::compute_summary_pub(&entries);
 
     // The write names the version it read, so a second writer who read the same document is
     // refused rather than carrying the first's entries back over the first's decisions.
-    let written = state
-        .db
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE pairing_plans SET entries = $1, curve_assignments = $2, summary = $3, \
-             accepted_objects = $4, instrument_proposals = $5, curve_attachments = $6, \
-             version = version + 1 WHERE id = $7 AND version = $8",
-            [
-                serde_json::to_value(&entries).unwrap_or_default().into(),
-                serde_json::to_value(&intents).unwrap_or_default().into(),
-                summary.into(),
-                serde_json::to_value(&accepted).unwrap_or_default().into(),
-                serde_json::to_value(&proposals).unwrap_or_default().into(),
-                serde_json::to_value(&attachments)
-                    .unwrap_or_default()
-                    .into(),
-                id.into(),
-                req.expected_version.into(),
-            ],
-        ))
-        .await?;
-    if written.rows_affected() == 0 {
+    let revision = crate::routes::private::data_streams::pairing_plans::ActiveModel {
+        entries: Set(crate::routes::private::sync::service::PlanEntries(entries)),
+        curve_assignments: Set(crate::routes::private::sync::service::PlanCurveIntents(
+            intents,
+        )),
+        summary: Set(summary),
+        accepted_objects: Set(crate::routes::private::sync::service::PlanAcceptedObjects(
+            accepted,
+        )),
+        instrument_proposals: Set(
+            crate::routes::private::sync::service::PlanInstrumentProposals(proposals),
+        ),
+        curve_attachments: Set(crate::routes::private::sync::service::PlanCurveAttachments(
+            attachments,
+        )),
+        ..Default::default()
+    };
+    let written = crate::routes::private::sync::service::write_plan_revision(
+        &state.db,
+        id,
+        req.expected_version,
+        revision,
+    )
+    .await?;
+    if written == 0 {
         return Err(stale_plan(plan_version(&state.db, id).await?));
     }
 
@@ -1886,25 +1886,9 @@ pub async fn revert_pairing_plan(
 pub async fn unpaired_summary(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<UnpairedSummaryRow>>> {
-    use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT source_system, \
-                COUNT(*) FILTER (WHERE site_parameter_id IS NULL) as unpaired, \
-                COUNT(*) FILTER (WHERE site_parameter_id IS NOT NULL) as paired \
-         FROM data_streams GROUP BY source_system ORDER BY source_system"
-                .to_owned(),
-        ))
-        .await?;
-
-    let result = rows
-        .iter()
-        .map(|row| UnpairedSummaryRow::from_query_result(row, ""))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(Json(result))
+    Ok(Json(
+        crate::routes::private::sync::service::unpaired_summary(&state.db).await?,
+    ))
 }
 
 /// Get site metadata enrichment for a pairing plan: latitudes, longitudes, glacier names,
@@ -1923,8 +1907,6 @@ pub async fn plan_site_metadata(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<PlanSiteMetadata>>> {
-    use sea_orm::{FromQueryResult, Statement};
-
     let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
         .await?
@@ -1937,36 +1919,9 @@ pub async fn plan_site_metadata(
         return Ok(Json(vec![]));
     }
 
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT ON (metadata->'hierarchy'->>'site') \
-            metadata->'hierarchy'->>'site' as site_name, \
-            metadata->'coordinates'->>'latitude' as latitude, \
-            metadata->'coordinates'->>'longitude' as longitude, \
-            metadata->'coordinates'->>'altitude_m' as altitude_m, \
-            metadata->'glacier'->>'name' as glacier_name, \
-            metadata->'glacier'->>'rgi_v6' as glacier_rgi, \
-            metadata->'location'->>'type' as location_type, \
-            metadata->'station'->>'catchment' as catchment, \
-            metadata->'station'->>'full_name' as full_name, \
-            metadata->'station'->>'elevation' as elevation, \
-            metadata->>'channel_id' as channel_id, \
-            metadata->>'sample_interval_sec' as sample_interval_sec \
-         FROM data_streams WHERE id = ANY($1) \
-         ORDER BY metadata->'hierarchy'->>'site'",
-            [sea_orm::Value::Array(
-                sea_orm::sea_query::ArrayType::Uuid,
-                Some(Box::new(
-                    stream_ids
-                        .iter()
-                        .map(|id| sea_orm::Value::Uuid(Some(*id)))
-                        .collect(),
-                )),
-            )],
-        ))
-        .await?;
+    let rows =
+        crate::routes::private::sync::service::plan_site_metadata_rows(&state.db, &stream_ids)
+            .await?;
 
     // A JSON field that was never written reads as absent, and one written as the string "null"
     // or as empty says the source had nothing there, which is the same thing.
@@ -1978,56 +1933,32 @@ pub async fn plan_site_metadata(
     }
 
     let mut result: Vec<PlanSiteMetadata> = rows
-        .iter()
-        .map(|row| {
-            let r = PlanSiteMetadataRow::from_query_result(row, "")?;
-            Ok(PlanSiteMetadata {
-                site_name: r.site_name.unwrap_or_default(),
-                latitude: number(r.latitude),
-                longitude: number(r.longitude),
-                altitude_m: number(r.altitude_m),
-                glacier_name: present(r.glacier_name),
-                glacier_rgi: present(r.glacier_rgi),
-                location_type: present(r.location_type),
-                catchment: present(r.catchment),
-                full_name: present(r.full_name),
-                elevation: number(r.elevation),
-                channel_id: present(r.channel_id),
-                sample_interval_sec: present(r.sample_interval_sec)
-                    .and_then(|s| s.parse::<i64>().ok()),
-                devices: Vec::new(),
-            })
+        .into_iter()
+        .map(|r| PlanSiteMetadata {
+            site_name: r.site_name.unwrap_or_default(),
+            latitude: number(r.latitude),
+            longitude: number(r.longitude),
+            altitude_m: number(r.altitude_m),
+            glacier_name: present(r.glacier_name),
+            glacier_rgi: present(r.glacier_rgi),
+            location_type: present(r.location_type),
+            catchment: present(r.catchment),
+            full_name: present(r.full_name),
+            elevation: number(r.elevation),
+            channel_id: present(r.channel_id),
+            sample_interval_sec: present(r.sample_interval_sec).and_then(|s| s.parse::<i64>().ok()),
+            devices: Vec::new(),
         })
-        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+        .collect();
 
     // Devices are counted per site, not folded into the site row: a site instrumented with two
     // loggers has two, and reporting one of them names channels that belong to the other.
-    let device_rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT metadata->'hierarchy'->>'site' AS site_name, \
-                    metadata->'device'->>'logger_serial' AS serial, \
-                    max(metadata->'device'->>'logger_device') AS model, \
-                    count(*) AS streams \
-             FROM data_streams \
-             WHERE id = ANY($1) AND metadata->'device'->>'logger_serial' <> '' \
-             GROUP BY 1, 2 ORDER BY 1, 2",
-            [sea_orm::Value::Array(
-                sea_orm::sea_query::ArrayType::Uuid,
-                Some(Box::new(
-                    stream_ids
-                        .iter()
-                        .map(|id| sea_orm::Value::Uuid(Some(*id)))
-                        .collect(),
-                )),
-            )],
-        ))
-        .await?;
+    let device_rows =
+        crate::routes::private::sync::service::plan_site_device_rows(&state.db, &stream_ids)
+            .await?;
     let mut devices_by_site: std::collections::HashMap<String, Vec<PlanSiteDevice>> =
         std::collections::HashMap::new();
-    for row in &device_rows {
-        let r = PlanSiteDeviceRow::from_query_result(row, "")?;
+    for r in device_rows {
         let Some(serial) = r.serial.filter(|s| !s.is_empty()) else {
             continue;
         };

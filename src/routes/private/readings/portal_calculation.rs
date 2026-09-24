@@ -27,20 +27,21 @@ pub async fn of_stream<C: ConnectionTrait>(
     let Some(declared) = plan_calculation(&stream.source_system, &stream.metadata) else {
         return Ok(None);
     };
-    let points = match site_id {
+    let streams = match site_id {
         Some(site_id) => {
             let candidates = paired_streams_at(db, &stream.source_system, site_id).await?;
-            let streams = streams_for_columns(&candidates, &declared.inputs);
-            points_at(db, &streams, time).await?
+            streams_for_columns(&candidates, &declared.inputs)
         }
         None => HashMap::new(),
     };
+    let points = points_at(db, &streams, time).await?;
     Ok(Some(PortalCalculation {
         function: declared.function,
         inputs: declared
             .inputs
             .into_iter()
             .map(|column| PortalInput {
+                stream_id: streams.get(&column).copied(),
                 point: points.get(&column).cloned(),
                 column,
             })

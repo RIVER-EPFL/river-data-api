@@ -3321,22 +3321,31 @@ pub(super) async fn decisions<C: ConnectionTrait>(
         .order_by_desc(decision_model::Column::At)
         .all(conn)
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| LedgerEntry {
-            at: r.at.into(),
-            source: "decision".to_string(),
-            severity: Severity::Info.as_str().to_string(),
-            actor: Some(r.actor),
-            what: match r.reason {
-                Some(why) if !why.trim().is_empty() => format!("{}: {why}", r.kind),
-                _ => r.kind,
-            },
-            old: Some(r.old),
-            new: Some(r.new),
-            id: r.id,
+    let sets: Vec<Uuid> = rows.iter().filter_map(|r| r.set_id).collect();
+    let rulings = audit::standing_rulings(conn, &sets).await?;
+    rows.into_iter()
+        .map(|stored| {
+            let mut row = row_from(stored)?;
+            row.ruling_hold_id = row.set_id.and_then(|s| rulings.get(&s).copied());
+            Ok(decision_entry(row))
         })
-        .collect())
+        .collect()
+}
+
+/// A decision as a ledger entry: `what` is its kind, and the row rides along for the reason, the
+/// origin and the rollback.
+pub(super) fn decision_entry(row: DecisionRow) -> LedgerEntry {
+    LedgerEntry {
+        at: row.at,
+        source: "decision".to_string(),
+        severity: Severity::Info.as_str().to_string(),
+        actor: Some(row.actor.clone()),
+        what: row.kind.as_str().to_string(),
+        old: Some(row.old.clone()),
+        new: Some(row.new.clone()),
+        id: row.id,
+        decision: Some(row),
+    }
 }
 
 /// Every windowed ingest pass whose claimed window covers the instant, not only the latest: the
@@ -3353,6 +3362,8 @@ pub(super) async fn ingest_passes<C: ConnectionTrait>(
         .columns([
             receipts::Column::Id,
             receipts::Column::At,
+            receipts::Column::WindowFrom,
+            receipts::Column::WindowTo,
             receipts::Column::Submitted,
             receipts::Column::NewRows,
             receipts::Column::Changed,
@@ -3398,10 +3409,105 @@ pub(super) async fn ingest_passes<C: ConnectionTrait>(
                 "withdrawn": r.withdrawn,
                 "rejected": r.rejected_total,
                 "braked": r.braked,
+                "window_from": r.window_from,
+                "window_to": r.window_to,
             })),
             id: r.id,
+            decision: None,
         })
         .collect())
+}
+
+/// The streams the instant's rows arrived on, as the arrival and pairing rows name them.
+pub(super) async fn streams_of<C: ConnectionTrait>(
+    conn: &C,
+    streams: &[Uuid],
+) -> AppResult<Vec<data_streams::Model>> {
+    if streams.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(data_streams::Entity::find()
+        .filter(data_streams::Column::Id.is_in(streams.to_vec()))
+        .all(conn)
+        .await?)
+}
+
+/// One row per stream and arrival time: when the replicates reached the store, by which write
+/// path and on which stream. A reading's `ingested_at` is its first arrival and nothing moves it.
+pub(super) fn arrivals(rows: &[RawRow], streams: &[data_streams::Model]) -> Vec<LedgerEntry> {
+    type Arrived = (Option<String>, Vec<i16>);
+    let mut arrived: BTreeMap<(Uuid, DateTime<Utc>), Arrived> = BTreeMap::new();
+    for r in rows {
+        let Some(at) = r.ingested_at else { continue };
+        let slot = arrived
+            .entry((r.stream_id, at))
+            .or_insert_with(|| (r.provenance_kind.clone(), Vec::new()));
+        slot.1.push(r.replicate_index);
+    }
+    arrived
+        .into_iter()
+        .filter_map(|((stream_id, at), (origin, replicates))| {
+            let stream = streams.iter().find(|s| s.id == stream_id)?;
+            Some(arrival_entry(stream, at, origin.as_deref(), &replicates))
+        })
+        .collect()
+}
+
+pub(super) fn arrival_entry(
+    stream: &data_streams::Model,
+    at: DateTime<Utc>,
+    origin: Option<&str>,
+    replicates: &[i16],
+) -> LedgerEntry {
+    LedgerEntry {
+        at,
+        source: "arrival".to_string(),
+        severity: Severity::Info.as_str().to_string(),
+        actor: None,
+        what: "arrived".to_string(),
+        old: None,
+        new: Some(serde_json::json!({
+            "origin": origin,
+            "stream_id": stream.id,
+            "source_system": stream.source_system,
+            "source_key": stream.source_key,
+            "replicates": replicates,
+        })),
+        id: stream.id,
+        decision: None,
+    }
+}
+
+/// When each stream was paired to the slot the instant is served under.
+pub(super) fn pairings(
+    streams: &[data_streams::Model],
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+) -> Vec<LedgerEntry> {
+    streams
+        .iter()
+        .filter_map(|stream| {
+            let at = stream.paired_at?.with_timezone(&Utc);
+            Some(LedgerEntry {
+                at,
+                source: "pairing".to_string(),
+                severity: Severity::Info.as_str().to_string(),
+                actor: None,
+                what: "paired".to_string(),
+                old: None,
+                new: Some(serde_json::json!({
+                    "stream_id": stream.id,
+                    "source_system": stream.source_system,
+                    "source_key": stream.source_key,
+                    "site_parameter_id": stream.site_parameter_id,
+                    "site_id": site_id,
+                    "parameter_id": parameter_id,
+                })),
+                id: stream.id,
+                decision: None,
+            })
+        })
+        .collect()
 }
 
 /// Holds raised on one of these streams.
@@ -3469,6 +3575,7 @@ pub(super) async fn hold_rows<C: ConnectionTrait>(
             old: None,
             new: r.tool.map(Into::into),
             id: r.id,
+            decision: None,
         })
         .collect())
 }
@@ -3510,6 +3617,7 @@ pub(super) async fn tool_runs<C: ConnectionTrait>(
             old: None,
             new: Some(r.tool_version),
             id: r.id,
+            decision: None,
         })
         .collect())
 }
@@ -3580,6 +3688,7 @@ pub(super) async fn job_entries<C: ConnectionTrait>(
                 "error_message": r.error_message,
             })),
             id: r.id,
+            decision: None,
         })
         .collect())
 }
@@ -3613,6 +3722,7 @@ pub(super) async fn job_logs<C: ConnectionTrait>(
             // A timeline entry is keyed by (job_id, seq) and has no id of its own; the job is
             // where a reader opens it.
             id: r.job_id,
+            decision: None,
         })
         .collect())
 }
@@ -3675,6 +3785,7 @@ pub(super) async fn slot_changes<C: ConnectionTrait>(
             old: r.old_value,
             new: r.new_value,
             id: r.id,
+            decision: None,
         })
         .collect())
 }
@@ -3741,6 +3852,7 @@ pub(super) async fn alarms<C: ConnectionTrait>(
                 "resolved_at": r.resolved_at,
             })),
             id: r.id,
+            decision: None,
         })
         .collect())
 }
@@ -14204,3 +14316,7 @@ async fn load_reading_curves<C: ConnectionTrait>(
         })
         .collect())
 }
+
+#[cfg(test)]
+#[path = "tests/ledger.rs"]
+mod ledger;

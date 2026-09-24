@@ -537,8 +537,8 @@ pub async fn replay_derived(
     ))
 }
 
-/// Everything that happened to one measured instant, in time order: the decisions taken on it, the
-/// ingest passes that carried it, the review holds it raised, the tool run that computed it, the
+/// Everything that happened to one measured instant, in time order: its arrival, the pairing of
+/// its stream, the decisions taken on it, the ingest passes that carried it, the review holds it raised, the tool run that computed it, the
 /// jobs that rewrote it and what they skipped, the slot edits that changed how it is served, and
 /// the alarms it raised. Requires `read_data`.
 #[utoipa::path(
@@ -582,7 +582,9 @@ pub async fn get_reading_ledger(
     let events: Vec<Uuid> = dedup(rows.iter().filter_map(|r| r.collection_event_id));
     let runs: Vec<Uuid> = dedup(rows.iter().filter_map(|r| run_id_of(r.provenance.as_ref())));
 
-    let mut entries = Vec::new();
+    let stream_models = streams_of(&state.db, &streams).await?;
+    let mut entries = arrivals(&rows, &stream_models);
+    entries.extend(pairings(&stream_models, site_id, parameter_id));
     entries.extend(decisions(&state.db, &streams, q.time).await?);
     entries.extend(ingest_passes(&state.db, &streams, q.time).await?);
     entries.extend(holds(&state.db, &streams, site_id, parameter_id).await?);

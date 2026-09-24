@@ -753,7 +753,6 @@ async fn a_shared_step_reads_another_shared_step() {
 async fn a_shared_step_reading_a_step_a_calculation_owns_is_refused_by_name_and_owner() {
     let (db, app, token) = setup().await;
     let pco2real = calculation(&db, "pco2real").await;
-    let other = calculation(&db, "other_set").await;
     owned_step(&app, &token, &pco2real, "water_k", "Dissolved_O2 + 273.15").await;
     let kh = owned_step(&app, &token, &pco2real, "kh", "0.034 / water_k").await;
 
@@ -766,21 +765,6 @@ async fn a_shared_step_reading_a_step_a_calculation_owns_is_refused_by_name_and_
         "{refused}"
     );
 
-    // Declaring kh releases it, and a released kh would read pco2real's own water_k.
-    let (status, refused) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/calculation_shared_steps",
-        &json!({ "tool_script_id": other, "formula_id": id_of(&kh) }),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 400, "{refused}");
-    assert!(
-        refused
-            .to_string()
-            .contains("reads water_k, a step of pco2real that is not shared"),
-        "{refused}"
-    );
     let owner = crate::common::e2e::scalar(
         &db,
         &format!(
@@ -923,4 +907,130 @@ async fn a_calculation_receives_the_shared_steps_its_declared_steps_read() {
         .map(|f| f["code"].as_str().expect("a code"))
         .collect();
     assert_eq!(readers, ["kh"], "kh is what reads it there: {feeds}");
+}
+
+/// The owner's value at a visit's instant, after its stream pass runs there on a DO reading.
+async fn computed_at(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+    output_parameter_id: &str,
+    hours_ago: i64,
+    dissolved_o2: f64,
+) -> Option<f64> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let site_id = uuid::Uuid::parse_str(crate::common::SITE1_ID).expect("a uuid");
+    let at = chrono::Utc::now() - chrono::Duration::hours(hours_ago);
+    let at = at - chrono::Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, written) = crate::common::post_json_with_token(
+        app,
+        "/api/readings/batch",
+        &json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": dissolved_o2,
+            }]
+        }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "batch ({status}): {written}");
+    river_db::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp(
+        db, site_id, at,
+    )
+    .await
+    .expect("the stream pass runs");
+    let output = uuid::Uuid::parse_str(output_parameter_id).expect("a uuid");
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT raw_value FROM readings WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
+        [site_id.into(), output.into(), at.into()],
+    ))
+    .await
+    .expect("a query")
+    .map(|row| row.try_get::<f64>("", "raw_value").expect("a value"))
+}
+
+/// Scenario: another calculation brings in `kh`, which reads `water_k`, both `pco2real`'s own.
+///
+/// Expected behaviour: both are released to shared, `pco2real` declares both, and it computes its
+/// output as before.
+#[tokio::test]
+#[serial]
+async fn bringing_in_a_step_shares_the_owned_steps_it_reads() {
+    let (db, app, token) = setup().await;
+    let pco2real = calculation(&db, "pco2real").await;
+    let other = calculation(&db, "other_set").await;
+    let water_k = owned_step(&app, &token, &pco2real, "water_k", "Dissolved_O2 * 2").await;
+    let kh = owned_step(&app, &token, &pco2real, "kh", "water_k + 1").await;
+    let output = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "pco2_out", "name": "pco2 out", "units": "",
+            "formula": "kh * 10", "tool_script_id": pco2real, "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    crate::common::commit_calculation(&db, pco2real.parse().expect("a uuid")).await;
+    let output_parameter_id = output["output_parameter_id"]
+        .as_str()
+        .expect("the formula minted its output")
+        .to_string();
+    post(
+        &app,
+        "/api/site_parameters",
+        &json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output_parameter_id,
+            "name": "pco2_out",
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "cadence": "high",
+        }),
+        &token,
+    )
+    .await;
+    // (100 * 2 + 1) * 10
+    let before = computed_at(&db, &app, &token, &output_parameter_id, 6, 100.0).await;
+    assert_eq!(before, Some(2010.0), "pco2real computes from its own steps");
+
+    post(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": other, "formula_id": id_of(&kh) }),
+        &token,
+    )
+    .await;
+
+    for step in [&water_k, &kh] {
+        let owner = crate::common::e2e::scalar(
+            &db,
+            &format!(
+                "SELECT COALESCE(tool_script_id::text, 'none') FROM calculation_formulas \
+                  WHERE id = '{}'",
+                id_of(step)
+            ),
+        )
+        .await;
+        assert_eq!(owner, "none", "{} is shared: {step}", step["code"]);
+        let declared = crate::common::e2e::scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::text FROM calculation_shared_steps \
+                  WHERE tool_script_id = '{pco2real}' AND formula_id = '{}'",
+                id_of(step)
+            ),
+        )
+        .await;
+        assert_eq!(declared, "1", "pco2real declares {}", step["code"]);
+    }
+
+    // (50 * 2 + 1) * 10
+    let after = computed_at(&db, &app, &token, &output_parameter_id, 4, 50.0).await;
+    assert_eq!(after, Some(1010.0), "pco2real computes the same through its declarations");
 }

@@ -52,7 +52,7 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/sites/service.rs", 6, 17),
     ("src/routes/private/sites/views.rs", 1, 24),
     ("src/routes/private/sync/service.rs", 4, 21),
-    ("src/routes/private/sync/views.rs", 4, 2),
+    ("src/routes/private/sync/views.rs", 0, 2),
     ("src/routes/private/tools/flows.rs", 0, 5),
     ("src/routes/private/tools/models.rs", 0, 1),
     ("src/routes/private/tools/service.rs", 0, 14),

@@ -260,9 +260,65 @@ impl CRUDOperations for SharedStepOperations {
         else {
             return Ok(());
         };
+        let owned = owned_steps(db, previous_owner).await?;
+        for formula_id in owned_chain(&step.formula, &owned) {
+            declare_step(db, previous_owner, formula_id).await?;
+            release_step(db, formula_id).await?;
+        }
         declare_step(db, previous_owner, entity.formula_id).await?;
         release_step(db, entity.formula_id).await
     }
+}
+
+/// A calculation's own steps, as the chain walk reads them.
+async fn owned_steps<C: ConnectionTrait>(
+    db: &C,
+    tool_script_id: Uuid,
+) -> Result<Vec<OwnedStep>, ApiError> {
+    super::models::definition::Entity::find()
+        .filter(super::models::definition::Column::ToolScriptId.eq(tool_script_id))
+        .filter(super::models::definition::Column::Intermediate.eq(true))
+        .all(db)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| OwnedStep {
+                    id: row.id,
+                    code: row.code,
+                    formula: row.formula,
+                })
+                .collect()
+        })
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+}
+
+/// A step some calculation owns: its id, its code and the formula that computes it.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedStep {
+    pub id: Uuid,
+    pub code: String,
+    pub formula: String,
+}
+
+/// The owned steps `formula` reads and the owned steps those read, each once, every one after the
+/// steps it reads, so each can be released onto shared steps only (Q334).
+pub(crate) fn owned_chain(formula: &str, owned: &[OwnedStep]) -> Vec<Uuid> {
+    fn visit(formula: &str, owned: &[OwnedStep], seen: &mut HashSet<Uuid>, chain: &mut Vec<Uuid>) {
+        for name in free_identifiers(formula) {
+            let Some(step) = owned.iter().find(|s| s.code == name) else {
+                continue;
+            };
+            if !seen.insert(step.id) {
+                continue;
+            }
+            visit(&step.formula, owned, seen, chain);
+            chain.push(step.id);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut chain = Vec::new();
+    visit(formula, owned, &mut seen, &mut chain);
+    chain
 }
 
 /// Take a step out of the calculation that wrote it: a shared step is owned by none. The formula's

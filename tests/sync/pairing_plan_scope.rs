@@ -5,10 +5,11 @@
 //!
 //! Expected behaviour: the revert unpairs exactly the two streams the plan paired and counts
 //! those, the hand-paired stream stays where it was, and the plan's site metadata is one typed row
-//! per site its streams name.
+//! per site its streams name, with the loggers behind them.
 //!
 //! Run: cargo test --test sync pairing_plan_scope -- --test-threads=1
 
+use sea_orm::ConnectionTrait;
 use serial_test::serial;
 
 use crate::common::e2e::count;
@@ -108,7 +109,15 @@ async fn site_metadata_is_one_typed_row_per_plan_site() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
-    seed_source(&db).await;
+    let (planned, _) = seed_source(&db).await;
+    db.execute_unprepared(&format!(
+        "UPDATE data_streams SET metadata = jsonb_set(metadata, '{{device}}', \
+         '{{\"logger_serial\": \"CR1000-7\", \"logger_device\": \"CR1000\"}}') \
+         WHERE id IN ('{}')",
+        planned.join("','")
+    ))
+    .await
+    .expect("stamp the logger");
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
     let plan_id = create_plan(&app, &token).await;
@@ -127,4 +136,9 @@ async fn site_metadata_is_one_typed_row_per_plan_site() {
     assert_eq!(rows[0]["longitude"], 7.2);
     assert_eq!(rows[0]["altitude_m"], 1800.0);
     assert!(rows[0]["glacier_name"].is_null(), "{}", rows[0]);
+    assert_eq!(
+        rows[0]["devices"],
+        serde_json::json!([{ "serial": "CR1000-7", "model": "CR1000", "streams": 2 }]),
+        "one logger behind both streams"
+    );
 }

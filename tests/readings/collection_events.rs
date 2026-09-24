@@ -581,7 +581,7 @@ async fn an_empty_event_can_move_but_not_onto_another_visit() {
 }
 
 /// A stream paired to the wrong site is unpaired and paired again elsewhere. The readings must
-/// follow, so the first site's visit is gone and the second site's visit holds them.
+/// follow, so the first site's visit stands empty and the second site's visit holds them.
 #[tokio::test]
 #[serial]
 async fn re_pairing_moves_the_visit_to_the_new_site() {
@@ -652,8 +652,8 @@ async fn re_pairing_moves_the_visit_to_the_new_site() {
             ),
         )
         .await,
-        0,
-        "the first site's visit is left with no readings and must be deleted"
+        1,
+        "the emptied visit is kept"
     );
 
     let (status, body) = crate::common::post_json_with_token(

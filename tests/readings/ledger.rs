@@ -110,6 +110,22 @@ async fn the_ledger_gathers_every_record_that_holds_part_of_the_value_s_history(
     let mut sorted = times.clone();
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(times, sorted, "entries are newest first: {body}");
+    // The flag carries its decision, so the history reads its reason and undoes it from here.
+    let flag = entries
+        .iter()
+        .find(|e| e["source"] == "decision")
+        .expect("the flag");
+    assert_eq!(flag["what"], "flag", "{flag}");
+    assert_eq!(flag["decision"]["reason"], "bubble on the probe", "{flag}");
+    assert_eq!(flag["decision"]["id"], flag["id"], "{flag}");
+    assert_eq!(flag["decision"]["reversible"], true, "{flag}");
+    assert!(
+        entries
+            .iter()
+            .filter(|e| e["source"] != "decision")
+            .all(|e| e.get("decision").is_none()),
+        "only a decision carries one: {body}"
+    );
     for e in entries {
         assert!(e["what"].is_string(), "every entry says what happened: {e}");
         assert!(
@@ -174,4 +190,85 @@ async fn an_instant_with_no_reading_is_not_found() {
     )
     .await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+#[serial]
+async fn arrival_pairing_and_the_receipt_are_rows_of_their_own() {
+    let (db, app, token) = setup().await;
+    save_grab(&app, &token).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE data_streams SET paired_at = '2025-06-01T09:08:00Z' \
+             WHERE id IN (SELECT stream_id FROM readings WHERE site_id = '{SITE1_ID}' \
+                            AND parameter_id = '{GLOBAL_PARAM_DO_ID}' AND time = '{T1}')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO ingest_receipts \
+               (stream_id, at, window_from, window_to, submitted, new_rows, changed, unchanged, \
+                retained, rejected_total, rejected, dropped, withdrawn) \
+             SELECT stream_id, '2025-06-03T10:44:00Z', '2025-05-01T00:00:00Z', \
+                    '2025-06-02T00:00:00Z', 3, 0, 0, 3, 0, 0, '{{}}'::jsonb, 0, 0 \
+             FROM readings WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}' \
+               AND time = '{T1}' LIMIT 1"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::get_json_with_token(&app, &uri(""), &token).await;
+    assert_eq!(status, 200, "{body}");
+    let entries = body["entries"].as_array().unwrap();
+    let of = |source: &str| {
+        entries
+            .iter()
+            .find(|e| e["source"] == source)
+            .unwrap_or_else(|| panic!("a {source} row: {body}"))
+    };
+
+    let arrival = of("arrival");
+    assert!(arrival["new"]["origin"].is_string(), "{arrival}");
+    assert!(arrival["new"]["source_system"].is_string(), "{arrival}");
+    assert!(arrival["new"]["source_key"].is_string(), "{arrival}");
+    assert_eq!(arrival["new"]["replicates"], json!([0]), "{arrival}");
+
+    let pairing = of("pairing");
+    assert_eq!(pairing["at"], "2025-06-01T09:08:00Z", "{pairing}");
+    assert_eq!(pairing["new"]["site_id"], SITE1_ID, "{pairing}");
+    assert_eq!(
+        pairing["new"]["parameter_id"], GLOBAL_PARAM_DO_ID,
+        "{pairing}"
+    );
+    assert!(pairing["new"]["source_key"].is_string(), "{pairing}");
+
+    let receipts: Vec<_> = entries.iter().filter(|e| e["source"] == "ingest").collect();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the receipt and its pass are one row: {body}"
+    );
+    let receipt = receipts[0];
+    assert_eq!(receipt["at"], "2025-06-03T10:44:00Z", "{receipt}");
+    for (field, value) in [
+        ("submitted", 3),
+        ("new", 0),
+        ("changed", 0),
+        ("unchanged", 3),
+        ("withdrawn", 0),
+        ("rejected", 0),
+    ] {
+        assert_eq!(receipt["new"][field], value, "{field}: {receipt}");
+    }
+    assert_eq!(
+        receipt["new"]["window_from"], "2025-05-01T00:00:00Z",
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["new"]["window_to"], "2025-06-02T00:00:00Z",
+        "{receipt}"
+    );
 }

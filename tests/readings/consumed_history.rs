@@ -353,6 +353,9 @@ async fn a_group_scoped_flag_marks_the_input_and_then_takes_the_output_off_its_s
     f.write_input(10.0, None).await;
     assert!(!f.consumed().await.is_empty(), "the capture landed");
     let stream = f.output_stream().await;
+    // The flag queues the recompute that captures again without the flagged input, so the worker
+    // is held until the record the flag marked has been read.
+    crate::common::stop_test_workers().await;
 
     // A key with no replicate index is the whole group. The revision expression reads such a
     // decision at every index of the key, so the input it covers reads changed.
@@ -397,6 +400,7 @@ async fn a_group_scoped_flag_marks_the_input_and_then_takes_the_output_off_its_s
     // The flagged input no longer resolves, so the chain takes the output off the slot. The row
     // and its captured history stand; only the slot stops serving it, and the record is then
     // reachable by the stream alone.
+    crate::common::spawn_test_worker(&f.state);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(POLL_SECS);
     loop {
         let (status, _) = crate::common::get_json_with_token(&f.app, &f.uri(), &f.token).await;

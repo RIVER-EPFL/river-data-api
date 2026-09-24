@@ -69,7 +69,7 @@ pub async fn stop_test_workers() {
 /// a barrier: when the handle resolves, nothing this worker started is still writing. It finishes
 /// that one job and no more, so the wait is bounded by what is in flight rather than by how many
 /// jobs a test enqueued; the rows still queued are left for the truncate.
-fn spawn_test_worker(state: &AppState) {
+pub fn spawn_test_worker(state: &AppState) {
     let db = state.db.clone();
     let events = state.events.clone();
     let mut built = river_db::routes::private::reprocessing_jobs::service::build_registry();
