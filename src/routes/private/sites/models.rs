@@ -437,7 +437,8 @@ pub struct SampleStatOut {
 
 #[derive(Debug, Deserialize, Serialize, IntoParams)]
 pub struct SiteReadingsQuery {
-    /// Start time (optional, ISO 8601). If omitted, returns from earliest data.
+    /// Start time (optional, ISO 8601). If omitted, the window opens
+    /// `DEFAULT_READINGS_LOOKBACK_DAYS` before now (7 days unless the deployment sets it).
     pub start: Option<DateTime<Utc>>,
     /// End time (optional, ISO 8601). If omitted, returns to latest data.
     pub end: Option<DateTime<Utc>>,

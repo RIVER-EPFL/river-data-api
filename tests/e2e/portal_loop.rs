@@ -1,4 +1,4 @@
-//! S9, a portal source through the real sync driver to a served value.
+//! A portal source through the real sync driver to a served value.
 //!
 //! The two halves of this seam were each proven against a stub: the API's suite wrote the ingest
 //! bodies itself, and core's driver test drove a fake API. Here the real `SyncDriver` runs a

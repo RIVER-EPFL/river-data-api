@@ -1084,6 +1084,231 @@ async fn a_csv_import_that_fails_once_lands_its_rows_on_the_retry() {
     );
 }
 
+/// Rows of the monthly rollup at SITE1 for June 2025, as materialized rather than read through.
+async fn materialized_june(db: &DatabaseConnection) -> i64 {
+    scalar_i64(
+        db,
+        &format!(
+            "SELECT count(*) AS n FROM readings_monthly WHERE site_id = '{}' \
+             AND bucket = '2025-06-01T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await
+}
+
+/// Scenario: an import's first run stores its readings and then fails refreshing the rollups.
+/// Expected behaviour: the retry, which finds the readings already stored and moves none of them,
+/// still refreshes the rollups over what the failed attempt landed before it completes.
+#[tokio::test]
+#[serial]
+async fn a_csv_import_whose_refresh_fails_refreshes_on_the_retry() {
+    use river_db::routes::private::reprocessing_jobs::service as jobs;
+    let (db, app, token) = setup().await;
+    crate::common::stop_test_workers().await;
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    let job_id = resp["derived_job_id"]
+        .as_str()
+        .expect("a worker job id is returned")
+        .to_string();
+
+    crate::common::exec(
+        &db,
+        "ALTER MATERIALIZED VIEW readings_monthly SET (timescaledb.materialized_only = true)",
+    )
+    .await;
+    let registry = jobs::build_registry();
+    let events = tokio::sync::broadcast::channel::<river_db::common::AppEvent>(16).0;
+    let worker = jobs::worker_id();
+    let policy = jobs::RetryPolicy {
+        max_retries: 1,
+        backoff_base: std::time::Duration::ZERO,
+    };
+    crate::common::jobs::refuse_refresh(&db).await;
+    assert!(
+        jobs::run_one_with_policy(&db, &events, &registry, &worker, policy)
+            .await
+            .unwrap(),
+        "the import's first attempt runs"
+    );
+    crate::common::jobs::restore_refresh(&db).await;
+    let queued = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM reprocessing_jobs \
+             WHERE id = '{job_id}' AND status = 'queued' AND retry_count = 1"
+        ),
+    )
+    .await;
+    let before = materialized_june(&db).await;
+
+    while jobs::run_one_with_policy(&db, &events, &registry, &worker, policy)
+        .await
+        .unwrap()
+    {}
+    let after = materialized_june(&db).await;
+    crate::common::exec(
+        &db,
+        "ALTER MATERIALIZED VIEW readings_monthly SET (timescaledb.materialized_only = false)",
+    )
+    .await;
+
+    assert_eq!(queued, 1, "the failed refresh fails the first attempt");
+    assert_eq!(
+        before, 0,
+        "nothing is materialized after the failed refresh"
+    );
+    assert!(
+        after > 0,
+        "the retry refreshes what the first attempt landed"
+    );
+}
+
+/// Scenario: an import lands a temperature that a calculation at the site reads, and on its first
+/// run the derived write recomputing it fails.
+/// Expected behaviour: the job is not reported complete but queued again with its staged rows, and
+/// the retry, which finds the readings already stored and moves none of them, still recomputes the
+/// derived value.
+#[tokio::test]
+#[serial]
+async fn a_csv_import_whose_derived_recompute_fails_recomputes_on_the_retry() {
+    use river_db::routes::private::reprocessing_jobs::service as jobs;
+    let (db, app, token) = setup().await;
+
+    let calculation = crate::common::seed_formula_calculation(&db, "import_derived_set").await;
+    let (status, def) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": "TempDoubled_import", "name": "Temperature doubled", "units": "x",
+            "formula": "DO_Temperature * 2", "tool_script_id": calculation,
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "create derived ({status}): {def}"
+    );
+    let output = def["output_parameter_id"]
+        .as_str()
+        .expect("output_parameter_id")
+        .to_string();
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID, "parameter_id": output,
+            "name": "TempDoubled_import", "sensor_type": "derived", "entry_mode": "tool",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {body}"
+    );
+
+    // This test is the worker, under a policy with a retry to spend and no backoff to wait out.
+    crate::common::stop_test_workers().await;
+    let registry = jobs::build_registry();
+    let events = tokio::sync::broadcast::channel::<river_db::common::AppEvent>(16).0;
+    let worker = jobs::worker_id();
+    let policy = jobs::RetryPolicy {
+        max_retries: 1,
+        backoff_base: std::time::Duration::ZERO,
+    };
+    while jobs::run_one_with_policy(&db, &events, &registry, &worker, policy)
+        .await
+        .unwrap()
+    {}
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    let job_id = resp["derived_job_id"]
+        .as_str()
+        .expect("a worker job id is returned")
+        .to_string();
+
+    for sql in [
+        "CREATE FUNCTION test_refuse_derived() RETURNS trigger AS $$ BEGIN \
+         IF NEW.measurement_type = 'derived' THEN RAISE EXCEPTION 'derived write refused'; END IF; \
+         RETURN NEW; END; $$ LANGUAGE plpgsql",
+        "CREATE TRIGGER test_refuse_derived BEFORE INSERT OR UPDATE ON readings \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_derived()",
+    ] {
+        crate::common::exec(&db, sql).await;
+    }
+    assert!(
+        jobs::run_one_with_policy(&db, &events, &registry, &worker, policy)
+            .await
+            .unwrap(),
+        "the import's first attempt runs"
+    );
+    for sql in [
+        "DROP TRIGGER test_refuse_derived ON readings",
+        "DROP FUNCTION test_refuse_derived()",
+    ] {
+        crate::common::exec(&db, sql).await;
+    }
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM reprocessing_jobs \
+                 WHERE id = '{job_id}' AND status = 'queued' AND retry_count = 1"
+            )
+        )
+        .await,
+        1,
+        "an import whose recompute failed is queued again, not complete"
+    );
+
+    while jobs::run_one_with_policy(&db, &events, &registry, &worker, policy)
+        .await
+        .unwrap()
+    {}
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM reprocessing_jobs \
+                 WHERE id = '{job_id}' AND status = 'completed'"
+            )
+        )
+        .await,
+        1,
+        "the retry completes"
+    );
+    // 2 * 12.0 and 2 * 12.5
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM readings WHERE parameter_id = '{output}' \
+                 AND time >= '2025-06-01T00:00:00Z' AND raw_value IN (24, 25)"
+            )
+        )
+        .await,
+        2,
+        "the retry recomputes both derived values from the stored temperatures"
+    );
+}
+
 /// Scenario: one import's job failed without its body ever dropping what it staged, another is
 /// still queued.
 /// Expected behaviour: the sweep takes the failed import's rows and leaves the queued one's.

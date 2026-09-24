@@ -845,6 +845,7 @@ pub struct JobContext {
     cancel: Arc<AtomicBool>,
     params: serde_json::Value,
     final_attempt: bool,
+    retry: bool,
 }
 
 /// A count as the progress columns carry it. Saturating: a walk longer than the column can hold
@@ -871,6 +872,7 @@ impl JobContext {
         params: serde_json::Value,
         first_seq: i64,
         final_attempt: bool,
+        retry: bool,
     ) -> (Self, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let ctx = Self {
@@ -881,6 +883,7 @@ impl JobContext {
             cancel: cancel.clone(),
             params,
             final_attempt,
+            retry,
         };
         (ctx, cancel)
     }
@@ -889,6 +892,12 @@ impl JobContext {
     #[must_use]
     pub fn is_final_attempt(&self) -> bool {
         self.final_attempt
+    }
+
+    /// Whether an earlier run of this job failed, so what it wrote may already be stored.
+    #[must_use]
+    pub fn is_retry(&self) -> bool {
+        self.retry
     }
 
     /// The job's persisted inputs, what a worker-run job reads to do its work.
@@ -1892,6 +1901,7 @@ async fn execute(
         claimed.params.clone(),
         first_seq,
         final_attempt,
+        claimed.retry_count > 0,
     );
     // The two lines every run owes its timeline. A job body says what only it knows; that a run
     // started and how it ended is the worker's to say, so a silent job is impossible.

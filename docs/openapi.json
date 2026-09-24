@@ -45595,7 +45595,7 @@
             }
           },
           {
-            "description": "Start time (optional, ISO 8601). If omitted, returns from earliest data.",
+            "description": "Start time (optional, ISO 8601). If omitted, the window opens\n`DEFAULT_READINGS_LOOKBACK_DAYS` before now (7 days unless the deployment sets it).",
             "in": "query",
             "name": "start",
             "required": false,

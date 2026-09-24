@@ -763,7 +763,11 @@ impl CsvImport {
         ))
         .await;
 
-        if inserted_total > 0 || overwritten > 0 {
+        // A retry finds the rows the failed attempt already stored and moves none of them, so the
+        // derived pass runs over the imported instants whatever this attempt moved.
+        let mut derived_failed = 0usize;
+        let mut first_failure = None;
+        if !distinct_ts.is_empty() {
             // Phase 2: derived recompute over the imported timestamps.
             let derived_total = i32::try_from(models.len() + distinct_ts.len()).unwrap_or(i32::MAX);
             ctx.set_progress(
@@ -777,9 +781,12 @@ impl CsvImport {
                 if ctx.is_cancelled() {
                     break;
                 }
-                if let Ok(slots) = recalculate_derived_at_timestamp(ctx.db(), site_id, *time).await
-                {
-                    refused.record(&slots, *time);
+                match recalculate_derived_at_timestamp(ctx.db(), site_id, *time).await {
+                    Ok(slots) => refused.record(&slots, *time),
+                    Err(e) => {
+                        derived_failed += 1;
+                        first_failure.get_or_insert(format!("{time}: {e}"));
+                    }
                 }
                 if (i + 1) % 500 == 0 {
                     let prog = i32::try_from(models.len() + i + 1).unwrap_or(i32::MAX);
@@ -793,6 +800,14 @@ impl CsvImport {
             ))
             .await;
 
+            // A retry after the rows committed moves none of them, and the refresh, the cache and
+            // the announcement the failed attempt owed are still owed for every staged row.
+            let moved = inserted_total + overwritten;
+            let landed = if ctx.is_retry() {
+                moved.max(models.len())
+            } else {
+                moved
+            };
             let app = crate::common::global_app_state();
             crate::routes::private::readings::service::run(
                 crate::routes::private::readings::service::Sink {
@@ -800,13 +815,8 @@ impl CsvImport {
                     events: ctx.events(),
                     cache: app.as_ref().map(|a| &a.response_cache),
                 },
-                &import_written(
-                    site_id,
-                    since.zip(latest),
-                    &param_streams,
-                    inserted_total + overwritten,
-                )
-                .touching(touched_visits),
+                &import_written(site_id, since.zip(latest), &param_streams, landed)
+                    .touching(touched_visits),
                 &IMPORT_TAIL,
                 "csv_import",
             )
@@ -814,17 +824,27 @@ impl CsvImport {
             .map_err(as_db_err)?;
         }
 
+        let report = JobReport::new()
+            .scope("site_id", site_id.to_string())
+            .count("inserted", inserted_total)
+            .count("overwritten", overwritten)
+            .count("replicate_groups", replicate_groups)
+            .count("derived_failed", derived_failed);
+        // A derived value left computed from the input this import replaced is stale with nothing
+        // to say so, so the job fails and keeps its staged rows for the retry.
+        if let Some(first) = first_failure {
+            ctx.report(report).await;
+            return Err(DbErr::Custom(format!(
+                "recomputing the calculations failed at {derived_failed} of {} imported instants, \
+                 first at {first}",
+                distinct_ts.len()
+            )));
+        }
+
         // The staging source has served its purpose, drop it (makes this job non-rerunnable).
         drop_staged(ctx.db(), import_token).await?;
 
-        ctx.report(
-            JobReport::new()
-                .scope("site_id", site_id.to_string())
-                .count("inserted", inserted_total)
-                .count("overwritten", overwritten)
-                .count("replicate_groups", replicate_groups),
-        )
-        .await;
+        ctx.report(report).await;
         Ok(i64::from(
             i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX),
         ))
