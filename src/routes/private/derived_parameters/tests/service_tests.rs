@@ -455,5 +455,8 @@ fn test_owned_chain_names_a_step_reached_twice_once() {
     let left = owned("left", "base + 1");
     let right = owned("right", "base - 1");
     let steps = [base.clone(), left.clone(), right.clone()];
-    assert_eq!(owned_chain("left * right", &steps), [base.id, left.id, right.id]);
+    assert_eq!(
+        owned_chain("left * right", &steps),
+        [base.id, left.id, right.id]
+    );
 }

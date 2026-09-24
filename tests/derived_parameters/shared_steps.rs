@@ -1032,7 +1032,11 @@ async fn bringing_in_a_step_shares_the_owned_steps_it_reads() {
 
     // (50 * 2 + 1) * 10
     let after = computed_at(&db, &app, &token, &output_parameter_id, 4, 50.0).await;
-    assert_eq!(after, Some(1010.0), "pco2real computes the same through its declarations");
+    assert_eq!(
+        after,
+        Some(1010.0),
+        "pco2real computes the same through its declarations"
+    );
 }
 
 /// Scenario: a calculation brings in a step no calculation owns, then stops reading it, each from

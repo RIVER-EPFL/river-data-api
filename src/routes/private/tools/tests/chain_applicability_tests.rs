@@ -56,7 +56,10 @@ fn a_tool_the_site_declared_nothing_of_does_not_apply() {
 
 #[test]
 fn a_tool_that_saves_nothing_reaches_no_site() {
-    assert!(!applies_at_site(&[], &[Uuid::new_v4()].into_iter().collect()));
+    assert!(!applies_at_site(
+        &[],
+        &[Uuid::new_v4()].into_iter().collect()
+    ));
 }
 
 mod reported_skips {

@@ -232,7 +232,10 @@ pub async fn applied_parameters_by_site(
 
 /// [`applied_parameters_by_site`] for one site: the set a calculation's applicability is read
 /// against.
-pub async fn applied_parameters(db: &DatabaseConnection, site_id: Uuid) -> AppResult<HashSet<Uuid>> {
+pub async fn applied_parameters(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> AppResult<HashSet<Uuid>> {
     Ok(applied_parameters_by_site(db, Some(&[site_id]))
         .await?
         .remove(&site_id)

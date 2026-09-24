@@ -78,7 +78,10 @@ async fn a_decommissioned_calculation_is_refused_by_name() {
     decommission(&f.db).await;
 
     let (status, body) = calculate(&f.app, &f.token).await;
-    assert_eq!(status, 409, "a decommissioned calculation is refused: {body}");
+    assert_eq!(
+        status, 409,
+        "a decommissioned calculation is refused: {body}"
+    );
     let message = body["error"].as_str().unwrap_or_default().to_string();
     assert!(
         message.contains(TOOL) && message.contains("decommissioned"),
