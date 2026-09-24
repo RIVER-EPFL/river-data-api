@@ -204,7 +204,6 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
             "slope": slope,
             "intercept": intercept,
             "valid_from": "2021-01-28T00:00:00Z",
-            "mode": "instant",
             "name": "DOC corr",
         }),
         &admin,
