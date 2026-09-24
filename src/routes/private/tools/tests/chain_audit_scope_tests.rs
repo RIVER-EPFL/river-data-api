@@ -1,4 +1,6 @@
-use crate::routes::private::tools::flows::{audit_event_set, audit_report_scope};
+use crate::routes::private::tools::flows::{
+    StaleReason, audit_event_set, audit_report_scope, stale_reason,
+};
 use uuid::Uuid;
 
 /// A synced visit is recomputed like any other (Q259), so the audit covers it too.
@@ -106,5 +108,29 @@ fn an_audit_report_names_every_scope_it_ran_under() {
     assert_eq!(
         both["scope"],
         serde_json::json!({ "site_id": site.to_string(), "constant": "xO2", "calculation": "pco2" })
+    );
+}
+
+#[test]
+fn an_output_agreeing_under_both_versions_is_not_stale() {
+    assert_eq!(stale_reason(25.0, 25.0, Some(25.0)), None);
+    assert_eq!(stale_reason(25.0, 25.0, None), None);
+}
+
+#[test]
+fn moved_inputs_are_reported_before_an_edit() {
+    // 15 stored, 25 under its own version today, 27 under the active one.
+    assert_eq!(
+        stale_reason(15.0, 25.0, Some(27.0)),
+        Some(StaleReason::Inputs)
+    );
+}
+
+#[test]
+fn an_edit_the_recompute_missed_is_reported_as_the_calculation() {
+    // 25 was right under its own version; the active version computes 25 + 2.
+    assert_eq!(
+        stale_reason(25.0, 25.0, Some(27.0)),
+        Some(StaleReason::Calculation(27.0))
     );
 }

@@ -1,5 +1,5 @@
-//! The scoped apply (M24): after a change the reactive hook does not see (a constant, a curve, a
-//! script activation, or here a calculation switched off while its input was corrected), the
+//! The scoped apply (M24): after a change the reactive hook does not see (a constant, a curve, or
+//! here a calculation switched off while its input was corrected), the
 //! audit reports every stale visit at a site and one site-scoped recompute repairs them all and
 //! closes the findings it repaired.
 
@@ -263,9 +263,8 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     assert_eq!(served_b(other_site.clone(), VISITS[0]).await, Some(25.0));
     assert!(pending_findings(other_site.clone()).await.is_empty());
 
-    // An edit to the calculation itself. Every stored B was correct under the version that made
-    // it, so judging a run only under its own version says nothing; the audit has to ask what the
-    // calculation computes now.
+    // An edit to the calculation itself recomputes every value the version it replaced stored
+    // (Q256), so the audit after it has nothing to report.
     e2e::revise_tool(
         &app,
         &admin,
@@ -280,6 +279,14 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
         json!({ "name": "adds", "inputs": { "a": 1.0 }, "expected": { "out_b": 8.0 } }),
     )
     .await;
+    e2e::drain_jobs(&db, 60).await;
+    for at in VISITS {
+        assert_eq!(
+            served_b(site_id.clone(), at).await,
+            Some(27.0),
+            "recomputed under the edit at {at}"
+        );
+    }
 
     let (status, audit) = crate::common::post_json_parse_with_token(
         &app,
@@ -291,24 +298,8 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     assert_eq!(status, 200, "{audit}");
     let job_id = audit["job_id"].as_str().expect("job id").to_string();
     assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
-
     let edited = pending_findings(site_id.clone()).await;
-    assert_eq!(
-        edited.len(),
-        2,
-        "the edit leaves both visits stale and reported: {edited:?}"
-    );
-    assert_eq!(
-        edited[0]["expected"]["reason"], "calculation",
-        "the finding says the calculation moved, not the inputs: {edited:?}"
-    );
-    assert_eq!(
-        edited[0]["expected"]["value"].as_f64(),
-        Some(27.0),
-        "and what it would compute now: {edited:?}"
-    );
-    // Reporting is all it does: no value is rewritten until somebody applies the repair.
-    assert_eq!(served_b(site_id.clone(), VISITS[0]).await, Some(25.0));
+    assert!(edited.is_empty(), "nothing is left stale: {edited:?}");
 }
 
 /// Q108 end to end: an input is corrected, the calculation over it is recomputed without anyone
@@ -411,9 +402,23 @@ async fn a_correction_cascades_is_recorded_and_is_reversible() {
     assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
     assert_eq!(served(pb.clone()).await, Some(15.0), "the chain computed B");
 
-    // The input is corrected through the edit primitive, previewed first as every edit is.
+    // The input is corrected through the edit primitive, screened and previewed first as every
+    // grab correction is.
+    let (status, check) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/seasonal_check",
+        &json!({
+            "site_id": site_id,
+            "time": AT,
+            "values": [{ "parameter_id": pa, "value": 20.0 }],
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "check: {check}");
     let selection = json!({ "site_id": site_id, "parameter_id": pa, "from": AT, "to": AT });
-    let decision = json!({ "kind": "value_correction", "value": 20.0 });
+    let decision =
+        json!({ "kind": "value_correction", "value": 20.0, "check_id": check["check_id"] });
     let (status, preview) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/edits/preview",

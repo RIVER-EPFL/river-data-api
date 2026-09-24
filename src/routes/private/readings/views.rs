@@ -760,6 +760,7 @@ pub async fn commit(
         }
     }
     refuse_unrouted(&state.db, &req.selection, option).await?;
+    require_checked_correction(&state.db, &req.selection, &req.decision, kind).await?;
 
     let (set_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let (set_id, recorded) =

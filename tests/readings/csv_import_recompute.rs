@@ -105,9 +105,8 @@ async fn a_csv_import_runs_the_calculations_that_read_what_it_landed() {
     let app = crate::common::build_test_app(db.clone());
     install_calculation(&db).await;
 
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": SITE1_ID,
             "measurement_type": "spot",

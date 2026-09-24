@@ -340,8 +340,8 @@ pub async fn get_ndjson_with_token(app: &Router, uri: &str, token: &str) -> (u16
 }
 
 /// Import a CSV as a screened commit: preview it first and pass the seasonal check the preview
-/// stored, the way the import page does. A spot or tool file whose values sit outside the site's
-/// seasonal range is otherwise refused without a check. `body` must not set `dry_run`.
+/// stored, the way the import page does. A spot or tool file is otherwise refused without a
+/// check. `body` must not set `dry_run`.
 pub async fn post_screened_import(
     app: &Router,
     body: &serde_json::Value,

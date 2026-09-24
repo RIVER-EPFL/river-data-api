@@ -109,7 +109,7 @@ async fn a_spot_import_is_screened_in_dry_run_and_the_commit_is_held_to_the_chec
 
 #[tokio::test]
 #[serial]
-async fn a_clean_spot_file_commits_without_a_check_and_a_continuous_file_is_not_screened() {
+async fn a_clean_spot_file_needs_a_check_and_a_continuous_file_is_not_screened() {
     let (_db, app, token) = setup().await;
     seed_june_history(&app, &token).await;
 
@@ -119,9 +119,30 @@ async fn a_clean_spot_file_commits_without_a_check_and_a_continuous_file_is_not_
         json!({ "site": SITE1_ID, "csv": CLEAN_CSV, "measurement_type": "spot" }),
     )
     .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["detail"]["warnings"], 0, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("dry_run"),
+        "{body}"
+    );
+
+    let (status, plan) = import(
+        &app,
+        &token,
+        json!({ "site": SITE1_ID, "csv": CLEAN_CSV, "measurement_type": "spot", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "{plan}");
+    let check_id = plan["check"]["check_id"].as_str().expect("check id").to_string();
+    let (status, body) = import(
+        &app,
+        &token,
+        json!({ "site": SITE1_ID, "csv": CLEAN_CSV, "measurement_type": "spot", "check_id": check_id }),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["check"]["warnings"], 0, "{body}");
-    assert!(body["check"]["check_id"].is_null(), "{body}");
+    assert_eq!(body["inserted_total"], 2, "{body}");
+    assert_eq!(body["check"]["check_id"], check_id, "{body}");
 
     let (status, body) = import(
         &app,

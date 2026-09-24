@@ -130,6 +130,36 @@ async fn sample_mean(f: &Fixture) -> Option<f64> {
     .flatten()
 }
 
+/// Preview an edit and commit it under the preview's id.
+async fn preview_and_commit(
+    f: &Fixture,
+    selection: &serde_json::Value,
+    decision: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let body = json!({ "selection": selection, "decision": decision });
+    let (status, preview) = post(f, "/api/readings/edits/preview", &body).await;
+    assert_eq!(status, 200, "{preview}");
+    let mut commit = body.clone();
+    commit["preview_id"] = preview["preview_id"].clone();
+    post(f, "/api/readings/edits", &commit).await
+}
+
+/// Screen corrected values, returning the check a correction of them names.
+async fn seasonal_check(f: &Fixture, values: &[f64]) -> String {
+    let values: Vec<serde_json::Value> = values
+        .iter()
+        .map(|v| json!({ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": v }))
+        .collect();
+    let (status, body) = post(
+        f,
+        "/api/readings/seasonal_check",
+        &json!({ "site_id": SITE1_ID, "time": AT, "values": values }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["check_id"].as_str().expect("check id").to_string()
+}
+
 #[tokio::test]
 #[serial]
 async fn a_preview_shows_the_write_s_own_arithmetic_and_changes_nothing() {
@@ -166,7 +196,8 @@ async fn a_preview_shows_the_write_s_own_arithmetic_and_changes_nothing() {
 async fn a_commit_is_held_to_the_preview_of_itself_and_is_reversible() {
     let f = setup(&[10.0, 12.0, 14.0]).await;
     let selection = one_key(f.stream, 0);
-    let decision = json!({ "kind": "value_correction", "value": 40.0 });
+    let check_id = seasonal_check(&f, &[40.0]).await;
+    let decision = json!({ "kind": "value_correction", "value": 40.0, "check_id": check_id });
 
     let (status, preview) = post(
         &f,
@@ -191,7 +222,7 @@ async fn a_commit_is_held_to_the_preview_of_itself_and_is_reversible() {
         "/api/readings/edits",
         &json!({
             "selection": selection,
-            "decision": { "kind": "value_correction", "value": 41.0 },
+            "decision": { "kind": "value_correction", "value": 41.0, "check_id": check_id },
             "preview_id": preview_id
         }),
     )
@@ -365,7 +396,9 @@ async fn a_block_corrected_to_different_values_is_one_decision_set() {
             { "stream_id": f.stream, "time": AT, "replicate_index": 2, "value": 24.0 },
         ]
     });
-    let decision = json!({ "kind": "value_correction", "reason": "pasted block" });
+    let check_id = seasonal_check(&f, &[20.0, 24.0]).await;
+    let decision =
+        json!({ "kind": "value_correction", "reason": "pasted block", "check_id": check_id });
 
     let (status, preview) = post(
         &f,
@@ -450,7 +483,9 @@ async fn a_set_rollback_skips_a_decision_already_rolled_back() {
             { "stream_id": f.stream, "time": AT, "replicate_index": 2, "value": 24.0 },
         ]
     });
-    let decision = json!({ "kind": "value_correction", "reason": "pasted block" });
+    let check_id = seasonal_check(&f, &[20.0, 24.0]).await;
+    let decision =
+        json!({ "kind": "value_correction", "reason": "pasted block", "check_id": check_id });
 
     let (status, preview) = post(
         &f,
@@ -645,6 +680,71 @@ async fn a_curve_edit_recomposes_the_value_and_its_rollback_restores_it() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn a_grab_correction_is_committed_only_under_a_check_that_screened_it() {
+    let f = setup(&[10.0, 12.0, 14.0]).await;
+    let selection = one_key(f.stream, 0);
+
+    let (status, body) = preview_and_commit(
+        &f,
+        &selection,
+        &json!({ "kind": "value_correction", "value": 12000.0 }),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("seasonal_check"),
+        "{body}"
+    );
+    assert_eq!(stored(&f, 0).await.0, 10.0, "nothing was written");
+
+    let other = seasonal_check(&f, &[50.0]).await;
+    let (status, body) = preview_and_commit(
+        &f,
+        &selection,
+        &json!({ "kind": "value_correction", "value": 12000.0, "check_id": other }),
+    )
+    .await;
+    assert_eq!(status, 409, "a check over another value does not cover this one: {body}");
+    assert_eq!(stored(&f, 0).await.0, 10.0);
+
+    // Far outside the range, and still saved: the check warns, it does not block.
+    let check_id = seasonal_check(&f, &[12000.0]).await;
+    let (status, body) = preview_and_commit(
+        &f,
+        &selection,
+        &json!({ "kind": "value_correction", "value": 12000.0, "check_id": check_id }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored(&f, 0).await.0, 12000.0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_correction_of_sensor_rows_needs_no_check() {
+    let f = setup(&[]).await;
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, \
+             replicate_index, measurement_type) \
+             VALUES ('{}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '{AT}', 10, 0, 'continuous')",
+            f.stream
+        ),
+    )
+    .await;
+    let (status, body) = preview_and_commit(
+        &f,
+        &one_key(f.stream, 0),
+        &json!({ "kind": "value_correction", "value": 11.0 }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored(&f, 0).await.0, 11.0);
+}
+
 /// Expected behaviour: an admin overrides a calculated value in one act (Q263). The value is
 /// replaced, the slot detached, and the provenance names the computed value it replaced; a
 /// value no tool produced is refused, and a return restores the computed value.
@@ -763,7 +863,25 @@ async fn an_edit_set_lists_every_decision_it_recorded_with_its_parameter() {
             { "stream_id": other, "time": AT, "replicate_index": 0, "value": 9.0 },
         ]
     });
-    let decision = json!({ "kind": "value_correction", "reason": "pasted row" });
+    let (status, check) = post(
+        &f,
+        "/api/readings/seasonal_check",
+        &json!({
+            "site_id": SITE1_ID,
+            "time": AT,
+            "values": [
+                { "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 15.0 },
+                { "parameter_id": crate::common::GLOBAL_PARAM_DO_ID, "value": 9.0 },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{check}");
+    let decision = json!({
+        "kind": "value_correction",
+        "reason": "pasted row",
+        "check_id": check["check_id"],
+    });
     let (status, preview) = post(
         &f,
         "/api/readings/edits/preview",

@@ -3797,6 +3797,7 @@ pub(super) async fn record_override<C: ConnectionTrait>(
         value: Some(req.value),
         target_id: None,
         reason: req.reason.clone(),
+        check_id: None,
     };
     let (set_id, recorded) = apply(conn, &selection, &correction, actor, Origin::Manual).await?;
     let mut streams: Vec<Uuid> = rows.iter().map(|(s, _)| *s).collect();
@@ -4375,6 +4376,99 @@ pub(super) async fn admit_edit_curve(
         })
         .collect();
     admit_standard_curves(db, &claims).await?;
+    Ok(())
+}
+
+/// A row a value correction moves, as the seasonal check reads it.
+#[derive(Debug, Clone, FromQueryResult)]
+pub(super) struct CorrectedRow {
+    pub(super) stream_id: Uuid,
+    pub(super) time: chrono::DateTime<chrono::Utc>,
+    pub(super) replicate_index: i16,
+    pub(super) site_id: Option<Uuid>,
+    pub(super) parameter_id: Option<Uuid>,
+    pub(super) measurement_type: Option<String>,
+}
+
+/// The `(parameter, corrected value)` pairs a check must cover, per site: one for every grab row
+/// the correction moves, at the value its key names or the decision's single value. Sensor rows
+/// are not screened.
+pub(super) fn corrected_grab_pairs(
+    rows: &[CorrectedRow],
+    selection: &Selection,
+    value: Option<f64>,
+) -> HashMap<Uuid, Vec<(Uuid, f64)>> {
+    let mut by_site: HashMap<Uuid, Vec<(Uuid, f64)>> = HashMap::new();
+    for row in rows {
+        if row.measurement_type.as_deref() != Some(SPOT) {
+            continue;
+        }
+        let (Some(site_id), Some(parameter_id)) = (row.site_id, row.parameter_id) else {
+            continue;
+        };
+        let keyed = selection
+            .keys
+            .iter()
+            .find(|k| {
+                k.stream_id == row.stream_id
+                    && k.time == row.time
+                    && k.replicate_index == Some(row.replicate_index)
+            })
+            .and_then(|k| k.value);
+        let Some(corrected) = keyed.or(value) else {
+            continue;
+        };
+        by_site
+            .entry(site_id)
+            .or_default()
+            .push((parameter_id, corrected));
+    }
+    by_site
+}
+
+/// A value correction over grab readings is committed only under a seasonal check that screened
+/// exactly the corrected values, the rule every grab save is held to.
+pub(super) async fn require_checked_correction(
+    db: &DatabaseConnection,
+    selection: &Selection,
+    decision: &EditDecision,
+    kind: Kind,
+) -> AppResult<()> {
+    if kind != Kind::ValueCorrection {
+        return Ok(());
+    }
+    let r = Alias::new("r");
+    let (sql, values) = readings_joined(r.clone())
+        .column((r.clone(), readings::Column::StreamId))
+        .column((r.clone(), readings::Column::Time))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::ParameterId))
+        .column((r, readings::Column::MeasurementType))
+        .cond_where(selection.condition()?)
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    let rows = CorrectedRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .all(db)
+    .await?;
+    let by_site = corrected_grab_pairs(&rows, selection, decision.value);
+    if by_site.is_empty() {
+        return Ok(());
+    }
+    let Some(check_id) = decision.check_id else {
+        return Err(AppError::BadRequest(
+            "a correction of grab values is screened first: run /readings/seasonal_check over \
+             the corrected values and name its check_id in the decision"
+                .to_string(),
+        ));
+    };
+    for (site_id, pairs) in &by_site {
+        validate_check_claim(db, check_id, *site_id, pairs).await?;
+    }
     Ok(())
 }
 
@@ -11314,7 +11408,7 @@ pub(super) const IMPORT_CHECK_FINDINGS_CAP: usize = 200;
 /// Screen the cells a spot or tool file will store, and decide what the request may do with the
 /// result. `dry_run` stores the check and returns its id. A commit naming a check is validated
 /// against it (every screened cell must be a checked pair, the grab save's rule); a commit
-/// naming none is refused when any cell warns, with the findings in the 409 body.
+/// naming none is refused, with the findings in the 409 body.
 pub(super) async fn screen_import(
     state: &AppState,
     auth: &crate::common::middleware::AuthContext,
@@ -11347,25 +11441,24 @@ pub(super) async fn screen_import(
             .map(|c| c.2)
             .min()
             .unwrap_or_else(chrono::Utc::now);
-        Some(
-            store_check(
-                &state.db,
-                site_id,
-                anchor,
-                &pairs,
-                crate::common::actor::label(auth),
-            )
-            .await?,
+        store_check(
+            &state.db,
+            site_id,
+            anchor,
+            &pairs,
+            crate::common::actor::label(auth),
         )
+        .await?
     } else if let Some(check_id) = req.check_id {
         let keyed: Vec<(Uuid, f64)> = pairs.iter().map(|p| (p.parameter_id, p.value)).collect();
         validate_check_claim(&state.db, check_id, site_id, &keyed).await?;
-        Some(check_id)
-    } else if warnings > 0 {
+        check_id
+    } else {
         return Err(AppError::ConflictDetail {
             message: format!(
-                "{warnings} value(s) fall outside the site's seasonal range; preview the file \
-                 (dry_run) and pass its check_id to import it as screened"
+                "{warnings} of {} value(s) fall outside the site's seasonal range; preview the \
+                 file (dry_run) and pass its check_id to import it as screened",
+                cells.len()
             ),
             detail: serde_json::json!({
                 "screened": cells.len(),
@@ -11374,8 +11467,6 @@ pub(super) async fn screen_import(
                 "method": method,
             }),
         });
-    } else {
-        None
     };
     Ok(ImportCheck {
         check_id,
@@ -12803,7 +12894,7 @@ pub(super) async fn import_tool_csv(
                 mode: (req.conflict == ConflictMode::Overwrite).then_some(GrabWriteMode::Replace),
                 dry_run: false,
                 tool_run_id: run_id,
-                check_id: check.check_id,
+                check_id: Some(check.check_id),
                 // The tool's manifest is read by the save path itself; nothing here overrides
                 // the slot's declaration.
                 readings,
@@ -13421,6 +13512,10 @@ mod decisions;
 #[cfg(test)]
 #[path = "tests/edits.rs"]
 mod edits;
+
+#[cfg(test)]
+#[path = "tests/checked_correction.rs"]
+mod checked_correction;
 
 #[cfg(test)]
 #[path = "tests/proposals.rs"]

@@ -256,14 +256,15 @@ async fn dry_run_stages_session_and_import_reuses_it_without_csv() {
     );
 
     // Confirm. Still no CSV in the body, and the earlier mapping is not carried over.
-    let (status, imported) = import(
-        &fx,
+    let (status, imported) = crate::common::post_screened_import(
+        &fx.app,
         &json!({
             "site": fx.track.site_id,
             "session_id": session,
             "conflict": "skip",
             "measurement_type": "spot",
         }),
+        &fx.river,
     )
     .await;
     assert_eq!(

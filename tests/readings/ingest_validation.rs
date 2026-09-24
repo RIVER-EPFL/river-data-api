@@ -92,8 +92,11 @@ async fn register_and_pair(
 }
 
 async fn import_csv(app: &Router, jwt: &str, body: &serde_json::Value) -> serde_json::Value {
-    let (status, resp) =
-        crate::common::post_json_parse_with_token(app, "/api/readings/import_csv", body, jwt).await;
+    let (status, resp) = if body["dry_run"] == json!(true) {
+        crate::common::post_json_parse_with_token(app, "/api/readings/import_csv", body, jwt).await
+    } else {
+        crate::common::post_screened_import(app, body, jwt).await
+    };
     assert_eq!(status, 200, "csv import ({status}): {resp}");
     resp
 }

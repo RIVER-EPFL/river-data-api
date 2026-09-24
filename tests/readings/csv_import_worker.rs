@@ -119,9 +119,8 @@ async fn csv_import_duplicate_timestamps_become_replicates() {
     // file being declared spot, are grouped into a sample. The distinct replicate indices also keep
     // the conflict keys unique, so overwrite mode's `ON CONFLICT DO UPDATE` cannot fail with
     // "cannot affect row a second time".
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": CSV_DUP_TS,
@@ -268,9 +267,8 @@ const CSV_TRIPLICATE: &str = "DateTime,Dissolved_O2\n\
 async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
     let (db, app, token) = setup().await;
 
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": CSV_TRIPLICATE,
@@ -335,9 +333,8 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
         "trigger populated the sample mean: got {mean}"
     );
 
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": CSV_TRIPLICATE,
@@ -391,9 +388,8 @@ const CSV_SINGLE_GRABS: &str = "DateTime,Dissolved_O2\n\
 async fn declared_spot_import_mints_no_sample_for_a_lone_row() {
     let (db, app, token) = setup().await;
 
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": CSV_SINGLE_GRABS,
@@ -527,9 +523,8 @@ async fn grab_row(db: &DatabaseConnection) -> (Option<f64>, Option<Uuid>, Option
 
 /// Declared raw: these tests are about what the slot's calibration does to uncorrected input.
 async fn import_grab_csv(app: &axum::Router, token: &str) {
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": CSV_GRAB,
@@ -897,9 +892,8 @@ const CSV_TRIPLICATE_CORRECTED: &str = "DateTime,Dissolved_O2\n\
 async fn csv_overwrite_replaces_the_whole_replicate_set() {
     let (db, app, token) = setup().await;
 
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": CSV_TRIPLICATE,

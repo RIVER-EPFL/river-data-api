@@ -1204,6 +1204,11 @@ pub struct EditDecision {
     pub target_id: Option<Uuid>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// The seasonal check that screened a `value_correction`'s corrected values; required when
+    /// the correction covers a grab (spot) reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub check_id: Option<Uuid>,
 }
 
 impl EditDecision {
@@ -2762,8 +2767,7 @@ pub struct ImportCsvRequest {
     pub curves: Option<HashMap<String, Uuid>>,
     /// The seasonal check a `dry_run` of this file returned (`check.check_id`). A spot or tool
     /// file is screened against the site's seasonal distribution; a commit naming the check is
-    /// held to exactly the values it screened, and a commit naming none is refused when the
-    /// screen finds a value outside the recorded range.
+    /// held to exactly the values it screened, and a commit naming none is refused.
     #[serde(default)]
     pub check_id: Option<Uuid>,
 }
@@ -2878,10 +2882,8 @@ pub struct ImportCsvResponse {
 /// against the site's seasonal distribution for its own month.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ImportCheck {
-    /// The stored check a commit must name. Set by `dry_run`; echoed by a commit that named one;
-    /// `null` on a commit that needed none (nothing outside the range).
-    #[schema(required)]
-    pub check_id: Option<Uuid>,
+    /// The stored check a commit must name: stored by `dry_run`, echoed by the commit.
+    pub check_id: Uuid,
     /// Cells screened.
     pub screened: usize,
     /// Cells outside the recorded seasonal range.

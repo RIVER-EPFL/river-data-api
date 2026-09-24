@@ -6555,6 +6555,11 @@
         "additionalProperties": false,
         "description": "The decision an edit request carries: what to do, and the one value it needs.",
         "properties": {
+          "check_id": {
+            "description": "The seasonal check that screened a `value_correction`'s corrected values; required when\nthe correction covers a grab (spot) reading.",
+            "format": "uuid",
+            "type": "string"
+          },
           "kind": {
             "description": "`value_correction` | `flag` | `unflag` | `withdraw` | `reassert` | `curve` |\n`verify` | `reject`.",
             "type": "string"
@@ -8622,12 +8627,9 @@
         "description": "The seasonal Check gate's CSV arm: every cell the file will store as a spot reading, screened\nagainst the site's seasonal distribution for its own month.",
         "properties": {
           "check_id": {
-            "description": "The stored check a commit must name. Set by `dry_run`; echoed by a commit that named one;\n`null` on a commit that needed none (nothing outside the range).",
+            "description": "The stored check a commit must name: stored by `dry_run`, echoed by the commit.",
             "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "findings": {
             "description": "The cells that warn, in file order, capped at `IMPORT_CHECK_FINDINGS_CAP`.",
@@ -8704,7 +8706,7 @@
         "additionalProperties": false,
         "properties": {
           "check_id": {
-            "description": "The seasonal check a `dry_run` of this file returned (`check.check_id`). A spot or tool\nfile is screened against the site's seasonal distribution; a commit naming the check is\nheld to exactly the values it screened, and a commit naming none is refused when the\nscreen finds a value outside the recorded range.",
+            "description": "The seasonal check a `dry_run` of this file returned (`check.check_id`). A spot or tool\nfile is screened against the site's seasonal distribution; a commit naming the check is\nheld to exactly the values it screened, and a commit naming none is refused.",
             "format": "uuid",
             "type": [
               "string",

@@ -32,6 +32,7 @@ mod assertion_over {
             value,
             target_id: None,
             reason: None,
+            check_id: None,
         }
     }
 

@@ -648,6 +648,30 @@ pub(super) fn disagrees(stored: f64, recomputed: f64) -> bool {
     (stored - recomputed).abs() / scale > STALE_REL_TOL
 }
 
+/// Why a stored output is stale, where it is.
+#[derive(Debug, PartialEq)]
+pub(super) enum StaleReason {
+    /// The run's own version, over the inputs as they stand, computes another value.
+    Inputs,
+    /// The run agrees with its own version, and the calculation's active version computes this.
+    Calculation(f64),
+}
+
+/// Whether a stored output is stale: against its own version rerun over today's inputs first,
+/// then against the calculation's active version where that is another one.
+pub(super) fn stale_reason(
+    stored: f64,
+    recomputed: f64,
+    under_active: Option<f64>,
+) -> Option<StaleReason> {
+    if disagrees(stored, recomputed) {
+        return Some(StaleReason::Inputs);
+    }
+    under_active
+        .filter(|active| disagrees(stored, *active))
+        .map(StaleReason::Calculation)
+}
+
 /// The readings one output of a run stores. A per-replicate output is an array, one entry per
 /// index of the variable it evaluated over, and each entry is a reading at that index; a gap
 /// stays a gap rather than closing up the indexes after it.
@@ -1628,11 +1652,15 @@ pub async fn audit_event(
                     .results
                     .get(output)
                     .and_then(serde_json::Value::as_f64);
+                let under_active = current
+                    .as_ref()
+                    .and_then(|o| o.results.get(output).and_then(serde_json::Value::as_f64));
                 match (stored, recomputed) {
                     (Some(stored), Some(recomputed)) => {
-                        if disagrees(stored, recomputed) {
-                            counts.stale += 1;
-                            upsert_finding(
+                        match stale_reason(stored, recomputed, under_active) {
+                            Some(StaleReason::Inputs) => {
+                                counts.stale += 1;
+                                upsert_finding(
                                 &state.db,
                                 HoldKind::StaleOutput,
                                 event,
@@ -1650,13 +1678,10 @@ pub async fn audit_event(
                                 },
                             )
                             .await?;
-                        } else if let Some(under_active) = current
-                            .as_ref()
-                            .and_then(|o| o.results.get(output).and_then(serde_json::Value::as_f64))
-                            && disagrees(stored, under_active)
-                        {
-                            counts.stale += 1;
-                            upsert_finding(
+                            }
+                            Some(StaleReason::Calculation(under_active)) => {
+                                counts.stale += 1;
+                                upsert_finding(
                                 &state.db,
                                 HoldKind::StaleOutput,
                                 event,
@@ -1675,9 +1700,12 @@ pub async fn audit_event(
                                 },
                             )
                             .await?;
-                        } else {
-                            counts.superseded +=
-                                supersede_findings(&state.db, event, parameter_id).await? as usize;
+                            }
+                            None => {
+                                counts.superseded +=
+                                    supersede_findings(&state.db, event, parameter_id).await?
+                                        as usize;
+                            }
                         }
                     }
                     (None, Some(recomputed)) => {

@@ -116,9 +116,8 @@ async fn a_processed_import_is_not_recalibrated_and_a_raw_one_is() {
     deploy_calibrated_probe(&db).await;
 
     // Default: processed values. The deployment covers the instant, and still no correction.
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": "DateTime,Dissolved_O2\n2025-06-01 00:00:00,250\n",
@@ -139,9 +138,8 @@ async fn a_processed_import_is_not_recalibrated_and_a_raw_one_is() {
     assert_eq!(calibration_id, None);
 
     // Declared raw: the same shape opts into the covering calibration.
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": "DateTime,Dissolved_O2\n2025-06-02 00:00:00,250\n",
@@ -234,9 +232,8 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
     assert_eq!(plan["row_count"], 2);
     assert_eq!(plan["tool_runs_created"], 0);
 
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": csv,
@@ -364,9 +361,8 @@ async fn an_import_naming_a_curve_saves_the_replicates_it_corrected_with_it() {
          2025-06-01 10:00:00,120,125,\n\
          2025-06-02 10:00:00,130,131,{plate_b}\n"
     );
-    let (status, resp) = crate::common::post_json_parse_with_token(
+    let (status, resp) = crate::common::post_screened_import(
         &app,
-        "/api/readings/import_csv",
         &serde_json::json!({
             "site": crate::common::SITE1_ID,
             "csv": csv,
