@@ -492,11 +492,22 @@ async fn correcting_a_shared_step_mints_a_version_for_each_declaring_calculation
         )
         .await;
         assert_ne!(author, "none", "the correction names who made it");
+        for key in [
+            format!("event_recompute:version:{was}"),
+            format!("derived_recompute:version:{was}"),
+        ] {
+            let queued = crate::common::e2e::scalar(
+                &db,
+                &format!("SELECT count(*)::text FROM reprocessing_jobs WHERE dedupe_key = '{key}'"),
+            )
+            .await;
+            assert_eq!(queued, "1", "the values {calculation}'s replaced version made are queued: {key}");
+        }
     }
 }
 
 /// Scenario: a step two calculations read is corrected from the second calculation's page, and the
-/// author saves on the correcting arm.
+/// author saves.
 ///
 /// Expected behaviour: the correction and the set save are one act. The calculation gets one
 /// version, authored and holding the correction, and the values the version it replaces produced
@@ -570,7 +581,6 @@ async fn correcting_a_shared_step_in_a_set_save_mints_one_version_and_migrates()
                            "formula": "bp_step + 1", "ordinal": 1 }],
             "shared_steps": [{ "id": step_id, "code": "bp_step", "name": "BP step",
                                "units": "hPa", "formula": "Dissolved_O2 * 3" }],
-            "migrate_stored": true,
         }),
         &token,
     )
@@ -684,4 +694,120 @@ async fn a_shared_step_read_by_one_calculation_is_taken_back_into_its_set() {
     )
     .await;
     assert_eq!(declared, "0", "and nothing declares it");
+}
+
+/// A step shared by no calculation, created directly.
+async fn shared_step(app: &axum::Router, token: &str, code: &str, formula: &str) -> (u16, Value) {
+    crate::common::post_json_parse_with_token(
+        app,
+        "/api/derived_parameters",
+        &json!({
+            "code": code, "name": code, "units": "",
+            "formula": formula, "intermediate": true,
+        }),
+        token,
+    )
+    .await
+}
+
+/// A step of `owner`, created directly.
+async fn owned_step(
+    app: &axum::Router,
+    token: &str,
+    owner: &str,
+    code: &str,
+    formula: &str,
+) -> Value {
+    post(
+        app,
+        "/api/derived_parameters",
+        &json!({
+            "code": code, "name": code, "units": "",
+            "formula": formula, "tool_script_id": owner,
+            "ordinal": 0, "intermediate": true,
+        }),
+        token,
+    )
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn a_shared_step_reads_another_shared_step() {
+    let (_db, app, token) = setup().await;
+    let (status, water_k) = shared_step(&app, &token, "water_k", "Dissolved_O2 + 273.15").await;
+    assert!((200..300).contains(&status), "({status}): {water_k}");
+
+    let (status, kh) = shared_step(&app, &token, "kh", "0.034 / water_k").await;
+    assert!((200..300).contains(&status), "({status}): {kh}");
+    let sources = kh["sources"].as_array().expect("sources");
+    assert!(sources.is_empty(), "a step read is no source: {kh}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_shared_step_reading_a_step_a_calculation_owns_is_refused_by_name_and_owner() {
+    let (db, app, token) = setup().await;
+    let pco2real = calculation(&db, "pco2real").await;
+    let other = calculation(&db, "other_set").await;
+    owned_step(&app, &token, &pco2real, "water_k", "Dissolved_O2 + 273.15").await;
+    let kh = owned_step(&app, &token, &pco2real, "kh", "0.034 / water_k").await;
+
+    let (status, refused) = shared_step(&app, &token, "kh_shared", "0.034 / water_k").await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("reads water_k, a step of pco2real that is not shared"),
+        "{refused}"
+    );
+
+    // Declaring kh releases it, and a released kh would read pco2real's own water_k.
+    let (status, refused) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": other, "formula_id": id_of(&kh) }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("reads water_k, a step of pco2real that is not shared"),
+        "{refused}"
+    );
+    let owner = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT COALESCE(tool_script_id::text, 'none') FROM calculation_formulas \
+              WHERE id = '{}'",
+            id_of(&kh)
+        ),
+    )
+    .await;
+    assert_eq!(owner, pco2real, "kh stays pco2real's own");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_cycle_among_shared_steps_is_refused_naming_its_members() {
+    let (_db, app, token) = setup().await;
+    let (status, first) = shared_step(&app, &token, "loop_a", "Dissolved_O2 + 1").await;
+    assert!((200..300).contains(&status), "({status}): {first}");
+    let (status, second) = shared_step(&app, &token, "loop_b", "loop_a * 2").await;
+    assert!((200..300).contains(&status), "({status}): {second}");
+
+    let (status, refused) = put_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{}", id_of(&first)),
+        &json!({ "formula": "loop_b + 1" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused.contains("loop_a") && refused.contains("loop_b") && refused.contains("cycle"),
+        "{refused}"
+    );
 }

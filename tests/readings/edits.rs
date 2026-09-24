@@ -638,3 +638,110 @@ async fn a_curve_edit_recomposes_the_value_and_its_rollback_restores_it() {
         "120 × 0.5, restored with the curve"
     );
 }
+
+/// Scenario: one block corrects a reading on each of two parameters, as a pasted row of a visit
+/// does, and the set is read before and after its rollback.
+/// Expected behaviour: the set lists both decisions with the parameter each one's reading measures
+/// and the value it moved, however many streams it reached, and reads as rolled back afterwards.
+#[tokio::test]
+#[serial]
+async fn an_edit_set_lists_every_decision_it_recorded_with_its_parameter() {
+    let f = setup(&[10.0]).await;
+    let other = crate::common::sensor_lifecycle::create_paired_stream(
+        &f.db,
+        "edits-do",
+        crate::common::PARAM_S1_DO_ID,
+    )
+    .await;
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, \
+             replicate_index, measurement_type) \
+             VALUES ('{other}', '{SITE1_ID}', '{}', '{AT}', 8.0, 0, 'spot')",
+            crate::common::GLOBAL_PARAM_DO_ID
+        ),
+    )
+    .await;
+    let selection = json!({
+        "keys": [
+            { "stream_id": f.stream, "time": AT, "replicate_index": 0, "value": 15.0 },
+            { "stream_id": other, "time": AT, "replicate_index": 0, "value": 9.0 },
+        ]
+    });
+    let decision = json!({ "kind": "value_correction", "reason": "pasted row" });
+    let (status, preview) = post(
+        &f,
+        "/api/readings/edits/preview",
+        &json!({ "selection": selection, "decision": decision }),
+    )
+    .await;
+    assert_eq!(status, 200, "preview: {preview}");
+    let (status, committed) = post(
+        &f,
+        "/api/readings/edits",
+        &json!({
+            "selection": selection,
+            "decision": decision,
+            "preview_id": preview["preview_id"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "commit: {committed}");
+    let set_id = committed["set_id"].as_str().expect("one set for the block");
+    let uri = format!("/api/readings/edits/sets/{set_id}");
+
+    let (status, set) = crate::common::get_json_with_token(&f.app, &uri, &f.token).await;
+    assert_eq!(status, 200, "{set}");
+    assert_eq!(set["rolled_back_at"], serde_json::Value::Null);
+    let members = set["members"].as_array().expect("the set's members");
+    assert_eq!(members.len(), 2, "both streams are listed: {set}");
+    let db = &f.db;
+    let codes = |id: &'static str| async move {
+        db.query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT code FROM parameters WHERE id = '{id}'"),
+        ))
+        .await
+        .unwrap()
+        .expect("a seeded parameter")
+        .try_get::<String>("", "code")
+        .unwrap()
+    };
+    let temp = codes(GLOBAL_PARAM_TEMP_ID).await;
+    let dissolved = codes(crate::common::GLOBAL_PARAM_DO_ID).await;
+    let member = |stream: Uuid| {
+        members
+            .iter()
+            .find(|m| m["decision"]["stream_id"] == json!(stream))
+            .unwrap_or_else(|| panic!("a member on stream {stream}: {set}"))
+    };
+    assert_eq!(member(f.stream)["parameter_code"], json!(temp));
+    assert_eq!(member(f.stream)["decision"]["old"]["raw_value"], 10.0);
+    assert_eq!(member(f.stream)["decision"]["new"]["raw_value"], 15.0);
+    assert_eq!(member(other)["parameter_code"], json!(dissolved));
+    assert_eq!(member(other)["decision"]["old"]["raw_value"], 8.0);
+    assert_eq!(member(other)["decision"]["new"]["raw_value"], 9.0);
+
+    let (status, rolled) = post(&f, &format!("{uri}/rollback"), &json!({})).await;
+    assert_eq!(status, 200, "rollback: {rolled}");
+    let (status, set) = crate::common::get_json_with_token(&f.app, &uri, &f.token).await;
+    assert_eq!(status, 200, "{set}");
+    assert!(set["rolled_back_at"].is_string(), "{set}");
+    assert!(
+        set["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["decision"]["rolled_back_by"].is_string()),
+        "every member is rolled back: {set}"
+    );
+
+    let (status, _) = crate::common::get_json_with_token(
+        &f.app,
+        &format!("/api/readings/edits/sets/{}", Uuid::new_v4()),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 404);
+}

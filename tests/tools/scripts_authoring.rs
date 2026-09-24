@@ -924,7 +924,7 @@ async fn an_activation_whose_migration_cannot_be_queued_activates_nothing() {
     let (status, body) = crate::common::post_json_parse_with_token(
         &app,
         &format!("/api/tool_scripts/{sid}/versions/{v2}/activate"),
-        &json!({ "migrate_stored": true }),
+        &json!({}),
         &admin,
     )
     .await;

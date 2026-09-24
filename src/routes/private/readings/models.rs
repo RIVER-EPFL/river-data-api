@@ -1391,6 +1391,31 @@ pub struct RollbackResponse {
     pub rollback_id: Uuid,
 }
 
+/// One decision of an edit set, with the parameter its reading measures (absent on a reading
+/// paired to no site parameter).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EditSetMember {
+    pub decision: DecisionRow,
+    #[schema(required)]
+    pub parameter_code: Option<String>,
+    #[schema(required)]
+    pub parameter_name: Option<String>,
+}
+
+/// Everything an edit set recorded, across every stream it reached.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EditSetResponse {
+    pub set_id: Uuid,
+    pub kind: String,
+    pub actor: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+    #[schema(required)]
+    pub reason: Option<String>,
+    #[schema(required)]
+    pub rolled_back_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub members: Vec<EditSetMember>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RollbackSetResponse {
     pub set_id: Uuid,
@@ -1550,7 +1575,24 @@ pub struct ProvenanceRecord {
     /// one computed before the capture existed, whose inputs are therefore unknown.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub consumed: Vec<ConsumedRef>,
+    /// The ledger row behind the capture `consumed` shows (Q251): the computation that produced
+    /// the value and the run that made it. Absent where a tool run captured it, which
+    /// `computation` names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub captured_by: Option<CaptureDecision>,
     pub holds: Vec<HoldRef>,
+}
+
+/// A `reading_decisions` row, as `GET /readings/decisions` serves it in full.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CaptureDecision {
+    pub id: Uuid,
+    pub seq: i64,
+    /// `derived_computed` for the first computation, `formula_transition` for a recompute.
+    pub kind: String,
+    #[schema(required)]
+    pub job_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

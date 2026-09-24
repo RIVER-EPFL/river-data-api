@@ -19,16 +19,16 @@ fn test_only_the_two_engines_are_accepted() {
     assert!(check_engine("r").is_err());
 }
 
-mod activation_arm {
+mod activation_migration {
     use crate::routes::private::tools::service::migration_jobs;
     use uuid::Uuid;
 
     /// Scenario: an author activates a corrected version of a calculation that has already
     /// produced values at visits.
     #[test]
-    fn the_correcting_arm_scopes_the_repair_to_the_version_it_replaced() {
+    fn an_activation_scopes_the_repair_to_the_version_it_replaced() {
         let superseded = Uuid::new_v4();
-        let jobs = migration_jobs(true, "pco2", Uuid::new_v4(), Some(superseded));
+        let jobs = migration_jobs("pco2", Uuid::new_v4(), Some(superseded));
         let visit = jobs
             .iter()
             .find(|j| j.kind == "event_recompute")
@@ -47,7 +47,7 @@ mod activation_arm {
     fn the_stream_arm_is_repaired_too_and_is_scoped_to_the_calculation() {
         let superseded = Uuid::new_v4();
         let script_id = Uuid::new_v4();
-        let jobs = migration_jobs(true, "pco2", script_id, Some(superseded));
+        let jobs = migration_jobs("pco2", script_id, Some(superseded));
         let stream = jobs
             .iter()
             .find(|j| j.kind == "derived_recompute")
@@ -62,11 +62,6 @@ mod activation_arm {
             "one enqueue per arm per save"
         );
         assert_eq!(jobs.len(), 2, "one job per arm, and no more");
-    }
-
-    #[test]
-    fn the_leaving_arm_repairs_nothing_and_the_history_stands() {
-        assert!(migration_jobs(false, "pco2", Uuid::new_v4(), Some(Uuid::new_v4())).is_empty());
     }
 
     /// Scenario: an admin edits constant k from 2.0 to 3.0, and one formula calculation reads it.
@@ -142,11 +137,10 @@ mod activation_arm {
         );
     }
 
-    /// A first activation replaces no version, so there is nothing to migrate however the author
-    /// answered.
+    /// A first activation replaces no version, so there is nothing to migrate.
     #[test]
     fn a_first_activation_supersedes_nothing() {
-        assert!(migration_jobs(true, "pco2", Uuid::new_v4(), None).is_empty());
+        assert!(migration_jobs("pco2", Uuid::new_v4(), None).is_empty());
     }
 }
 

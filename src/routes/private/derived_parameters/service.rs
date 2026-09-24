@@ -62,11 +62,24 @@ pub(crate) async fn resolve_variables<C: ConnectionTrait>(
     formula: &str,
     context: &FormulaContext<'_>,
 ) -> Result<ResolvedSources, ApiError> {
-    let steps = steps_of(db, context).await?;
-    let names: Vec<String> = variables_of(formula, context.curve_slot)?
-        .into_iter()
-        .filter(|name| !steps.iter().any(|step| step == name))
-        .collect();
+    let steps = all_steps(db).await?;
+    let declared = match context.tool_script_id {
+        Some(tool_script_id) => declared_steps(db, tool_script_id)
+            .await?
+            .into_iter()
+            .map(|step| step.code)
+            .collect(),
+        None => Vec::new(),
+    };
+    let reader = StepRef {
+        code: context.code.to_string(),
+        owner: context.tool_script_id,
+    };
+    let names = variables_of(formula, context.curve_slot)?;
+    let names = match unread_steps(&reader, names, &steps, &declared) {
+        Ok(names) => names,
+        Err(StepRef { code, owner }) => return Err(unshared_read(db, &code, owner).await),
+    };
     resolve_identifiers(db, &names).await
 }
 
@@ -237,28 +250,37 @@ impl CRUDOperations for SharedStepOperations {
         else {
             return Ok(());
         };
-        release_step(db, entity.formula_id).await?;
         declare_step(db, previous_owner, entity.formula_id).await?;
-        // A declaration changes the shape of both calculations' pinned sets, and it is the whole
-        // act, so each is minted once here rather than by a sweep over every formula calculation.
-        for calculation in [previous_owner, entity.tool_script_id] {
-            remint(db, calculation).await?;
-        }
-        Ok(())
+        release_step(db, entity.formula_id).await
     }
 }
 
-/// Take a step out of the calculation that wrote it: a shared step is owned by none.
-async fn release_step<C: ConnectionTrait>(db: &C, formula_id: Uuid) -> Result<(), ApiError> {
-    super::models::definition::Entity::update_many()
-        .col_expr(
-            super::models::definition::Column::ToolScriptId,
-            sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
-        )
-        .filter(super::models::definition::Column::Id.eq(formula_id))
-        .exec(db)
-        .await
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+/// Take a step out of the calculation that wrote it: a shared step is owned by none. The formula's
+/// own update hook refuses a step that would then read its owner's unshared steps, and mints a
+/// version for every calculation declaring it, the one that wrote it included.
+async fn release_step<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    formula_id: Uuid,
+) -> Result<(), ApiError> {
+    use super::models::definition::CalculationFormulaUpdate;
+
+    CalculationFormula::update(
+        db,
+        formula_id,
+        CalculationFormulaUpdate {
+            code: None,
+            name: None,
+            units: None,
+            formula: None,
+            description: None,
+            tool_script_id: Some(None),
+            ordinal: None,
+            curve_slot: None,
+            per_replicate: None,
+            intermediate: None,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -297,31 +319,124 @@ pub(crate) struct FormulaContext<'a> {
     pub curve_slot: Option<&'a str>,
 }
 
-/// The codes of the steps this formula may read: the calculation's own intermediates and the
-/// shared steps it declares. A step stores nothing and mints no parameter, so its code names no
-/// reading: it reaches the formulas after it from the run, and recording it as a source would send
-/// the evaluation looking for a value the visit never holds.
-async fn steps_of<C: ConnectionTrait>(
-    db: &C,
-    context: &FormulaContext<'_>,
-) -> Result<Vec<String>, ApiError> {
-    let Some(tool_script_id) = context.tool_script_id else {
-        return Ok(Vec::new());
+/// A step by its code and the calculation that owns it, `None` for a shared step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StepRef {
+    pub code: String,
+    pub owner: Option<Uuid>,
+}
+
+/// A formula's names less the steps it reads, which reach it from the run and name no reading.
+///
+/// A formula reads the steps of its own owner and those the owner declares; a shared step, owned
+/// by none, reads every other shared step (Q254). A shared step naming a step some calculation
+/// owns is that step, returned as the error, since the calculation may change it without the
+/// step's readers knowing.
+pub(crate) fn unread_steps(
+    reader: &StepRef,
+    names: Vec<String>,
+    steps: &[StepRef],
+    declared: &[String],
+) -> Result<Vec<String>, StepRef> {
+    let mut unread = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(step) = steps
+            .iter()
+            .find(|s| s.code == name && s.code != reader.code)
+        else {
+            unread.push(name);
+            continue;
+        };
+        if step.owner == reader.owner || declared.contains(&name) {
+            continue;
+        }
+        if reader.owner.is_none() {
+            return Err(step.clone());
+        }
+        unread.push(name);
+    }
+    Ok(unread)
+}
+
+/// The refusal for a shared step reading a step `owner` keeps to itself.
+async fn unshared_read<C: ConnectionTrait>(db: &C, code: &str, owner: Option<Uuid>) -> ApiError {
+    let script = match owner {
+        Some(owner) => crate::routes::private::tools::models::script::Entity::find_by_id(owner)
+            .one(db)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
     };
-    let mut codes: Vec<String> = super::models::definition::Entity::find()
-        .filter(super::models::definition::Column::ToolScriptId.eq(tool_script_id))
+    let owner = script.map_or_else(|| "another calculation".to_string(), |s| s.name);
+    ApiError::bad_request(format!(
+        "A shared step reads {code}, a step of {owner} that is not shared"
+    ))
+}
+
+/// Every step there is, by code and owner. A step stores nothing and mints no parameter, so its
+/// code names no reading: it reaches the formulas after it from the run, and recording it as a
+/// source would send the evaluation looking for a value the visit never holds.
+async fn all_steps<C: ConnectionTrait>(db: &C) -> Result<Vec<StepRef>, ApiError> {
+    super::models::definition::Entity::find()
         .filter(super::models::definition::Column::Intermediate.eq(true))
-        .filter(super::models::definition::Column::Code.ne(context.code))
         .all(db)
         .await
-        .map(|rows| rows.into_iter().map(|row| row.code).collect())
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    for step in declared_steps(db, tool_script_id).await? {
-        if step.code != context.code && !codes.contains(&step.code) {
-            codes.push(step.code);
-        }
-    }
-    Ok(codes)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StepRef {
+                    code: row.code,
+                    owner: row.tool_script_id,
+                })
+                .collect()
+        })
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+}
+
+/// Refuse a shared step whose reads, with every other shared step's, form a cycle, naming the
+/// steps in it. `written` is the step being saved, `(code, formula)`, in place of its stored text.
+async fn refuse_shared_cycle<C: ConnectionTrait>(
+    db: &C,
+    written: (&str, &str),
+) -> Result<(), ApiError> {
+    let mut steps: Vec<(String, String)> = super::models::definition::Entity::find()
+        .filter(super::models::definition::Column::ToolScriptId.is_null())
+        .filter(super::models::definition::Column::Intermediate.eq(true))
+        .filter(super::models::definition::Column::Code.ne(written.0))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+        .into_iter()
+        .map(|row| (row.code, row.formula))
+        .collect();
+    steps.push((written.0.to_string(), written.1.to_string()));
+    shared_cycle(&steps).map_err(ApiError::bad_request)
+}
+
+/// Whether shared steps, `(code, formula)`, order: a cycle is the error, naming its members.
+pub(crate) fn shared_cycle(steps: &[(String, String)]) -> Result<(), String> {
+    use crate::routes::private::tools::models::PinnedFormula;
+
+    let pinned: Vec<PinnedFormula> = steps
+        .iter()
+        .map(|(code, formula)| PinnedFormula {
+            code: code.clone(),
+            label: code.clone(),
+            units: None,
+            formula: formula.clone(),
+            ordinal: 0,
+            output_parameter_code: None,
+            sources: Vec::new(),
+            held: Vec::new(),
+            site_sources: Vec::new(),
+            curve_slot: None,
+            per_replicate: None,
+            intermediate: true,
+        })
+        .collect();
+    crate::routes::private::tools::service::in_order(&pinned)
+        .map(|_| ())
+        .map_err(|e| format!("Shared steps {e}"))
 }
 
 /// The identifiers a formula reads, minus the two its curve slot binds.
@@ -982,6 +1097,9 @@ impl CRUDOperations for CalculationFormulaOperations {
             curve_slot: data.curve_slot.as_deref(),
         };
         let resolved = resolve_variables(db, &data.formula, &context).await?;
+        if data.tool_script_id.is_none() {
+            refuse_shared_cycle(db, (&data.code, &data.formula)).await?;
+        }
         // A definition being created may already have its output parameter in the catalog, and
         // anything reading that parameter is a chain this formula would close.
         let output = existing_parameter_id(db, &data.code).await?;
@@ -1023,30 +1141,37 @@ impl CRUDOperations for CalculationFormulaOperations {
         // also carries what this update does not change: the curve slot, the owner and whether
         // the formula is a step.
         let stored = stored_definition(db, id).await?;
-        require_owner_or_step(
-            match &data.tool_script_id {
-                Some(owner) => *owner,
-                None => stored.tool_script_id,
-            },
-            match &data.intermediate {
-                Some(Some(step)) => *step,
-                _ => stored.intermediate,
-            },
-        )?;
-        if let Some(Some(ref formula)) = data.formula {
-            validate_formula(formula)?;
-            let curve_slot = match &data.curve_slot {
-                Some(slot) => slot.clone(),
-                None => stored.curve_slot.clone(),
-            };
-            let context = FormulaContext {
-                tool_script_id: stored.tool_script_id,
-                code: &stored.code,
-                curve_slot: curve_slot.as_deref(),
-            };
-            let resolved = resolve_variables(db, formula, &context).await?;
-            validate_against_stored_graph(db, stored.output_parameter_id, &resolved.parameters)
-                .await?;
+        let owner = match &data.tool_script_id {
+            Some(owner) => *owner,
+            None => stored.tool_script_id,
+        };
+        let intermediate = match &data.intermediate {
+            Some(Some(step)) => *step,
+            _ => stored.intermediate,
+        };
+        require_owner_or_step(owner, intermediate)?;
+        let formula = match &data.formula {
+            Some(Some(formula)) => {
+                validate_formula(formula)?;
+                formula.as_str()
+            }
+            _ if owner != stored.tool_script_id => stored.formula.as_str(),
+            _ => return Ok(()),
+        };
+        // A step released to be shared reads what a shared step may, so it is resolved again.
+        let curve_slot = match &data.curve_slot {
+            Some(slot) => slot.clone(),
+            None => stored.curve_slot.clone(),
+        };
+        let context = FormulaContext {
+            tool_script_id: owner,
+            code: &stored.code,
+            curve_slot: curve_slot.as_deref(),
+        };
+        let resolved = resolve_variables(db, formula, &context).await?;
+        validate_against_stored_graph(db, stored.output_parameter_id, &resolved.parameters).await?;
+        if owner.is_none() {
+            refuse_shared_cycle(db, (&stored.code, formula)).await?;
         }
         Ok(())
     }

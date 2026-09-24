@@ -53,6 +53,7 @@ use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::resolver;
 use crate::routes::private::sensors::models::ResolvedOwner;
 use crate::routes::private::sensors::service::resolve_slot_owner_for_times;
+use crate::routes::private::collection_events::flows::enqueue_at_slot;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::resolve_site_with_project;
 use crate::routes::service::ACTION_BODY_LIMIT;
@@ -314,7 +315,8 @@ pub async fn detach_output(
 }
 
 /// Return a detached output slot to its calculation: the value the last correction since the
-/// detach replaced is restored and the tool owns the slot again. Requires Administrator.
+/// detach replaced is restored, the tool owns the slot again, and the visit recomputes to catch
+/// up with inputs that moved while it was detached. Requires Administrator.
 #[utoipa::path(
     post,
     path = "/api/readings/return",
@@ -418,6 +420,7 @@ pub async fn return_output(
             .await?;
             decided += 1;
         }
+        enqueue_at_slot(txn, req.site_id, req.parameter_id, req.time, &actor).await?;
         Ok(decided)
     })
     .await?;
@@ -762,6 +765,30 @@ pub async fn rollback(
     .await?;
     refresh_edited_rollups(&state, &recorded).await;
     Ok(Json(RollbackResponse { rollback_id }))
+}
+
+/// Every decision an edit set recorded, across the streams it reached, with each reading's
+/// parameter: what rolling the set back restores. Requires `read_data`.
+#[utoipa::path(
+    get,
+    path = "/api/readings/edits/sets/{set_id}",
+    params(("set_id" = Uuid, Path, description = "The set the edit recorded")),
+    responses(
+        (status = 200, description = "The set and its decisions", body = EditSetResponse),
+        (status = 404, description = "No such set"),
+    ),
+    tag = "readings"
+)]
+pub async fn get_edit_set(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    axum::extract::Path(set_id): axum::extract::Path<Uuid>,
+) -> AppResult<Json<EditSetResponse>> {
+    let sites = decided_sites(&state.db, decision_model::Column::SetId, set_id).await?;
+    require_edit_in_scope(&state.db, &scope, &sites).await?;
+    Ok(Json(
+        crate::routes::private::readings::service::set_members(&state.db, set_id).await?,
+    ))
 }
 
 /// Invert every live decision an edit's set recorded, restoring exactly the state each one
@@ -2815,6 +2842,7 @@ pub fn readings_read_routes(state: &AppState) -> axum::Router {
         .route("/readings/decisions", get(list_decisions))
         .route("/readings/replay", get(replay_derived))
         .route("/readings/edits/inspect", post(inspect))
+        .route("/readings/edits/sets/{set_id}", get(get_edit_set))
         .layer(axum::middleware::from_fn(require_read_data))
         .with_state(state.clone())
 }

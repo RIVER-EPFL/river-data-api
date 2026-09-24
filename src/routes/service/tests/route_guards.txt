@@ -81,6 +81,7 @@
 /readings/edits => require_write_data
 /readings/edits/inspect => require_read_data
 /readings/edits/preview => require_write_data
+/readings/edits/sets/{set_id} => require_read_data
 /readings/edits/sets/{set_id}/rollback => require_write_data
 /readings/edits/{id}/rollback => require_write_data
 /readings/flag => require_write_data

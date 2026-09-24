@@ -174,6 +174,37 @@ impl Fixture {
             .unwrap_or_default()
     }
 
+    /// The ledger row the record names as behind its capture.
+    async fn captured_by(&self) -> serde_json::Value {
+        let (status, body) =
+            crate::common::get_json_with_token(&self.app, &self.uri(), &self.token).await;
+        assert_eq!(status, 200, "{body}");
+        body["records"][0]["captured_by"].clone()
+    }
+
+    /// The newest computation the ledger holds at the output's key, as the record serves one.
+    async fn newest_computation(&self) -> serde_json::Value {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id, seq, kind, job_id FROM reading_decisions \
+                   WHERE stream_id = $1 AND time = $2 \
+                     AND kind IN ('formula_transition', 'derived_computed') \
+                   ORDER BY seq DESC LIMIT 1",
+                [self.output_stream().await.into(), self.at.into()],
+            ))
+            .await
+            .expect("the query runs")
+            .expect("a computation on the ledger");
+        json!({
+            "id": row.try_get::<Uuid>("", "id").expect("id"),
+            "seq": row.try_get::<i64>("", "seq").expect("seq"),
+            "kind": row.try_get::<String>("", "kind").expect("kind"),
+            "job_id": row.try_get::<Option<Uuid>>("", "job_id").expect("job_id"),
+        })
+    }
+
     /// The stream the output is stored on.
     async fn output_stream(&self) -> Uuid {
         self.db
@@ -288,6 +319,29 @@ async fn a_correction_recomputes_the_output_and_the_record_follows_the_new_readi
     assert!(
         input["members"][0]["revision"].as_i64().is_some(),
         "the correction is a decision, so the reading now has a revision: {input}"
+    );
+}
+
+/// Scenario: an output is computed, then recomputed after its input is corrected.
+///
+/// Expected behaviour: the record names the ledger row behind the capture it shows, once beside
+/// it: the first computation, then the recompute that moved the value (Q251).
+#[tokio::test]
+#[serial]
+async fn the_record_names_the_ledger_row_behind_its_capture() {
+    let f = computed_slot("Dissolved_O2 * 2", &[]).await;
+    f.write_input(10.0, None).await;
+    f.consumed().await;
+    let first = f.captured_by().await;
+    assert_eq!(first, f.newest_computation().await);
+
+    f.write_input(11.0, Some("overwrite")).await;
+    f.wait_for_output(22.0).await;
+    let moved = f.captured_by().await;
+    assert_eq!(moved, f.newest_computation().await);
+    assert!(
+        moved["seq"].as_i64() > first["seq"].as_i64(),
+        "the recompute's row, not the first: {first} then {moved}"
     );
 }
 

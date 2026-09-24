@@ -42,7 +42,7 @@ async fn save_set(
     let (status, body) = crate::common::post_json_with_token(
         app,
         &format!("/api/tool_scripts/{calculation}/formulas"),
-        &json!({ "formulas": [row], "migrate_stored": true }),
+        &json!({ "formulas": [row] }),
         token,
     )
     .await;
@@ -185,8 +185,8 @@ async fn each_version_lists_the_readings_it_computed_and_the_span_they_cover() {
         "the newest instant is the one just ingested: {one:?}"
     );
 
-    // A second save mints a version and, on the correcting arm, repairs what the first left on
-    // both arms: the stream value moves onto the new version with no recompute asked for by hand.
+    // A second save mints a version and repairs what the first left on both arms: the stream value
+    // moves onto the new version with no recompute asked for by hand.
     save_set(
         &app,
         &token,

@@ -85,3 +85,33 @@ fn two_subjects_at_once_are_refused_rather_than_ranked() {
     };
     assert!(closure_subject(&q).is_err());
 }
+
+/// Scenario: two janitor runs in the window, each filling pCO2 at Saxon, one also at Sion, and a
+/// run whose report predates the per-calculation record.
+///
+/// Expected behaviour: the fills are summed per calculation and site, a site outside the reader's
+/// scope is left out, and a report without the record adds nothing.
+#[test]
+fn janitor_fills_are_summed_per_calculation_and_site_across_runs() {
+    use uuid::Uuid;
+    let (pco2, saxon, sion) = (Uuid::from_u128(1), Uuid::from_u128(10), Uuid::from_u128(11));
+    let run = |sites: serde_json::Value| {
+        serde_json::json!({ "scope": { "filled_by_calculation": { pco2.to_string(): sites } } })
+    };
+    let details = [
+        run(serde_json::json!({ saxon.to_string(): { "values": 3, "instants": [] } })),
+        run(serde_json::json!({
+            saxon.to_string(): { "values": 11, "instants": [] },
+            sion.to_string(): { "values": 2, "instants": [] },
+        })),
+        serde_json::json!({ "scope": {}, "counts": { "filled": 4 } }),
+    ];
+
+    let all = super::sum_janitor_fills(&details, None);
+    assert_eq!(all[&pco2][&saxon], 14);
+    assert_eq!(all[&pco2][&sion], 2);
+
+    let scoped = super::sum_janitor_fills(&details, Some(&[saxon]));
+    assert_eq!(scoped[&pco2].len(), 1);
+    assert_eq!(scoped[&pco2][&saxon], 14);
+}

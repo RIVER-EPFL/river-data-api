@@ -10,7 +10,8 @@ use sea_orm::sea_query::{
     Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, QueryFilter, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, QueryFilter, QuerySelect,
+    Statement,
 };
 use uuid::Uuid;
 
@@ -189,4 +190,47 @@ pub async fn enqueue_for<C: ConnectionTrait>(
         }
     }
     Ok(queued)
+}
+
+/// Enqueue the recompute of the visit an output slot sits at, the way a returned slot catches up
+/// with the inputs that moved while it was detached. Returns the job queued, if any.
+pub async fn enqueue_at_slot<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+    actor: &str,
+) -> AppResult<Option<Uuid>> {
+    let event_id: Option<Option<Uuid>> = readings::Entity::find()
+        .select_only()
+        .column(readings::Column::CollectionEventId)
+        .filter(readings::Column::SiteId.eq(site_id))
+        .filter(readings::Column::ParameterId.eq(parameter_id))
+        .filter(readings::Column::Time.eq(at))
+        .filter(readings::Column::CollectionEventId.is_not_null())
+        .into_tuple()
+        .one(db)
+        .await?;
+    let Some(event_id) = event_id.flatten() else {
+        return Ok(None);
+    };
+    let Some(event) = events::Entity::find_by_id(event_id).one(db).await? else {
+        return Ok(None);
+    };
+    if !super::service::chain_may_run(&event.source) {
+        return Ok(None);
+    }
+    Ok(jobs::enqueue(
+        db,
+        "event_recompute",
+        None,
+        Some(event.id),
+        &serde_json::json!({
+            "collection_event_id": event.id,
+            "site_id": event.site_id,
+            "actor": actor,
+        }),
+        Some(&dedupe_key(event.id)),
+    )
+    .await?)
 }

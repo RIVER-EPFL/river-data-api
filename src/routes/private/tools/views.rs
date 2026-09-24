@@ -6,7 +6,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router, middleware};
 use crudcrate::CRUDResource;
-use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait,
@@ -15,12 +14,11 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::flows::{calculation_sites, execute_and_store_run, preview_run, replay_trace};
-use super::models::activation as activation_entity;
 use super::models::script as script_entity;
 use super::models::script::{ToolScript, ToolScriptList};
 use super::models::version::ToolScriptVersion;
 use super::models::{
-    ActivateRequest, ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth,
+    ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth,
     CalculationSites, ClosureQuery, ClosureResponse, CreateScriptRequest, CreateVersionRequest,
     CreateVersionResponse, DecommissionRequest, DraftRunFailure, DraftRunFailureKind,
     DraftRunRequest, DraftRunResponse, DraftRunResults, Engine, FormulaDraftRunRequest,
@@ -774,7 +772,8 @@ pub async fn validate_version(
 }
 
 /// Make a version the one `GET /tools` serves. Activating an older version is the rollback; every
-/// flip lands in the activation audit under the authenticated caller.
+/// flip lands in the activation audit under the authenticated caller, and the values the version it
+/// replaces produced are queued for recompute in the same transaction (Q256).
 ///
 /// A version has to have been validated by hand, **and its cases are run again here** rather than
 /// read off `validated_at`. The stamp says the cases passed at a time, and what a case runs
@@ -794,7 +793,6 @@ pub async fn validate_version(
 /// Administrator.
 #[utoipa::path(post, path = "/api/tool_scripts/{id}/versions/{version_id}/activate",
     params(("id" = Uuid, Path), ("version_id" = Uuid, Path)),
-    request_body = ActivateRequest,
     responses((status = 200, body = ActivateResponse),
               (status = 409, description = "Never validated, or the cases do not pass now"),
               (status = 503, description = "The tool runner is not configured or unreachable")),
@@ -803,7 +801,6 @@ pub async fn activate_version(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Path((id, vid)): Path<(Uuid, Uuid)>,
-    Json(payload): Json<ActivateRequest>,
 ) -> AppResult<Json<ActivateResponse>> {
     let version = load_version(&state, id, vid).await?;
     if version.validated_at.is_none() {
@@ -842,38 +839,16 @@ pub async fn activate_version(
         .one(&txn)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Tool script {id} not found")))?;
-    activation_entity::ActiveModel {
-        tool_script_id: Set(id),
-        from_version_id: Set(current.active_version_id),
-        to_version_id: Set(vid),
-        activated_by: Set(Some(crate::common::actor::label(&auth))),
-        ..Default::default()
-    }
-    .insert(&txn)
-    .await?;
-    script_entity::Entity::update_many()
-        .col_expr(
-            script_entity::Column::ActiveVersionId,
-            Expr::value(Some(vid)),
-        )
-        .col_expr(script_entity::Column::UpdatedAt, Expr::current_timestamp())
-        .filter(script_entity::Column::Id.eq(id))
-        .exec(&txn)
-        .await?;
-    // The correcting arm reaches exactly the visits the superseded version produced values at
-    // (Q170), and commits with the activation, so a job that cannot be queued activates nothing.
-    super::service::recompute_after_activation(
+    super::service::activate(
         &txn,
-        payload.migrate_stored,
-        &current.name,
         id,
         current.active_version_id,
+        vid,
+        Some(&crate::common::actor::label(&auth)),
     )
     .await?;
     txn.commit().await?;
     let script = load_script(&state, id).await?;
-    // The audit is the backstop under either arm: it reports what the activation left disagreeing.
-    audit_after_activation(&state.db, &script.name).await;
     Ok(Json(ActivateResponse { script, lint }))
 }
 
@@ -1131,8 +1106,8 @@ async fn refuse_reads_of_former(
 /// created, and a stored formula the set leaves out is deleted. The shared steps it carries are
 /// written first, in the same transaction, and are not the set's to delete. One version is minted from the
 /// resulting set and activated, whatever the save touched, so an author's version history reads as
-/// their decisions rather than as their keystrokes (Q186). `migrate_stored` chooses what happens to
-/// the values the superseded version produced (Q170). Requires Administrator, or a token with
+/// their decisions rather than as their keystrokes (Q186). The values the superseded version produced
+/// are queued for recompute with the activation (Q256). Requires Administrator, or a token with
 /// `write_metadata`, which is what a formula row is written under.
 #[utoipa::path(
     post,
@@ -1246,11 +1221,9 @@ pub async fn save_formula_set(
             .await?,
         );
     }
-    // The migration commits with the version it repairs, so a save reporting `migrated` has its
-    // job queued, and a job that cannot be queued leaves no save behind.
-    let migrated = payload.migrate_stored && superseded.is_some() && version_id != superseded;
-    super::service::recompute_after_activation(&txn, migrated, &script.name, id, superseded)
-        .await?;
+    // The activation queued the migration in this transaction, so a save reporting `migrated` has
+    // its job queued, and a job that cannot be queued leaves no save behind.
+    let migrated = superseded.is_some() && version_id != superseded;
     txn.commit().await?;
 
     let version_no = match version_id {
@@ -1261,7 +1234,7 @@ pub async fn save_formula_set(
         None => None,
     };
 
-    // The audit is the backstop under either arm: it reports what the save left disagreeing.
+    // The audit is the backstop: it reports what the save left disagreeing.
     audit_after_activation(&state.db, &script.name).await;
 
     Ok(Json(SaveFormulaSetResponse {

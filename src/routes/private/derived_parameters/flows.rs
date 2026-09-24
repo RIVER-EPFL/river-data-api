@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,6 +28,9 @@ use crate::routes::private::site_parameters::models as site_parameters;
 use super::models::{definition, source};
 
 const MAX_GAPS_PER_RUN: usize = 50_000;
+
+/// How many instants a report lists per calculation and site; the count covers them all.
+const FILL_INSTANTS_LISTED: usize = 100;
 
 /// The statuses a prune leaves alone: a job still queued or running is not history yet.
 const IN_FLIGHT: [&str; 4] = ["queued", "pending", "running", "retrying"];
@@ -118,6 +122,7 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
         .distinct()
         .column((r.clone(), readings::Column::SiteId))
         .column((r.clone(), readings::Column::Time))
+        .column((d.clone(), definition::Column::ToolScriptId))
         .from_as(readings::Entity, r.clone())
         .join_as(
             JoinType::Join,
@@ -196,6 +201,34 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
 struct StaleSlot {
     site_id: Uuid,
     time: chrono::DateTime<chrono::FixedOffset>,
+    tool_script_id: Uuid,
+}
+
+/// What one calculation had filled at one site: every value, and the first instants of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SiteFills {
+    pub values: usize,
+    pub instants: Vec<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Each calculation's filled gaps by site, from the scan's `(calculation, site, instant)` rows and
+/// the `(site, instant)` pairs the recompute filled.
+fn fills_by_calculation(
+    gaps: &[(Uuid, Uuid, chrono::DateTime<chrono::Utc>)],
+    filled: &HashSet<(Uuid, chrono::DateTime<chrono::Utc>)>,
+) -> BTreeMap<Uuid, BTreeMap<Uuid, SiteFills>> {
+    let mut fills: BTreeMap<Uuid, BTreeMap<Uuid, SiteFills>> = BTreeMap::new();
+    for &(tool, site, time) in gaps {
+        if !filled.contains(&(site, time)) {
+            continue;
+        }
+        let at = fills.entry(tool).or_default().entry(site).or_default();
+        at.values += 1;
+        if at.instants.len() < FILL_INSTANTS_LISTED {
+            at.instants.push(time);
+        }
+    }
+    fills
 }
 
 /// What one gap-fill pass found and did.
@@ -207,6 +240,8 @@ pub struct GapFill {
     pub earliest_filled: Option<chrono::DateTime<chrono::Utc>>,
     /// The scan returned `MAX_GAPS_PER_RUN` rows, so gaps may remain past what this pass saw.
     pub capped: bool,
+    /// What each calculation, by `tool_script_id`, had filled at each site.
+    pub by_calculation: BTreeMap<Uuid, BTreeMap<Uuid, SiteFills>>,
 }
 
 impl GapFill {
@@ -219,6 +254,11 @@ impl GapFill {
                 self.earliest_filled.map(|t| t.to_rfc3339()),
             )
             .scope("capped_at_limit", self.capped)
+            .scope_opt(
+                "filled_by_calculation",
+                (!self.by_calculation.is_empty())
+                    .then(|| serde_json::to_value(&self.by_calculation).unwrap_or_default()),
+            )
             .count("gaps_found", self.found)
             .count("filled", self.filled)
             .count("refused_slots", self.refused_slots)
@@ -241,26 +281,34 @@ pub async fn run_once(
         ))
         .await?;
 
-    let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+    // A row per calculation with a gap at the instant; the recompute covers every calculation at
+    // the site, so it runs once per instant.
+    let mut gaps = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let slot = StaleSlot::from_query_result(row, "")?;
+        gaps.push((slot.tool_script_id, slot.site_id, slot.time.with_timezone(&chrono::Utc)));
+    }
+    let mut instants: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> =
+        gaps.iter().map(|&(_, site, time)| (site, time)).collect();
+    instants.dedup();
+
+    let total = i32::try_from(instants.len()).unwrap_or(i32::MAX);
     if let Some(ctx) = ctx {
         ctx.set_progress(0, Some(total)).await;
     }
-    if rows.is_empty() {
+    if instants.is_empty() {
         tracing::info!("Derived janitor: no gaps found");
         return Ok(GapFill::default());
     }
     tracing::info!(gaps = total, "Derived janitor: filling gaps");
 
-    let mut filled: i64 = 0;
+    let mut filled_slots = HashSet::new();
     let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut refused = DerivedPass::default();
-    for (i, row) in rows.iter().enumerate() {
+    for (i, &(site_id, utc_time)) in instants.iter().enumerate() {
         if ctx.is_some_and(JobContext::is_cancelled) {
             break;
         }
-        let slot = StaleSlot::from_query_result(row, "")?;
-        let site_id = slot.site_id;
-        let utc_time = slot.time.with_timezone(&chrono::Utc);
         match crate::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp(
             db, site_id, utc_time,
         )
@@ -268,7 +316,7 @@ pub async fn run_once(
         {
             Ok(slots) => {
                 refused.record(&slots, utc_time);
-                filled += 1;
+                filled_slots.insert((site_id, utc_time));
                 min_filled = Some(min_filled.map_or(utc_time, |m| Ord::min(m, utc_time)));
             }
             Err(e) => tracing::warn!(error = %e, site_id = %site_id, time = %utc_time, "Janitor failed to fill derived gap"),
@@ -281,12 +329,13 @@ pub async fn run_once(
     }
 
     if let Some(since) = min_filled {
-        tracing::info!(%since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
+        tracing::info!(%since, filled = filled_slots.len(), "Derived janitor: refreshing continuous aggregates after backfill");
         crate::common::sync_state::refresh_continuous_aggregates(db, since)
             .await
             .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
     }
     let refused_slots = refused.report(db).await?;
+    let filled = filled_slots.len();
     if let Some(ctx) = ctx {
         ctx.set_progress(total, Some(total)).await;
         ctx.info(&format!("Filled {filled} of {total} derived gaps"))
@@ -300,11 +349,12 @@ pub async fn run_once(
         "Derived janitor: gap fill complete"
     );
     Ok(GapFill {
-        found: rows.len(),
-        filled: usize::try_from(filled).unwrap_or(0),
+        found: instants.len(),
+        filled,
         refused_slots,
         earliest_filled: min_filled,
         capped: rows.len() >= MAX_GAPS_PER_RUN,
+        by_calculation: fills_by_calculation(&gaps, &filled_slots),
     })
 }
 

@@ -313,10 +313,10 @@ pub fn sites_applied(
 
 /// Why the chain leaves one of a run's outputs alone at a visit, or `None` when it writes it.
 ///
-/// A slot an admin detached at this visit is a manual value until an input moves or it is
-/// returned (Q40, Q47). A slot the site declares high cadence is the stream engine's (Q234):
-/// `readings` holds one row per slot instant, so a visit that wrote it would overwrite the value
-/// and provenance the stream pass put there. A two-output calculation may have one output on each
+/// A slot an admin detached at this visit is a manual value until it is returned (Q40, Q263). A
+/// slot the site declares high cadence is the stream engine's (Q234): `readings` holds one row per
+/// slot instant, so a visit that wrote it would overwrite the value and provenance the stream pass
+/// put there. A two-output calculation may have one output on each
 /// arm, which is why the question is asked per output rather than per run.
 #[must_use]
 pub fn output_skip_reason(

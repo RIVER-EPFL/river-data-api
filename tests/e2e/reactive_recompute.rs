@@ -294,21 +294,21 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
     );
 }
 
-/// Expected behaviour: an admin detaches an output slot at a visit, edits its value, and the
-/// chain no longer writes it; an edit to an input at the visit re-engages the tool and the
-/// chain supersedes the manual value; the admin returns the slot and the tool's value stands.
+/// Expected behaviour: an admin detaches an output slot at a visit and edits its value; an edit to
+/// an input at the visit leaves the override standing; the admin returns the slot and the visit
+/// recomputes from the inputs as they now stand.
 #[tokio::test]
 #[serial]
-async fn detach_edit_reengage_and_return_on_an_output_slot() {
+async fn detach_edit_and_return_on_an_output_slot() {
     use sea_orm::ConnectionTrait;
     if !crate::common::profile::Service::Keycloak
-        .require("detach_edit_reengage_and_return_on_an_output_slot")
+        .require("detach_edit_and_return_on_an_output_slot")
         .await
     {
         return;
     }
     if !crate::common::profile::Service::ToolsRunner
-        .require("detach_edit_reengage_and_return_on_an_output_slot")
+        .require("detach_edit_and_return_on_an_output_slot")
         .await
     {
         return;
@@ -408,7 +408,7 @@ async fn detach_edit_reengage_and_return_on_an_output_slot() {
     assert_eq!(status, 200);
     assert_eq!(served(&db, &site_id, &pb).await, Some(99.0));
 
-    // A correction to the input at the visit re-engages the tool: the chain supersedes 99.
+    // A correction to the input at the visit leaves the override standing.
     let (status, _) = crate::common::post_json_with_token(
         &app,
         "/api/grab_samples",
@@ -424,19 +424,11 @@ async fn detach_edit_reengage_and_return_on_an_output_slot() {
     assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
     assert_eq!(
         served(&db, &site_id, &pb).await,
-        Some(25.0),
-        "re-engaged: 20 + 5"
+        Some(99.0),
+        "the override stands"
     );
 
-    // A second detach without a correction, then return: the tool's value stands.
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/readings/detach",
-        &json!({ "site_id": site_id, "parameter_id": pb, "time": VISIT }),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
+    // The return recomputes the visit: the tool's value follows the corrected input.
     let (status, body) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/return",
@@ -446,10 +438,11 @@ async fn detach_edit_reengage_and_return_on_an_output_slot() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["owner"], "tool");
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
     assert_eq!(
         served(&db, &site_id, &pb).await,
         Some(25.0),
-        "the tool's value stands"
+        "returned and recomputed: 20 + 5"
     );
 
     // After the return the tool owns the slot: returning again is refused, detaching is valid.

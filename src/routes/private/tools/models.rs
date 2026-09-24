@@ -1930,6 +1930,16 @@ pub struct CalculationHealth {
     /// failed. Null once it completed, or when none ran.
     #[schema(required)]
     pub repair: Option<CalculationRepair>,
+    /// The values the janitor had to fill for this calculation in the last 24 hours, by site: each
+    /// is a write that missed its recompute (Q260). Empty when there were none.
+    pub janitor_fills: Vec<JanitorFill>,
+}
+
+/// The values the janitor filled for one calculation at one site.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct JanitorFill {
+    pub site_id: Uuid,
+    pub values: i64,
 }
 
 /// A calculation's latest recompute run, named so its logs can be opened.
@@ -2233,11 +2243,6 @@ pub struct SaveFormulaSetRequest {
     /// mints holds them and the version they supersede is the one the page was editing.
     #[serde(default)]
     pub shared_steps: Vec<SavedSharedStep>,
-    /// What happens to the values the version being replaced produced (Q170). `false`, the
-    /// default, leaves them on that version. `true` is a correction: every visit the superseded
-    /// version produced values at is recomputed under the new one.
-    #[serde(default)]
-    pub migrate_stored: bool,
 }
 
 /// What one set-level save wrote.
@@ -2365,16 +2370,6 @@ pub struct ValidateResponse {
     pub cases: Vec<CaseResult>,
     #[schema(required)]
     pub validated_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ActivateRequest {
-    /// What happens to the values the version being replaced produced (Q170). `false`, the
-    /// default, leaves them on that version: this activation is a new method, and the history
-    /// stands as it was computed. `true` is a correction: every visit the superseded version
-    /// produced values at is recomputed under the new one.
-    #[serde(default)]
-    pub migrate_stored: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

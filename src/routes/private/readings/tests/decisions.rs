@@ -475,35 +475,27 @@ fn a_selection_can_name_one_visit() {
 }
 
 #[test]
-fn a_detach_makes_the_slot_manual_until_an_input_moves_or_it_is_returned() {
+fn a_detach_makes_the_slot_manual_until_it_is_returned() {
     use super::{Owner, slot_owner};
     let t = |s: &str| {
         chrono::DateTime::parse_from_rfc3339(s)
             .unwrap()
             .with_timezone(&chrono::Utc)
     };
-    assert_eq!(slot_owner(&[], None), Owner::Tool);
+    assert_eq!(slot_owner(&[]), Owner::Tool);
     assert_eq!(
-        slot_owner(&[(Kind::Chain, t("2025-06-01T00:00:00Z"))], None),
+        slot_owner(&[(Kind::Chain, t("2025-06-01T00:00:00Z"))]),
         Owner::Tool
     );
-    let detached = [(Kind::Detach, t("2025-06-02T00:00:00Z"))];
-    assert_eq!(slot_owner(&detached, None), Owner::Manual);
     assert_eq!(
-        slot_owner(&detached, Some(t("2025-06-01T12:00:00Z"))),
-        Owner::Manual,
-        "an input edit before the detach does not re-engage"
-    );
-    assert_eq!(
-        slot_owner(&detached, Some(t("2025-06-03T00:00:00Z"))),
-        Owner::Tool,
-        "an input edit after the detach re-engages the tool"
+        slot_owner(&[(Kind::Detach, t("2025-06-02T00:00:00Z"))]),
+        Owner::Manual
     );
     let returned = [
         (Kind::Return, t("2025-06-04T00:00:00Z")),
         (Kind::Detach, t("2025-06-02T00:00:00Z")),
     ];
-    assert_eq!(slot_owner(&returned, None), Owner::Tool);
+    assert_eq!(slot_owner(&returned), Owner::Tool);
 }
 
 #[test]

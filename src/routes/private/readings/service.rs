@@ -3073,35 +3073,18 @@ pub async fn enqueue_pin_reprocess_for_decision<C: ConnectionTrait>(
 }
 
 /// The ownership fold over a slot's ownership decisions (`chain`, `detach`, `return`), newest
-/// first, and the instant of the latest input decision at the visit. A `detach` makes the slot
-/// manual until a `return`, a `chain` supersession, or an input decision newer than it, which
-/// re-engages the tool (Q47's clarification).
+/// first. A `detach` makes the slot manual until a `return` or a `chain` supersession: an input
+/// moving under it leaves the override standing (Q263).
 #[must_use]
-pub fn slot_owner(
-    ownership_newest_first: &[(Kind, chrono::DateTime<chrono::Utc>)],
-    latest_input_decision: Option<chrono::DateTime<chrono::Utc>>,
-) -> Owner {
+pub fn slot_owner(ownership_newest_first: &[(Kind, chrono::DateTime<chrono::Utc>)]) -> Owner {
     match ownership_newest_first.first() {
-        Some((Kind::Detach, at)) => match latest_input_decision {
-            Some(input) if input > *at => Owner::Tool,
-            _ => Owner::Manual,
-        },
+        Some((Kind::Detach, _)) => Owner::Manual,
         _ => Owner::Tool,
     }
 }
 
-/// The decisions that say who owns an output slot, and the ones that count as an input moving
-/// under it. Together they are the fold [`slot_owner`] applies.
+/// The decisions that say who owns an output slot, the fold [`slot_owner`] applies.
 const OWNERSHIP_KINDS: [Kind; 3] = [Kind::Chain, Kind::Detach, Kind::Return];
-const INPUT_KINDS: [Kind; 7] = [
-    Kind::Flag,
-    Kind::Unflag,
-    Kind::Withdraw,
-    Kind::Reassert,
-    Kind::Reject,
-    Kind::ValueCorrection,
-    Kind::Rollback,
-];
 
 /// The output rows at one slot instant: `(stream_id, replicate indices)` per stream.
 pub(super) async fn output_rows_at<C: ConnectionTrait>(
@@ -3130,8 +3113,7 @@ pub(super) async fn output_rows_at<C: ConnectionTrait>(
 }
 
 /// The owner of an output slot at a visit, read from the record: the latest live ownership
-/// decision on the slot's rows against the latest decision on any other parameter's rows at the
-/// same site and instant (an input edit).
+/// decision on the slot's rows.
 pub async fn output_owner<C: ConnectionTrait>(
     conn: &C,
     site_id: Uuid,
@@ -3140,17 +3122,10 @@ pub async fn output_owner<C: ConnectionTrait>(
 ) -> AppResult<Owner> {
     let d = Alias::new("d");
     let r = Alias::new("r");
-    let at_slot = |same_parameter: bool| {
-        let parameter = Expr::col((r.clone(), readings::Column::ParameterId));
-        Condition::all()
-            .add(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
-            .add(if same_parameter {
-                parameter.eq(parameter_id)
-            } else {
-                parameter.ne(parameter_id)
-            })
-            .add(Expr::col((r.clone(), readings::Column::Time)).eq(at))
-    };
+    let at_slot = Condition::all()
+        .add(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .add(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
+        .add(Expr::col((r.clone(), readings::Column::Time)).eq(at));
     let decisions_on_the_slot = || {
         let mut query = Query::select();
         query.from_as(decision_model::Entity, d.clone()).join_as(
@@ -3186,7 +3161,7 @@ pub async fn output_owner<C: ConnectionTrait>(
         .column((d.clone(), decision_model::Column::Kind))
         .column((d.clone(), decision_model::Column::At))
         .cond_where(
-            at_slot(true)
+            at_slot
                 .add(
                     Expr::col((d.clone(), decision_model::Column::Kind))
                         .is_in(OWNERSHIP_KINDS.map(Kind::as_str)),
@@ -3207,31 +3182,7 @@ pub async fn output_owner<C: ConnectionTrait>(
     // already names the three this reads.
     .filter_map(|r| Some((Kind::parse(&r.kind)?, r.at.with_timezone(&chrono::Utc))))
     .collect();
-    let (sql, values) =
-        decisions_on_the_slot()
-            .expr_as(
-                Func::max(Expr::col((d.clone(), decision_model::Column::At))),
-                Alias::new("at"),
-            )
-            .cond_where(at_slot(false).add(
-                Expr::col((d, decision_model::Column::Kind)).is_in(INPUT_KINDS.map(Kind::as_str)),
-            ))
-            .to_owned()
-            .build(PostgresQueryBuilder);
-    let input = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await?
-        .and_then(|r| {
-            r.try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "at")
-                .ok()
-                .flatten()
-        })
-        .map(|t| t.with_timezone(&chrono::Utc));
-    Ok(slot_owner(&ownership, input))
+    Ok(slot_owner(&ownership))
 }
 
 pub async fn load<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<DecisionRow> {
@@ -4294,31 +4245,110 @@ pub(super) async fn decided_sites<C: ConnectionTrait>(
             JoinType::InnerJoin,
             readings::Entity,
             r.clone(),
-            Condition::all()
-                .add(
-                    Expr::col((r.clone(), readings::Column::StreamId))
-                        .equals((d.clone(), decision_model::Column::StreamId)),
-                )
-                .add(
-                    Expr::col((r.clone(), readings::Column::Time))
-                        .equals((d.clone(), decision_model::Column::Time)),
-                )
-                .add(
-                    Condition::any()
-                        .add(
-                            Expr::col((d.clone(), decision_model::Column::ReplicateIndex))
-                                .is_null(),
-                        )
-                        .add(
-                            Expr::col((d, decision_model::Column::ReplicateIndex))
-                                .equals((r, readings::Column::ReplicateIndex)),
-                        ),
-                ),
+            decided_reading(&d, &r),
         )
-        .and_where(Expr::col((Alias::new("d"), column)).eq(id))
+        .and_where(Expr::col((d, column)).eq(id))
         .to_owned()
         .build(PostgresQueryBuilder);
     sites_of(conn, sql, values).await
+}
+
+/// The readings a decision stands on: its key, and every replicate when it names the whole group.
+fn decided_reading(d: &Alias, r: &Alias) -> Condition {
+    Condition::all()
+        .add(
+            Expr::col((r.clone(), readings::Column::StreamId))
+                .equals((d.clone(), decision_model::Column::StreamId)),
+        )
+        .add(
+            Expr::col((r.clone(), readings::Column::Time))
+                .equals((d.clone(), decision_model::Column::Time)),
+        )
+        .add(
+            Condition::any()
+                .add(Expr::col((d.clone(), decision_model::Column::ReplicateIndex)).is_null())
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::ReplicateIndex))
+                        .equals((r.clone(), readings::Column::ReplicateIndex)),
+                ),
+        )
+}
+
+/// Every decision an edit set recorded, whichever stream it stands on, with the parameter each
+/// one's reading measures: what a rollback of the set would restore.
+pub async fn set_members<C: ConnectionTrait>(conn: &C, set_id: Uuid) -> AppResult<EditSetResponse> {
+    #[derive(FromQueryResult)]
+    struct Named {
+        id: Uuid,
+        code: String,
+        name: String,
+    }
+    let set = decision_set::Entity::find_by_id(set_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Decision set {set_id} not found")))?;
+    let stored = decision_model::Entity::find()
+        .filter(decision_model::Column::SetId.eq(set_id))
+        .order_by_asc(decision_model::Column::Time)
+        .order_by_asc(decision_model::Column::StreamId)
+        .order_by_asc(decision_model::Column::ReplicateIndex)
+        .all(conn)
+        .await?;
+    let d = Alias::new("d");
+    let r = Alias::new("r");
+    let p = Alias::new("p");
+    let (sql, values) = Query::select()
+        .distinct()
+        .column((d.clone(), decision_model::Column::Id))
+        .column((p.clone(), parameters::Column::Code))
+        .column((p.clone(), parameters::Column::Name))
+        .from_as(decision_model::Entity, d.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            readings::Entity,
+            r.clone(),
+            decided_reading(&d, &r),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p, parameters::Column::Id)).equals((r, readings::Column::ParameterId)),
+        )
+        .and_where(Expr::col((d, decision_model::Column::SetId)).eq(set_id))
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    let names: HashMap<Uuid, (String, String)> = Named::find_by_statement(
+        Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values),
+    )
+    .all(conn)
+    .await?
+    .into_iter()
+    .map(|n| (n.id, (n.code, n.name)))
+    .collect();
+    let rulings = audit::standing_rulings(conn, &[set_id]).await?;
+    let members = stored
+        .into_iter()
+        .map(|stored| {
+            let named = names.get(&stored.id).cloned();
+            let mut decision = row_from(stored)?;
+            decision.ruling_hold_id = rulings.get(&set_id).copied();
+            Ok(EditSetMember {
+                parameter_code: named.as_ref().map(|n| n.0.clone()),
+                parameter_name: named.map(|n| n.1),
+                decision,
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(EditSetResponse {
+        set_id,
+        kind: set.kind,
+        actor: set.actor,
+        at: set.at,
+        reason: set.reason,
+        rolled_back_at: set.rolled_back_at,
+        members,
+    })
 }
 
 async fn sites_of<C: ConnectionTrait>(
@@ -5149,8 +5179,8 @@ pub async fn assemble_records(
     }
     let links = fetch_formula_links(db, rows).await?;
     let served = fetch_served_values(db, rows, &links, time).await?;
-    let mut consumed_sets =
-        super::consumed::resolve_many(db, &fetch_consumed_sets(db, rows, time).await?).await?;
+    let (captured, mut captured_by) = fetch_consumed_sets(db, rows, time).await?;
+    let mut consumed_sets = super::consumed::resolve_many(db, &captured).await?;
 
     let mut records = Vec::with_capacity(groups.len());
     for (stream_id, group) in &groups {
@@ -5302,6 +5332,7 @@ pub async fn assemble_records(
             _ => (Vec::new(), Vec::new()),
         };
         let consumed = consumed_sets.remove(stream_id).unwrap_or_default();
+        let captured_by = captured_by.remove(stream_id);
 
         records.push(ProvenanceRecord {
             origin: OriginInfo {
@@ -5342,6 +5373,7 @@ pub async fn assemble_records(
             inputs,
             consumers,
             consumed,
+            captured_by,
             holds,
         });
     }
@@ -5382,8 +5414,12 @@ pub(super) async fn fetch_consumed_sets(
     db: &sea_orm::DatabaseConnection,
     rows: &[RawRow],
     time: DateTime<Utc>,
-) -> AppResult<HashMap<Uuid, Vec<ConsumedInput>>> {
+) -> AppResult<(
+    HashMap<Uuid, Vec<ConsumedInput>>,
+    HashMap<Uuid, CaptureDecision>,
+)> {
     let mut out: HashMap<Uuid, Vec<ConsumedInput>> = HashMap::new();
+    let mut behind: HashMap<Uuid, CaptureDecision> = HashMap::new();
 
     // The first blob in the group, which is the one the record itself reports.
     let mut runs: HashMap<Uuid, Uuid> = HashMap::new();
@@ -5442,6 +5478,12 @@ pub(super) async fn fetch_consumed_sets(
                 continue;
             };
             newest.entry(row.stream_id).or_insert_with(|| set.clone());
+            behind.entry(row.stream_id).or_insert_with(|| CaptureDecision {
+                id: row.id,
+                seq: row.seq,
+                kind: row.kind.clone(),
+                job_id: row.job_id,
+            });
             first.insert(row.stream_id, set);
         }
         for (stream_id, set) in newest {
@@ -5449,7 +5491,7 @@ pub(super) async fn fetch_consumed_sets(
             out.insert(stream_id, super::consumed::as_first_read(set, origin));
         }
     }
-    Ok(out)
+    Ok((out, behind))
 }
 
 /// A stored `consumed` array as the capture wrote it. A shape this build does not understand is

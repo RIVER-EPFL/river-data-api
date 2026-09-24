@@ -186,6 +186,86 @@ async fn test_janitor_fills_derived_gaps() {
     );
 }
 
+/// A calculation with one formula over dissolved oxygen, declared at the site as a tool slot.
+async fn declare_do_calculation(
+    db: &DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+    site_id: Uuid,
+    factor: f64,
+) -> Uuid {
+    let code = format!("janitor_fill_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(db, &format!("{code}_set")).await;
+    let (status, def) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": code,
+            "name": code,
+            "units": "mg/L",
+            "formula": format!("Dissolved_O2 * {factor}"),
+            "tool_script_id": calculation,
+        }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "{def}");
+    let output = Uuid::parse_str(def["output_parameter_id"].as_str().unwrap()).unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"INSERT INTO site_parameters
+            (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode)
+          VALUES (gen_random_uuid(), $1, $2, $3, 'derived', true, 'tool')",
+        [site_id.into(), output.into(), code.into()],
+    ))
+    .await
+    .unwrap();
+    calculation
+}
+
+/// Scenario: two calculations read dissolved oxygen at one site, and one new oxygen reading
+/// lands with no recompute behind it.
+///
+/// Expected behaviour: the janitor's pass credits one filled value to each calculation at that
+/// site, never both to one of them.
+#[tokio::test]
+#[serial]
+async fn test_janitor_credits_each_calculation_with_its_own_fill() {
+    use river_db::routes::private::derived_parameters::flows::run_once;
+    let (db, app, token) = setup().await;
+    let site_id = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
+    let first = declare_do_calculation(&db, &app, &token, site_id, 0.032).await;
+    let second = declare_do_calculation(&db, &app, &token, site_id, 2.0).await;
+    run_once(&db, None, None).await.unwrap();
+
+    let at: DateTime<Utc> = "2025-02-03T04:05:00Z".parse().unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
+          VALUES (
+            (SELECT id FROM data_streams WHERE site_parameter_id = (
+                SELECT id FROM site_parameters WHERE site_id = $1 AND parameter_id = $2
+            ) LIMIT 1),
+            $1, $2, $3, 8.0, 8.0, 0, 'continuous'
+          )",
+        [
+            site_id.into(),
+            Uuid::parse_str(crate::common::GLOBAL_PARAM_DO_ID).unwrap().into(),
+            at.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    let pass = run_once(&db, None, None).await.unwrap();
+
+    for calculation in [first, second] {
+        let fills = &pass.by_calculation[&calculation][&site_id];
+        assert_eq!(fills.values, 1, "{calculation}: {:?}", pass.by_calculation);
+        assert_eq!(fills.instants, vec![at]);
+    }
+}
+
 /// The `derived_computed` decisions on one derived slot's instant, as (actor, old, new).
 async fn arrivals_at(
     db: &DatabaseConnection,

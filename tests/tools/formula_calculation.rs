@@ -572,9 +572,9 @@ async fn a_per_replicate_formula_produces_one_value_per_index() {
 
 /// Scenario: an author edits a formula, which is a change to what the calculation computes.
 ///
-/// Expected behaviour: the edit reports rather than rewrites, the way a constant edit does. It
-/// enqueues the report-only audit itself, so the staleness a formula edit leaves behind is found
-/// without anybody thinking to press Audit.
+/// Expected behaviour: the edit enqueues the audit itself, so what it leaves disagreeing is found
+/// without anybody thinking to press Audit, and queues the recompute of the values the replaced
+/// version produced (Q256).
 #[tokio::test]
 #[serial]
 async fn a_formula_edit_enqueues_its_own_audit() {
@@ -634,7 +634,6 @@ async fn a_formula_edit_enqueues_its_own_audit() {
         "the edit audits too"
     );
 
-    // The audit is report-only: nothing rewrote a value on the way through.
     let rewrites = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -647,7 +646,7 @@ async fn a_formula_edit_enqueues_its_own_audit() {
         .expect("a row")
         .try_get::<i64>("", "n")
         .expect("n");
-    assert_eq!(rewrites, 0, "a formula edit repairs nothing by itself");
+    assert_eq!(rewrites, 1, "the edit queues the recompute of what the first version produced");
 }
 
 /// Scenario: a calculation reading a catalog parameter that belongs to no group of its own, and
@@ -1306,7 +1305,7 @@ async fn a_set_save_names_the_output_it_stopped_publishing() {
     );
 }
 
-/// Scenario: an author saves a correction on the correcting arm, and the migration job it owes
+/// Scenario: an author saves a correction, and the migration job it owes
 /// cannot be queued.
 ///
 /// Expected behaviour: the save and its migration are one transaction, so the save is refused and
@@ -1350,7 +1349,6 @@ async fn a_correcting_save_whose_migration_cannot_be_queued_saves_nothing() {
         &json!({
             "formulas": [{ "id": id, "code": "queued_out", "units": "ratio",
                            "formula": "DO_Temperature * 2", "ordinal": 1 }],
-            "migrate_stored": true,
         }),
         &token,
     )

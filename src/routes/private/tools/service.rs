@@ -25,7 +25,7 @@ use super::models::script::{self, ToolScript};
 use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
 use super::models::{
-    ActiveTool, CalculationHealth, CalculationImpact, CalculationRepair, CaseResult,
+    ActiveTool, CalculationHealth, CalculationImpact, JanitorFill, CalculationRepair, CaseResult,
     CatalogFindings, ClosureQuery, Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter,
     LintFinding, Manifest, ManifestCurve, ManifestEventInput, ManifestOutput, ManifestSiteInput,
     MissingConstant, ParamWhen, ParseCheck, ParseError, PinnedFormula, Produced, ResolvedBy,
@@ -4306,6 +4306,7 @@ pub async fn calculation_health(
                 stale_outputs: 0,
                 skipped_outputs: 0,
                 repair: None,
+                janitor_fills: Vec::new(),
             })
     }
 
@@ -4325,9 +4326,84 @@ pub async fn calculation_health(
     for (tool, repair) in latest_repairs(db, site_ids).await? {
         entry(&mut by_tool, &tool).repair = Some(repair);
     }
+    for (tool, fills) in recent_janitor_fills(db, site_ids).await? {
+        entry(&mut by_tool, &tool).janitor_fills = fills;
+    }
     let mut out: Vec<CalculationHealth> = by_tool.into_values().collect();
     out.sort_by(|a, b| a.tool.cmp(&b.tool));
     Ok(out)
+}
+
+/// How far back the health row reads the janitor's fills.
+const JANITOR_FILL_WINDOW_HOURS: i64 = 24;
+
+/// Each calculation's janitor fills over the window, by name, from the janitor runs' reports.
+async fn recent_janitor_fills(
+    db: &DatabaseConnection,
+    site_ids: Option<&[Uuid]>,
+) -> AppResult<Vec<(String, Vec<JanitorFill>)>> {
+    use crate::routes::private::reprocessing_jobs::models::job;
+
+    let since = chrono::Utc::now() - chrono::Duration::hours(JANITOR_FILL_WINDOW_HOURS);
+    let details: Vec<serde_json::Value> = job::Entity::find()
+        .filter(job::Column::TriggerType.eq("janitor_service"))
+        .filter(job::Column::CreatedAt.gte(since))
+        .select_only()
+        .column(job::Column::Detail)
+        .into_tuple()
+        .all(db)
+        .await?;
+    let sums = sum_janitor_fills(&details, site_ids);
+    if sums.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names: HashMap<Uuid, String> = script::Entity::find()
+        .filter(script::Column::Id.is_in(sums.keys().copied()))
+        .select_only()
+        .column(script::Column::Id)
+        .column(script::Column::Name)
+        .into_tuple()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(sums
+        .into_iter()
+        .filter_map(|(tool, sites)| {
+            let fills = sites
+                .into_iter()
+                .map(|(site_id, values)| JanitorFill { site_id, values })
+                .collect();
+            names.get(&tool).map(|name| (name.clone(), fills))
+        })
+        .collect())
+}
+
+/// The janitor reports' `filled_by_calculation` summed per calculation and site, confined to
+/// `site_ids` when given.
+pub(super) fn sum_janitor_fills(
+    details: &[serde_json::Value],
+    site_ids: Option<&[Uuid]>,
+) -> std::collections::BTreeMap<Uuid, std::collections::BTreeMap<Uuid, i64>> {
+    let mut sums: std::collections::BTreeMap<Uuid, std::collections::BTreeMap<Uuid, i64>> =
+        std::collections::BTreeMap::new();
+    for detail in details {
+        let Some(by_tool) = detail["scope"]["filled_by_calculation"].as_object() else {
+            continue;
+        };
+        for (tool, sites) in by_tool {
+            let Ok(tool) = tool.parse::<Uuid>() else { continue };
+            for (site, fill) in sites.as_object().into_iter().flatten() {
+                let Ok(site) = site.parse::<Uuid>() else { continue };
+                if site_ids.is_some_and(|ids| !ids.contains(&site)) {
+                    continue;
+                }
+                *sums.entry(tool).or_default().entry(site).or_default() +=
+                    fill["values"].as_i64().unwrap_or(0);
+            }
+        }
+    }
+    sums
 }
 
 /// Each calculation's latest `event_recompute` run that still needs watching, keyed by the
@@ -4949,7 +5025,7 @@ pub struct MigrationJob {
 /// What an activation enqueues to repair the values the version it replaced produced (Q170): one
 /// job per arm the calculation computes on.
 ///
-/// Empty on the leaving arm, and on a first activation, which supersedes nothing.
+/// Empty on a first activation, which supersedes nothing.
 ///
 /// The visit arm is scoped to the superseded version: the visits it produced values at are a
 /// finite set its provenance names, and it stops growing the moment the activation commits. The
@@ -4957,15 +5033,7 @@ pub struct MigrationJob {
 /// mints no run: its values are found through the slots the calculation outputs. A pass that moves
 /// nothing records nothing, so the wider scope costs a pass rather than a ledger row.
 #[must_use]
-pub fn migration_jobs(
-    migrate_stored: bool,
-    name: &str,
-    script_id: Uuid,
-    superseded: Option<Uuid>,
-) -> Vec<MigrationJob> {
-    if !migrate_stored {
-        return Vec::new();
-    }
+pub fn migration_jobs(name: &str, script_id: Uuid, superseded: Option<Uuid>) -> Vec<MigrationJob> {
     let Some(superseded) = superseded else {
         return Vec::new();
     };
@@ -5049,17 +5117,13 @@ pub async fn calculations_reading_constant<C: ConnectionTrait>(
 
 /// Enqueue what [`migration_jobs`] decided, if anything. Given the transaction that activates the
 /// version, the jobs commit with it or not at all.
-///
-/// # Errors
-/// A database error on any enqueue.
-pub async fn recompute_after_activation<C: ConnectionTrait>(
+async fn recompute_after_activation<C: ConnectionTrait>(
     db: &C,
-    migrate_stored: bool,
     name: &str,
     script_id: Uuid,
     superseded: Option<Uuid>,
 ) -> Result<(), sea_orm::DbErr> {
-    for job in migration_jobs(migrate_stored, name, script_id, superseded) {
+    for job in migration_jobs(name, script_id, superseded) {
         crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             job.kind,
@@ -5073,6 +5137,8 @@ pub async fn recompute_after_activation<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Make `to` the version a calculation runs, recording the flip, and queue the recompute of every
+/// value the version it replaces produced (Q256): a save, a CRUD mint and a rollback alike.
 pub(super) async fn activate<C: ConnectionTrait>(
     db: &C,
     script_id: Uuid,
@@ -5096,9 +5162,12 @@ pub(super) async fn activate<C: ConnectionTrait>(
         .filter(script::Column::Id.eq(script_id))
         .exec(db)
         .await?;
-    if let Ok(Some(calculation)) = load_calculation(db, script_id).await {
-        audit_after_activation(db, &calculation.name).await;
-    }
+    let calculation = load_calculation(db, script_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Tool script {script_id} not found")))?;
+    let superseded = from.filter(|from| *from != to);
+    recompute_after_activation(db, &calculation.name, script_id, superseded).await?;
+    audit_after_activation(db, &calculation.name).await;
     Ok(())
 }
 

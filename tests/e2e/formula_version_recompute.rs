@@ -1,12 +1,10 @@
-//! Scenario: an author corrects a formula calculation twice, once on each save arm, and then
-//! corrects a constant the formula reads.
+//! Scenario: an author corrects a formula calculation twice, saves the earlier formula back, and
+//! then corrects a constant the formula reads.
 //!
-//! Expected behaviour (Q170, Q186): a save mints one version whatever it touched. On the leaving
-//! arm the values the superseded version produced keep that version and their number, and only
-//! measurements taken afterwards run against the new one. On the correcting arm every visit the
-//! superseded version produced is recomputed onto the new one, and the visits an earlier version
-//! produced are left where they are. A constant carries no versions, so its edit is always the
-//! correcting arm: the closure says which calculations read it before the write, and every reading
+//! Expected behaviour (Q186, Q256): a save mints one version whatever it touched, and every visit
+//! the superseded version produced is recomputed onto the new one. Saving an earlier formula back
+//! re-activates the version that holds it, and that rollback recomputes too. A constant carries no
+//! versions: the closure says which calculations read it before the write, and every reading
 //! naming it is recomputed with a ledger row naming the value it replaced.
 //!
 //! The ledger row is a `chain` decision, not a `formula_transition`: the chain executor is what
@@ -16,7 +14,7 @@
 //! The calculation is formula-engined, so the arithmetic runs in-process and the story needs no
 //! R runner.
 //!
-//! Run: cargo test --test e2e formula_save_arms -- --test-threads=1
+//! Run: cargo test --test e2e formula_version_recompute -- --test-threads=1
 
 use sea_orm::ConnectionTrait;
 use serde_json::json;
@@ -31,7 +29,7 @@ const VISITS: [&str; 3] = [
     "2025-06-22T09:00:00Z",
     "2025-06-29T09:00:00Z",
 ];
-/// The visit taken after the leaving arm, so the second version is the only one that produced it.
+/// The visit taken after the second save, so the second version is the only one that produced it.
 const LATER: &str = "2025-07-06T09:00:00Z";
 
 /// The served output value at a visit, and the version the reading names.
@@ -113,9 +111,9 @@ async fn ledger_at(
 
 #[tokio::test]
 #[serial]
-async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move() {
+async fn every_version_change_moves_what_the_replaced_version_stored() {
     if !crate::common::profile::Service::Keycloak
-        .require("a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move")
+        .require("every_version_change_moves_what_the_replaced_version_stored")
         .await
     {
         return;
@@ -170,7 +168,7 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
     let script_id = e2e::id_of(&created);
 
     // The whole set in one request, which is what a save is: one version comes out of it (Q186).
-    let save = |formula: &'static str, migrate: bool, formula_id: Option<String>| {
+    let save = |formula: &'static str, formula_id: Option<String>| {
         let app = app.clone();
         let admin = admin.clone();
         let script_id = script_id.clone();
@@ -188,7 +186,7 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
             let (status, saved) = crate::common::post_json_parse_with_token(
                 &app,
                 &format!("/api/tool_scripts/{script_id}/formulas"),
-                &json!({ "formulas": [entry], "migrate_stored": migrate }),
+                &json!({ "formulas": [entry] }),
                 &admin,
             )
             .await;
@@ -197,7 +195,7 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
         }
     };
 
-    let saved = save("FverIn * 2 * fver_factor", false, None).await;
+    let saved = save("FverIn * 2 * fver_factor", None).await;
     assert_eq!(
         saved["created"], 1,
         "the first save writes the formula: {saved}"
@@ -267,23 +265,22 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
         );
     }
 
-    // --- The leaving arm ---
-    // A coefficient correction saved as a new version. The three stored values were right under
-    // the version that made them, so they stay on it.
-    let saved = save("FverIn * 3 * fver_factor", false, Some(formula_id.clone())).await;
+    // --- A correction ---
+    // A coefficient correction saved as a new version moves the three stored values onto it.
+    let saved = save("FverIn * 3 * fver_factor", Some(formula_id.clone())).await;
     assert_eq!(saved["updated"], 1, "the formula it named: {saved}");
     assert_eq!(saved["version_no"], 2, "one save, one version: {saved}");
     assert_eq!(
-        saved["migrated"], false,
-        "the leaving arm migrates nothing: {saved}"
+        saved["migrated"], true,
+        "the save enqueues the migration: {saved}"
     );
     let second_version = saved["version_id"].as_str().expect("a version").to_string();
-    e2e::drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 120).await;
     for at in VISITS {
         assert_eq!(
             output_at(&db, &site_id, &output, at).await,
-            (Some(20.0), Some(first_version.clone())),
-            "the leaving arm leaves {at} on the version that produced it"
+            (Some(30.0), Some(second_version.clone())),
+            "10 * 3 * 1, recomputed onto the second version, at {at}"
         );
     }
 
@@ -296,29 +293,19 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
         "10 * 3 * 1 under the second version"
     );
 
-    // --- The correcting arm ---
-    // The reach is every visit the superseded version produced, and that is the second version:
-    // the three visits the first one produced are not in its scope and stay where they are.
-    let saved = save("FverIn * 4 * fver_factor", true, Some(formula_id.clone())).await;
+    // --- A second correction ---
+    // The reach is every visit the superseded version produced, which is now all four.
+    let saved = save("FverIn * 4 * fver_factor", Some(formula_id.clone())).await;
     assert_eq!(saved["version_no"], 3, "one save, one version: {saved}");
-    assert_eq!(
-        saved["migrated"], true,
-        "the correcting arm enqueues the migration: {saved}"
-    );
+    assert_eq!(saved["migrated"], true, "{saved}");
     let third_version = version_id(&db, &script_id, 3).await;
     assert_eq!(saved["version_id"], json!(third_version));
     e2e::drain_jobs(&db, 120).await;
-
-    assert_eq!(
-        output_at(&db, &site_id, &output, LATER).await,
-        (Some(40.0), Some(third_version.clone())),
-        "10 * 4 * 1, recomputed onto the version that replaced the one that made it"
-    );
-    for at in VISITS {
+    for at in VISITS.iter().chain([&LATER]) {
         assert_eq!(
             output_at(&db, &site_id, &output, at).await,
-            (Some(20.0), Some(first_version.clone())),
-            "a visit an earlier version produced is outside the migration's scope, at {at}"
+            (Some(40.0), Some(third_version.clone())),
+            "10 * 4 * 1, recomputed onto the third version, at {at}"
         );
     }
 
@@ -338,6 +325,20 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
         "the value the new version replaced: {moved:?}"
     );
     assert!(reran, "and the run behind it moved: {moved:?}");
+
+    // --- The rollback ---
+    // The second formula saved back is the second version again, and the values move back to it.
+    let saved = save("FverIn * 3 * fver_factor", Some(formula_id.clone())).await;
+    assert_eq!(saved["version_no"], 2, "the version holding it: {saved}");
+    assert_eq!(saved["migrated"], true, "a rollback recomputes too: {saved}");
+    e2e::drain_jobs(&db, 120).await;
+    for at in VISITS.iter().chain([&LATER]) {
+        assert_eq!(
+            output_at(&db, &site_id, &output, at).await,
+            (Some(30.0), Some(second_version.clone())),
+            "10 * 3 * 1, back on the second version, at {at}"
+        );
+    }
 
     // --- The constant ---
     // Asked before the write: which calculations read it, so an author editing it knows who it
@@ -365,8 +366,7 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
     );
     assert_eq!(closure["stored"]["visits"], 4, "{closure}");
 
-    // A constant carries no versions, so the edit is the correcting arm and reaches every reading
-    // naming it, whichever version produced it.
+    // A constant carries no versions, so the edit reaches every reading naming it.
     let (status, patched) = crate::common::put_json_with_token(
         &app,
         &format!("/api/constants/{constant_id}"),
@@ -380,14 +380,14 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
     for at in VISITS {
         assert_eq!(
             output_at(&db, &site_id, &output, at).await,
-            (Some(80.0), Some(third_version.clone())),
-            "10 * 4 * 2, recomputed under the active version, at {at}"
+            (Some(60.0), Some(second_version.clone())),
+            "10 * 3 * 2, recomputed under the active version, at {at}"
         );
     }
     assert_eq!(
         output_at(&db, &site_id, &output, LATER).await,
-        (Some(80.0), Some(third_version.clone())),
-        "10 * 4 * 2 at the later visit too"
+        (Some(60.0), Some(second_version.clone())),
+        "10 * 3 * 2 at the later visit too"
     );
     let moved = ledger_at(&db, &site_id, &output, VISITS[0]).await;
     let (kind, was, reran) = moved
@@ -397,7 +397,7 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
     assert_eq!(kind, "chain", "{moved:?}");
     assert_eq!(
         was,
-        Some(20.0),
+        Some(30.0),
         "the value the constant edit replaced: {moved:?}"
     );
     assert!(reran, "and the run behind it moved: {moved:?}");

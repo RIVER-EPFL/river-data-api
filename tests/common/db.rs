@@ -117,13 +117,17 @@ fn retry_delay(attempt: u32) -> Duration {
     LOCK_SESSION_RETRY_DELAY * 2u32.pow(attempt.saturating_sub(1))
 }
 
-/// Whether a failed connect is worth trying again: a failure at the transport, not an answer from
-/// the server. A reset on the first connect discards the whole binary's work, and the next connect
-/// a moment later succeeds.
-fn transient(err: &DbErr) -> bool {
+/// Whether a failed connect or statement is worth trying again: a failure at the transport or the
+/// pool, not an answer from the server. A reset on the first connect or the migration discards the
+/// whole binary's work, and the next attempt a moment later succeeds.
+pub(crate) fn transient(err: &DbErr) -> bool {
     use std::ops::Deref;
-    let DbErr::Conn(RuntimeErr::SqlxError(e)) = err else {
-        return false;
+    let e = match err {
+        DbErr::ConnectionAcquire(_) => return true,
+        DbErr::Conn(RuntimeErr::SqlxError(e))
+        | DbErr::Exec(RuntimeErr::SqlxError(e))
+        | DbErr::Query(RuntimeErr::SqlxError(e)) => e,
+        _ => return false,
     };
     matches!(
         e.deref(),
@@ -142,6 +146,22 @@ async fn connect_retrying(opts: ConnectOptions, what: &str) -> DatabaseConnectio
                 attempt += 1;
             }
             Err(e) => panic!("Failed to connect to {what} in {attempt} attempts: {e} ({e:?})"),
+        }
+    }
+}
+
+/// Run the migrations, trying again on a failure at the transport. Postgres rolls back the
+/// migration that was cut off, so the next attempt starts from the last one applied.
+async fn migrate_retrying(db: &DatabaseConnection) {
+    let mut attempt = 1;
+    loop {
+        match migration::Migrator::up(db, None).await {
+            Ok(()) => return,
+            Err(e) if transient(&e) && attempt < LOCK_SESSION_ATTEMPTS => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                attempt += 1;
+            }
+            Err(e) => panic!("Failed to run migrations in {attempt} attempts: {e} ({e:?})"),
         }
     }
 }
@@ -257,9 +277,7 @@ pub async fn setup_test_db() -> DatabaseConnection {
 
     require_connection_headroom(&db, &url_for_message).await;
 
-    migration::Migrator::up(&db, None)
-        .await
-        .expect("Failed to run migrations");
+    migrate_retrying(&db).await;
 
     stop_background_policies(&db).await;
 

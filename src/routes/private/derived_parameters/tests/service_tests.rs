@@ -1,4 +1,4 @@
-use super::{DerivedGraph, validate_dependency_chain};
+use super::{DerivedGraph, StepRef, shared_cycle, unread_steps, validate_dependency_chain};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -362,4 +362,84 @@ mod formula_syntax {
             );
         }
     }
+}
+
+fn step(code: &str, owner: Option<Uuid>) -> StepRef {
+    StepRef {
+        code: code.to_string(),
+        owner,
+    }
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|n| (*n).to_string()).collect()
+}
+
+#[test]
+fn test_a_shared_step_reads_every_other_shared_step() {
+    let steps = [step("water_k", None), step("kh", None)];
+    let unread = unread_steps(
+        &step("kh", None),
+        names(&["water_k", "Dissolved_O2"]),
+        &steps,
+        &[],
+    );
+    assert_eq!(unread, Ok(names(&["Dissolved_O2"])));
+}
+
+#[test]
+fn test_a_shared_step_naming_an_owned_step_is_refused_with_it() {
+    let pco2real = Uuid::new_v4();
+    let steps = [step("water_k", Some(pco2real))];
+    let refused = unread_steps(&step("kh", None), names(&["water_k"]), &steps, &[]);
+    assert_eq!(refused, Err(step("water_k", Some(pco2real))));
+}
+
+#[test]
+fn test_an_owned_formula_reads_its_own_and_declared_steps() {
+    let (own, other) = (Uuid::new_v4(), Uuid::new_v4());
+    let steps = [
+        step("mine", Some(own)),
+        step("declared", None),
+        step("undeclared", None),
+        step("theirs", Some(other)),
+    ];
+    let unread = unread_steps(
+        &step("out", Some(own)),
+        names(&["mine", "declared", "undeclared", "theirs"]),
+        &steps,
+        &names(&["declared"]),
+    );
+    // A step the calculation neither owns nor declares resolves as any other name.
+    assert_eq!(unread, Ok(names(&["undeclared", "theirs"])));
+}
+
+#[test]
+fn test_a_formula_is_no_step_of_its_own() {
+    let steps = [step("kh", None)];
+    let unread = unread_steps(&step("kh", None), names(&["kh"]), &steps, &[]);
+    assert_eq!(unread, Ok(names(&["kh"])));
+}
+
+#[test]
+fn test_a_chain_of_shared_steps_orders() {
+    let steps = [
+        ("water_k".to_string(), "Dissolved_O2 + 273.15".to_string()),
+        ("kh".to_string(), "0.034 / water_k".to_string()),
+    ];
+    assert_eq!(shared_cycle(&steps), Ok(()));
+}
+
+#[test]
+fn test_a_shared_step_cycle_names_its_members() {
+    let steps = [
+        ("loop_a".to_string(), "loop_b + 1".to_string()),
+        ("loop_b".to_string(), "loop_a * 2".to_string()),
+        ("apart".to_string(), "Dissolved_O2".to_string()),
+    ];
+    let err = shared_cycle(&steps).unwrap_err();
+    assert!(
+        err.contains("loop_a") && err.contains("loop_b") && !err.contains("apart"),
+        "{err}"
+    );
 }
