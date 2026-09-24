@@ -1170,7 +1170,8 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
 
     assert_eq!(job["detail"]["counts"]["findings_raised"], 2, "{job}");
 
-    // The visit says so too: two of its three outputs are absent because a step did not run.
+    // A recompute runs the same steps to the same end, so the visit owes none: the skips stand
+    // as findings on the review queue instead.
     let (status, detail) = crate::common::get_json_with_token(
         &app,
         &format!("/api/collection_events/{event_id}/detail"),
@@ -1178,7 +1179,22 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     )
     .await;
     assert_eq!(status, 200, "{detail}");
-    assert_eq!(detail["recompute"], "stale", "{detail}");
+    assert_eq!(detail["recompute"], "current", "{detail}");
+    // Each skip says what it lacks: B's script raised, and C waits on B.
+    let finding_of = |code: &str| {
+        detail["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["parameter_code"] == code)
+            .map(|c| c["finding"].clone())
+            .unwrap_or_else(|| panic!("{code} carries a finding: {detail}"))
+    };
+    let b_finding = finding_of("ChainPB");
+    assert_eq!(b_finding["cause"], "error", "{b_finding}");
+    let c_finding = finding_of("ChainPC");
+    assert_eq!(c_finding["cause"], "upstream", "{c_finding}");
+    assert_eq!(c_finding["waits_on"], "chain_b", "{c_finding}");
 
     // The review queue carries each absent output with the reason its step did not run, and it
     // is still there when the job row that counted them is gone.

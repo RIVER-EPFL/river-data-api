@@ -1,64 +1,54 @@
-use crate::routes::private::tools::flows::applies_at_site;
-use std::collections::HashSet;
+use crate::routes::private::tools::flows::{
+    applies_at_site, failed_step_awaited, reads_a_measurement,
+};
+use crate::routes::private::tools::models::{Manifest, parse_manifest};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-/// A site declares which calculations apply to it by holding slots for what they read (Q193,
-/// narrowing Q98): the output slot follows from the inputs and is minted by the run that
-/// publishes it. Q98's test stands beside it, for a calculation that reads no parameter.
+/// A calculation applies at a site only where someone added it there, which declares its outputs
+/// (Q325, Q274). Declaring every input is not an assignment.
 #[test]
-fn a_tool_applies_where_the_site_declares_everything_it_reads() {
+fn a_tool_does_not_apply_where_the_site_declares_only_what_it_reads() {
     let doc = Uuid::new_v4();
     let a254 = Uuid::new_v4();
     let suva = Uuid::new_v4();
     let outputs = vec![("suva".to_string(), suva)];
-    let inputs = vec![doc, a254];
 
-    let both: HashSet<Uuid> = [doc, a254].into_iter().collect();
+    let inputs: HashSet<Uuid> = [doc, a254].into_iter().collect();
     assert!(
-        applies_at_site(&inputs, &outputs, &both),
-        "the site holds the inputs, so it gets the column the run publishes"
+        !applies_at_site(&outputs, &inputs),
+        "holding every input is not the calculation being added at the site"
     );
 
-    let half: HashSet<Uuid> = [doc].into_iter().collect();
-    assert!(
-        !applies_at_site(&inputs, &outputs, &half),
-        "a read the site does not declare is a calculation it has not asked for"
-    );
+    let applied: HashSet<Uuid> = [doc, a254, suva].into_iter().collect();
+    assert!(applies_at_site(&outputs, &applied));
+}
+
+/// A slot the chain minted with `needs_review` is left out of the applied set before it is asked
+/// (Q317), so a site holding only that slot holds nothing the calculation writes.
+#[test]
+fn a_tool_does_not_apply_where_its_only_output_slot_waits_on_review() {
+    let doc = Uuid::new_v4();
+    let suva = Uuid::new_v4();
+    let outputs = vec![("suva".to_string(), suva)];
+    let applied: HashSet<Uuid> = [doc].into_iter().collect();
+    assert!(!applies_at_site(&outputs, &applied));
 }
 
 #[test]
-fn a_tool_applies_where_the_site_already_holds_one_of_its_outputs() {
+fn a_tool_applies_where_the_site_holds_one_of_its_outputs() {
     let doc = Uuid::new_v4();
     let dom = Uuid::new_v4();
     let outputs = vec![("doc_avg".to_string(), doc), ("doc_sd".to_string(), dom)];
-    let declared: HashSet<Uuid> = [doc].into_iter().collect();
-
-    assert!(
-        applies_at_site(&[Uuid::new_v4()], &outputs, &declared),
-        "a declared output keeps the calculation the site already asked for"
-    );
-}
-
-/// A calculation reading only site properties and constants declares no parameter, so the inputs
-/// say nothing about where it belongs and its outputs still do.
-#[test]
-fn a_tool_reading_no_parameter_is_placed_by_its_outputs_alone() {
-    let out = Uuid::new_v4();
-    let outputs = vec![("pressure".to_string(), out)];
-    assert!(applies_at_site(&[], &outputs, &[out].into_iter().collect()));
-    assert!(!applies_at_site(&[], &outputs, &HashSet::new()));
+    let applied: HashSet<Uuid> = [doc].into_iter().collect();
+    assert!(applies_at_site(&outputs, &applied));
 }
 
 #[test]
 fn a_tool_the_site_declared_nothing_of_does_not_apply() {
     let outputs = vec![("doc_avg".to_string(), Uuid::new_v4())];
+    assert!(!applies_at_site(&outputs, &HashSet::new()));
     assert!(!applies_at_site(
-        &[Uuid::new_v4()],
-        &outputs,
-        &HashSet::new()
-    ));
-    assert!(!applies_at_site(
-        &[Uuid::new_v4()],
         &outputs,
         &[Uuid::new_v4()].into_iter().collect()
     ));
@@ -66,11 +56,7 @@ fn a_tool_the_site_declared_nothing_of_does_not_apply() {
 
 #[test]
 fn a_tool_that_saves_nothing_reaches_no_site() {
-    assert!(!applies_at_site(
-        &[],
-        &[],
-        &[Uuid::new_v4()].into_iter().collect()
-    ));
+    assert!(!applies_at_site(&[], &[Uuid::new_v4()].into_iter().collect()));
 }
 
 mod reported_skips {
@@ -217,10 +203,10 @@ mod the_outputs_an_audit_compares {
     }
 }
 
-/// Scenario: three sites, one declaring every parameter a calculation reads, one missing an
-/// input, and one missing an input but already holding an output.
+/// Scenario: three sites, one holding every input a calculation reads, one holding one of its
+/// outputs, and one holding the inputs and an output.
 ///
-/// Expected behaviour: the calculation is active at the first and the third, the same verdict
+/// Expected behaviour: the calculation is active at the second and the third, the same verdict
 /// `applies_at_site` gives the chain at each.
 mod the_sites_a_calculation_is_active_at {
     use crate::routes::private::tools::flows::{applies_at_site, sites_applied};
@@ -230,41 +216,36 @@ mod the_sites_a_calculation_is_active_at {
     #[test]
     fn a_site_is_counted_where_the_chain_would_fire() {
         let (doc, a254, suva) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
-        let (every_input, missing_one, holding_output) = (
+        let (every_input, holding_output, both) = (
             Uuid::from_u128(10),
             Uuid::from_u128(11),
             Uuid::from_u128(12),
         );
-        let inputs = vec![doc, a254];
         let outputs = vec![("suva".to_string(), suva)];
-        let declared: HashMap<Uuid, HashSet<Uuid>> = [
+        let applied: HashMap<Uuid, HashSet<Uuid>> = [
             (every_input, [doc, a254].into_iter().collect()),
-            (missing_one, [doc].into_iter().collect()),
-            (holding_output, [doc, suva].into_iter().collect()),
+            (holding_output, [suva].into_iter().collect()),
+            (both, [doc, a254, suva].into_iter().collect()),
         ]
         .into_iter()
         .collect();
 
-        let mut active = sites_applied(&inputs, &outputs, &declared);
+        let mut active = sites_applied(&outputs, &applied);
         active.sort();
-        assert_eq!(active, vec![every_input, holding_output]);
-        for (site, parameters) in &declared {
-            assert_eq!(
-                active.contains(site),
-                applies_at_site(&inputs, &outputs, parameters)
-            );
+        assert_eq!(active, vec![holding_output, both]);
+        for (site, parameters) in &applied {
+            assert_eq!(active.contains(site), applies_at_site(&outputs, parameters));
         }
     }
 
-    /// The chain skips a calculation that publishes nothing before it asks where it applies.
     #[test]
     fn a_calculation_that_saves_nothing_is_active_nowhere() {
         let doc = Uuid::from_u128(1);
-        let declared: HashMap<Uuid, HashSet<Uuid>> =
+        let applied: HashMap<Uuid, HashSet<Uuid>> =
             [(Uuid::from_u128(10), [doc].into_iter().collect())]
                 .into_iter()
                 .collect();
-        assert!(sites_applied(&[doc], &[], &declared).is_empty());
+        assert!(sites_applied(&[], &applied).is_empty());
     }
 }
 
@@ -291,4 +272,79 @@ mod a_run_that_saved_nothing {
     fn raises_nothing_when_every_output_was_skipped_as_another_arm_s() {
         assert!(unexplained_outputs(&[], &[]).is_empty());
     }
+}
+
+/// pCO2's shape: two measured scalars and a replicate family, none of them required.
+fn pco2() -> Manifest {
+    parse_manifest(&serde_json::json!({
+        "label": "pco2",
+        "params": [
+            { "name": "co2", "label": "CO2", "kind": "replicates", "parameter_code": "lab_co2_co2ppm" },
+            { "name": "temp", "label": "Temp", "kind": "number", "required": false },
+            { "name": "bp", "label": "BP", "kind": "number", "required": false },
+            { "name": "kh", "label": "kH", "kind": "number", "required": false, "default": 0.03 }
+        ],
+        "outputs": [],
+        "event_inputs": [
+            { "param": "temp", "parameter_code": "lab_co2_lab_temp" },
+            { "param": "bp", "parameter_code": "Field_BP" }
+        ]
+    }))
+    .expect("manifest")
+}
+
+fn inputs(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+#[test]
+fn test_reads_a_measurement_none_present() {
+    // A default is no measurement, and an all-gap family is none either.
+    let at_visit = inputs(serde_json::json!({ "kh": 0.03, "co2": [null, null] }));
+    assert!(!reads_a_measurement(&pco2(), &at_visit));
+}
+
+#[test]
+fn test_reads_a_measurement_one_scalar_present() {
+    let at_visit = inputs(serde_json::json!({ "kh": 0.03, "bp": 950.0 }));
+    assert!(reads_a_measurement(&pco2(), &at_visit));
+}
+
+#[test]
+fn test_reads_a_measurement_one_replicate_present() {
+    let at_visit = inputs(serde_json::json!({ "co2": [null, 412.0] }));
+    assert!(reads_a_measurement(&pco2(), &at_visit));
+}
+
+#[test]
+fn test_reads_a_measurement_no_measured_input_declared() {
+    // A calculation over site properties and constants has nothing to be missing at a visit.
+    let manifest = parse_manifest(&serde_json::json!({
+        "label": "pressure",
+        "params": [{ "name": "altitude", "label": "Altitude", "kind": "number" }],
+        "outputs": []
+    }))
+    .expect("manifest");
+    assert!(reads_a_measurement(&manifest, &serde_json::Map::new()));
+}
+
+#[test]
+fn test_failed_step_awaited_names_the_step_that_owed_the_input() {
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let failed = HashMap::from([(b, "chain_b".to_string())]);
+    assert_eq!(failed_step_awaited(&[a, b], &failed), Some("chain_b"));
+}
+
+#[test]
+fn test_failed_step_awaited_nothing_failed() {
+    assert_eq!(
+        failed_step_awaited(&[Uuid::new_v4()], &HashMap::new()),
+        None
+    );
+}
+
+#[test]
+fn test_failed_step_awaited_failure_elsewhere() {
+    let failed = HashMap::from([(Uuid::new_v4(), "chain_b".to_string())]);
+    assert_eq!(failed_step_awaited(&[Uuid::new_v4()], &failed), None);
 }

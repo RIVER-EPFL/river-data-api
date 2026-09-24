@@ -647,6 +647,7 @@ struct FindingRow {
     parameter_id: Uuid,
     tool: Option<String>,
     status: String,
+    expected: Option<serde_json::Value>,
 }
 
 /// The open findings at one visit, oldest first. A hold is keyed on the slot (an event-audit
@@ -663,6 +664,7 @@ async fn open_findings_at(
         .expr_as(holds::slot_parameter(), Alias::new("parameter_id"))
         .column((holds::h(), holds::Column::Tool))
         .column((holds::h(), holds::Column::Status))
+        .column((holds::h(), holds::Column::Expected))
         .and_where(holds::slot_site().eq(site_id))
         .and_where(Expr::col((holds::h(), holds::Column::GroupTime)).eq(collected_at))
         .and_where(Expr::col((holds::h(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
@@ -830,14 +832,9 @@ pub async fn get_event_detail(
     let mut finding_by_param: std::collections::HashMap<Uuid, CellFinding> =
         std::collections::HashMap::new();
     for f in findings {
-        finding_by_param
-            .entry(f.parameter_id)
-            .or_insert(CellFinding {
-                id: f.id,
-                kind: f.kind,
-                tool: f.tool,
-                status: f.status,
-            });
+        finding_by_param.entry(f.parameter_id).or_insert_with(|| {
+            service::cell_finding(f.id, f.kind, f.tool, f.status, f.expected.as_ref())
+        });
     }
 
     // Fold reading rows into per-(parameter, stream) cells.

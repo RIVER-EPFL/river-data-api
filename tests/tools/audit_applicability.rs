@@ -1,7 +1,6 @@
-//! The audit reports on the set the repair can repair: a calculation whose inputs a site declares
-//! applies there and its absent output is a finding, whether or not the site already holds the
-//! output slot (Q193, narrowing Q98); one whose inputs the site does not hold does not apply, so
-//! its absent output is not a finding.
+//! The audit reports on the set the repair can repair: a calculation added at a site, which holds
+//! its output slot, applies there and its absent output is a finding; one the site holds only the
+//! inputs of was not added there (Q325), so its absent output is not a finding.
 //!
 //! No R runs here: the audit decides applicability before any runner is reached.
 //!
@@ -175,14 +174,13 @@ async fn setup() -> (DatabaseConnection, river_db::common::AppState, Uuid) {
 
 #[tokio::test]
 #[serial]
-async fn a_calculation_whose_inputs_the_site_holds_reports_its_absent_output() {
+async fn a_calculation_whose_inputs_the_site_holds_and_was_not_added_raises_no_finding() {
     let (db, state, event_id) = setup().await;
     audit(&state, event_id).await;
     assert_eq!(
         findings_on_output(&db).await,
-        1,
-        "the site declares what the calculation reads, so the recompute can repair this and the \
-         audit says so; the output slot is the run's to mint"
+        0,
+        "holding the inputs is not the calculation being added here"
     );
 }
 

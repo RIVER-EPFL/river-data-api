@@ -32,6 +32,7 @@ use crate::routes::private::standard_curves::models as standard_curves;
 use crate::routes::private::sync::hold_model as holds;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
+use crate::routes::private::tools::flows::skip_cause;
 
 pub(super) const MAX_PAGE_SIZE: u64 = 200;
 
@@ -730,6 +731,33 @@ pub fn parameter_roles(
     (read_by, written_by)
 }
 
+/// A finding as the visit detail serves it, a skip carrying its reason and what it lacks.
+#[must_use]
+pub fn cell_finding(
+    id: Uuid,
+    kind: String,
+    tool: Option<String>,
+    status: String,
+    expected: Option<&serde_json::Value>,
+) -> super::models::CellFinding {
+    let reason = (kind == HoldKind::SkippedOutput.as_str())
+        .then(|| expected?.get("reason")?.as_str().map(str::to_string))
+        .flatten();
+    let (cause, waits_on) = match reason.as_deref().map(skip_cause) {
+        Some((cause, waits_on)) => (Some(cause.as_str().to_string()), waits_on),
+        None => (None, None),
+    };
+    super::models::CellFinding {
+        id,
+        kind,
+        tool,
+        status,
+        reason,
+        cause,
+        waits_on,
+    }
+}
+
 /// The visit's recompute state from what its latest job and its open findings say: an active
 /// job is the state whatever the findings (it is being repaired), a failed job outranks a stale
 /// finding (the repair itself needs attention), a stale finding outranks nothing else.
@@ -799,8 +827,8 @@ fn newest_job_per_visit(rows: impl IntoIterator<Item = RecomputeJobRow>) -> Hash
 }
 
 /// The recompute state of each visit: `queued` | `running` | `failed` from its latest
-/// `event_recompute` job, else `stale` when an open stale-output or skipped-step finding names
-/// it, else `current`.
+/// `event_recompute` job, else `stale` when an open finding a recompute clears names it, else
+/// `current`.
 pub async fn status_for(
     db: &DatabaseConnection,
     event_ids: &[Uuid],
@@ -828,10 +856,10 @@ pub async fn status_for(
                         .equals((holds::h(), holds::Column::GroupTime)),
                 ),
         )
-        .and_where(Expr::col((holds::h(), holds::Column::Kind)).is_in([
-            HoldKind::StaleOutput.as_str(),
-            HoldKind::SkippedOutput.as_str(),
-        ]))
+        .and_where(
+            Expr::col((holds::h(), holds::Column::Kind))
+                .is_in(HoldKind::RECOMPUTE_CLEARS.map(|k| k.as_str())),
+        )
         .and_where(Expr::col((holds::h(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
         .and_where(Expr::col((holds::h(), holds::Column::StreamId)).is_null())
         .and_where(Expr::col((ce(), super::Column::Id)).is_in(event_ids.iter().copied()))

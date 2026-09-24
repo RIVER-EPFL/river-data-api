@@ -111,11 +111,29 @@ async fn install_formula_set(
         .try_get::<Uuid>("", "id")
         .expect("id")
         .to_string();
+    let codes: Vec<String> = formulas
+        .as_array()
+        .expect("a formula list")
+        .iter()
+        .map(|f| f["code"].as_str().expect("a code").to_string())
+        .collect();
     let (status, text) = crate::common::save_formula_set(app, token, &script_id, formulas).await;
     assert!(
         (200..300).contains(&status),
         "save the formula set ({status}): {text}"
     );
+    // Added at the site, on the visit arm: a calculation runs only where it was added (Q325).
+    for code in codes {
+        exec(
+            db,
+            "INSERT INTO site_parameters (site_id, parameter_id, name, sensor_type, is_active,
+                                          entry_mode, cadence)
+             SELECT $1::uuid, p.id, p.name, '', true, 'tool', 'low'
+               FROM parameters p WHERE lower(p.code) = lower($2)",
+            vec![SITE1_ID.into(), code.into()],
+        )
+        .await;
+    }
 }
 
 /// The catalog parameter a formula minted for its output code.

@@ -1,6 +1,7 @@
 //! Applying a calculation at a site from its own page: the site's slots are checked against what
-//! the calculation reads before anything is written, and the output slots it lacks are minted
-//! declared rather than flagged for review (M308).
+//! the calculation reads before anything is written, and the output slots it lacks are created
+//! declared rather than flagged for review (M308). Applying is the only thing that runs it there
+//! (Q325).
 //!
 //! Formula engine only, so no R runs here.
 //!
@@ -240,10 +241,58 @@ async fn applying_a_calculation_mints_its_output_slots_and_leaves_the_second_app
         "the calculation was applied here"
     );
     assert_eq!(
-        outcome.slots_minted, 0,
-        "the apply already declared the output, so the run mints nothing"
+        slot_count(&db, &output_id).await,
+        1,
+        "the apply already declared the output, so the run adds no slot"
     );
     assert!(outcome.readings_written >= 1, "the computed value landed");
+}
+
+/// Scenario: the site holds an output slot the chain minted needing review before Q325, and a
+/// manager applies the calculation there.
+///
+/// Expected behaviour: the apply confirms that slot rather than creating a second one, which is
+/// what makes the calculation run at the site (Q317).
+#[tokio::test]
+#[serial]
+async fn applying_a_calculation_confirms_an_output_slot_waiting_on_review() {
+    let f = crate::common::seeded_app().await;
+    let db = f.db.clone();
+    let script_id = seed_calculation(&db).await;
+    exec(
+        &db,
+        &format!(
+            "UPDATE site_parameters SET cadence = 'low' \
+              WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_TEMP_ID}'"
+        ),
+    )
+    .await;
+    let (status, text) = add_formula(&f, &script_id, "DO_Temperature * 2").await;
+    assert!((200..300).contains(&status), "({status}): {text}");
+    let output_id = parameter_id(&db, OUTPUT_CODE).await.expect("the output");
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
+                                          is_active, is_public, needs_review, entry_mode, cadence) \
+             VALUES (gen_random_uuid(), '{SITE1_ID}', '{output_id}', '{OUTPUT_CODE}', '', true, \
+                     false, true, 'tool', 'low')"
+        ),
+    )
+    .await;
+
+    let (status, applied) = apply(&f, &script_id, false).await;
+    assert_eq!(status, 200, "{applied}");
+    assert_eq!(codes(&applied["outputs_created"]), Vec::<String>::new());
+    assert_eq!(
+        codes(&applied["outputs_existing"]),
+        vec![OUTPUT_CODE.to_string()]
+    );
+    assert_eq!(slot_count(&db, &output_id).await, 1);
+    assert!(
+        !slot(&db, &output_id).await.expect("the slot").0,
+        "the apply confirmed the minted slot"
+    );
 }
 
 /// Scenario: the calculation reads a parameter the site does not measure.

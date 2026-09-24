@@ -224,7 +224,8 @@ async fn sites_of_closure_a(app: &axum::Router, token: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: a site in a second project declares the temperature `closure_a` reads.
+/// Scenario: `closure_a` is added at a site in a second project, which holds the oxygen slot it
+/// writes.
 ///
 /// Expected behaviour: both sites are named as where `closure_a` is active, and a token scoped to
 /// the first project is told only of its own.
@@ -240,7 +241,7 @@ async fn the_sites_a_calculation_is_active_at_are_named() {
             "INSERT INTO sites (id, name, project_id) VALUES ('{SITE_B_ID}', 'Closure site B', '{PROJECT_B_ID}')"
         ),
         format!(
-            "INSERT INTO site_parameters (site_id, parameter_id, name) VALUES ('{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'Temp B')"
+            "INSERT INTO site_parameters (site_id, parameter_id, name) VALUES ('{SITE_B_ID}', '{GLOBAL_PARAM_DO_ID}', 'DO B')"
         ),
     ] {
         crate::common::db::exec(&db, &sql).await;

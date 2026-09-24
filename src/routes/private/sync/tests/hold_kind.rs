@@ -34,6 +34,14 @@ fn test_the_event_audit_set_is_the_three_calculation_findings() {
 }
 
 #[test]
+fn test_a_recompute_clears_missing_and_stale_outputs_not_skips() {
+    assert_eq!(
+        HoldKind::sql_list(&HoldKind::RECOMPUTE_CLEARS),
+        "('missing_output', 'stale_output')"
+    );
+}
+
+#[test]
 fn test_a_single_kind_list_is_still_a_sql_list() {
     assert_eq!(
         HoldKind::sql_list(&[HoldKind::BrakeFired]),

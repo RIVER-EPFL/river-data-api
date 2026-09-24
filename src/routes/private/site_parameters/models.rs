@@ -37,9 +37,9 @@ pub struct Model {
     pub is_active: Option<bool>,
     #[crudcrate(filterable, on_create = false)]
     pub is_public: Option<bool>,
-    /// Carried by a slot the chain minted where the site declared the calculation's inputs and
-    /// not its output (Q193); cleared by a manager confirming the slot from the site's Parameters
-    /// tab.
+    /// Carried by a slot the chain minted before Q325 made adding a calculation the only thing that
+    /// runs it; cleared by a manager confirming the slot or applying the calculation at the site.
+    /// A slot carrying it does not make a calculation run there (Q317).
     #[crudcrate(filterable, sortable, on_create = false)]
     pub needs_review: bool,
     /// How this site fills the slot: 'manual' (a person types the value) or 'tool' (a

@@ -1034,3 +1034,69 @@ async fn bringing_in_a_step_shares_the_owned_steps_it_reads() {
     let after = computed_at(&db, &app, &token, &output_parameter_id, 4, 50.0).await;
     assert_eq!(after, Some(1010.0), "pco2real computes the same through its declarations");
 }
+
+/// Scenario: a calculation brings in a step no calculation owns, then stops reading it, each from
+/// the calculation page's own controls.
+///
+/// Expected behaviour: each declaration write re-pins the calculation, so the version it runs
+/// reads what its page shows: the step once brought in, and nothing of it once dropped.
+#[tokio::test]
+#[serial]
+async fn bringing_in_and_dropping_a_shared_step_each_mint_a_version() {
+    let (db, app, token) = setup().await;
+    let reader = calculation(&db, "declares_then_drops").await;
+    post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "declares_out", "name": "declares_out", "units": "uM",
+            "formula": "Dissolved_O2 * 2", "tool_script_id": reader, "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    let (status, step) = shared_step(&app, &token, "dropped_step", "Dissolved_O2 / 2").await;
+    assert!((200..300).contains(&status), "({status}): {step}");
+
+    let running = || {
+        let db = db.clone();
+        let reader = reader.clone();
+        async move {
+            crate::common::e2e::scalar(
+                &db,
+                &format!(
+                    "SELECT COALESCE(v.script, 'none') FROM tool_scripts s \
+                       LEFT JOIN tool_script_versions v ON v.id = s.active_version_id \
+                      WHERE s.id = '{reader}'"
+                ),
+            )
+            .await
+        }
+    };
+
+    let declaration = post(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": reader, "formula_id": id_of(&step) }),
+        &token,
+    )
+    .await;
+    let brought = running().await;
+    assert!(
+        brought.contains("dropped_step"),
+        "the version run once the step is brought in reads it: {brought}"
+    );
+
+    let (status, raw) = crate::common::delete_with_token(
+        &app,
+        &format!("/api/calculation_shared_steps/{}", id_of(&declaration)),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "({status}): {raw}");
+    let dropped = running().await;
+    assert!(
+        !dropped.contains("dropped_step"),
+        "the version run once the step is dropped no longer reads it: {dropped}"
+    );
+}

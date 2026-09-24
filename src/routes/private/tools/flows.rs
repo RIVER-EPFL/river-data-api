@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::models::{
     ActiveTool, AppliedSite, AuditCounts, CalculationSites, Engine, EventAudit, EventContext,
-    EventPreview, EventRecompute, MissingConstant, PreviewedValue, RecomputeOutcome,
+    EventPreview, EventRecompute, Manifest, MissingConstant, PreviewedValue, RecomputeOutcome,
     RecomputeScope, RunOutcome, RunTrace, ToolCalculation, ToolResult, parse_manifest, run,
 };
 use super::service::{
@@ -188,8 +188,7 @@ pub async fn load_event(db: &DatabaseConnection, id: Uuid) -> AppResult<EventCon
     })
 }
 
-/// The catalog parameters a site holds a slot for. The set a calculation's applicability is read
-/// against, and the only thing that declares it.
+/// The catalog parameters a site holds a slot for, confirmed or not.
 pub async fn declared_parameters(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -207,25 +206,37 @@ pub async fn declared_parameters(
         .collect())
 }
 
-/// [`declared_parameters`] for every site at once, or for the sites named.
-pub async fn declared_parameters_by_site(
+/// The catalog parameters each site holds a slot for that nobody still has to confirm, for every
+/// site at once or for the sites named. A slot the chain minted with `needs_review` is not the
+/// calculation being added there (Q317), so it is left out.
+pub async fn applied_parameters_by_site(
     db: &DatabaseConnection,
     site_ids: Option<&[Uuid]>,
 ) -> AppResult<HashMap<Uuid, HashSet<Uuid>>> {
     use crate::routes::private::site_parameters::models as site_parameters;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
     let mut query = site_parameters::Entity::find()
+        .filter(site_parameters::Column::NeedsReview.eq(false))
         .select_only()
         .column(site_parameters::Column::SiteId)
         .column(site_parameters::Column::ParameterId);
     if let Some(ids) = site_ids {
         query = query.filter(site_parameters::Column::SiteId.is_in(ids.iter().copied()));
     }
-    let mut declared: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+    let mut applied: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
     for (site_id, parameter_id) in query.into_tuple::<(Uuid, Uuid)>().all(db).await? {
-        declared.entry(site_id).or_default().insert(parameter_id);
+        applied.entry(site_id).or_default().insert(parameter_id);
     }
-    Ok(declared)
+    Ok(applied)
+}
+
+/// [`applied_parameters_by_site`] for one site: the set a calculation's applicability is read
+/// against.
+pub async fn applied_parameters(db: &DatabaseConnection, site_id: Uuid) -> AppResult<HashSet<Uuid>> {
+    Ok(applied_parameters_by_site(db, Some(&[site_id]))
+        .await?
+        .remove(&site_id)
+        .unwrap_or_default())
 }
 
 /// Every live calculation with the sites it is active at, named, read the way the chain reads
@@ -238,12 +249,12 @@ pub async fn calculation_sites(
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
     let tools = list_active_tools(db).await?;
     let catalog = load_parameter_catalog(db, tools.iter().map(|t| &t.manifest)).await?;
-    let declared = declared_parameters_by_site(db, site_ids).await?;
+    let applied = applied_parameters_by_site(db, site_ids).await?;
     let names: Vec<(Uuid, String)> = sites::Entity::find()
         .select_only()
         .column(sites::Column::Id)
         .column(sites::Column::Name)
-        .filter(sites::Column::Id.is_in(declared.keys().copied()))
+        .filter(sites::Column::Id.is_in(applied.keys().copied()))
         .order_by_asc(sites::Column::Name)
         .into_tuple()
         .all(db)
@@ -257,10 +268,9 @@ pub async fn calculation_sites(
                 .iter()
                 .filter_map(|o| catalog.resolve(o).map(|p| (o.key.clone(), p.id)))
                 .collect();
-            let active: HashSet<Uuid> =
-                sites_applied(&read_inputs(tool, &catalog), &saved_outputs, &declared)
-                    .into_iter()
-                    .collect();
+            let active: HashSet<Uuid> = sites_applied(&saved_outputs, &applied)
+                .into_iter()
+                .collect();
             CalculationSites {
                 calculation_id: tool.script_id,
                 calculation: tool.name.clone(),
@@ -277,37 +287,65 @@ pub async fn calculation_sites(
         .collect())
 }
 
-/// Whether a calculation applies at a site (Q193): the site declares every parameter the
-/// calculation reads, so declaring the inputs declares the outputs and the run mints the output
-/// slot it needs. Q98's test stands beside it rather than being dropped: a site that already
-/// holds one of the outputs keeps the calculation, which is what a calculation reading nothing
-/// but site properties and constants has.
+/// Whether a calculation applies at a site: the site holds a confirmed slot for one of its outputs,
+/// which is what adding it there writes (Q325, Q274). Holding every input is not an assignment.
 #[must_use]
-pub fn applies_at_site(
-    read_inputs: &[Uuid],
-    saved_outputs: &[(String, Uuid)],
-    declared: &HashSet<Uuid>,
-) -> bool {
-    if !read_inputs.is_empty() && read_inputs.iter().all(|id| declared.contains(id)) {
-        return true;
-    }
-    saved_outputs.iter().any(|(_, id)| declared.contains(id))
+pub fn applies_at_site(saved_outputs: &[(String, Uuid)], applied: &HashSet<Uuid>) -> bool {
+    saved_outputs.iter().any(|(_, id)| applied.contains(id))
 }
 
-/// The sites a calculation is active at: [`applies_at_site`] over each site's declaration. A
-/// calculation that publishes nothing is active nowhere, as the chain skips it before asking.
+/// Whether a run at a visit reads anything measured there: one of the manifest's event inputs or
+/// replicate families holds a value in the inputs it resolved. A visit holding none is not the
+/// calculation's to compute, so the chain files no finding there. A calculation reading no
+/// measurement at all is placed by [`applies_at_site`] alone.
+#[must_use]
+pub fn reads_a_measurement(
+    manifest: &Manifest,
+    inputs: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let families = manifest
+        .params
+        .iter()
+        .filter(|p| p.kind == "replicates" && p.parameter_code.is_some())
+        .map(|p| p.name.as_str());
+    let mut measured = manifest
+        .event_inputs
+        .iter()
+        .map(|e| e.param.as_str())
+        .chain(families)
+        .peekable();
+    if measured.peek().is_none() {
+        return true;
+    }
+    measured.any(|name| match inputs.get(name) {
+        Some(serde_json::Value::Array(values)) => values.iter().any(|v| !v.is_null()),
+        Some(value) => !value.is_null(),
+        None => false,
+    })
+}
+
+/// The step before it in the same pass whose output a calculation reads and which failed to
+/// produce it, by name. The input's absence at the visit is that step's failure, so the
+/// calculation files its own finding rather than being not applicable there (Q327).
+#[must_use]
+pub fn failed_step_awaited<'a>(
+    reads: &[Uuid],
+    failed: &'a HashMap<Uuid, String>,
+) -> Option<&'a str> {
+    reads
+        .iter()
+        .find_map(|id| failed.get(id).map(String::as_str))
+}
+
+/// The sites a calculation is active at: [`applies_at_site`] over each site's applied slots.
 #[must_use]
 pub fn sites_applied(
-    read_inputs: &[Uuid],
     saved_outputs: &[(String, Uuid)],
-    declared: &HashMap<Uuid, HashSet<Uuid>>,
+    applied: &HashMap<Uuid, HashSet<Uuid>>,
 ) -> Vec<Uuid> {
-    if saved_outputs.is_empty() {
-        return Vec::new();
-    }
-    declared
+    applied
         .iter()
-        .filter(|(_, parameters)| applies_at_site(read_inputs, saved_outputs, parameters))
+        .filter(|(_, parameters)| applies_at_site(saved_outputs, parameters))
         .map(|(site_id, _)| *site_id)
         .collect()
 }
@@ -602,6 +640,64 @@ pub(super) fn skip_reason(e: &AppError) -> Option<String> {
     }
 }
 
+/// A skip's reason when the step it reads failed earlier in the pass, naming that step.
+#[must_use]
+pub fn awaited_reason(step: &str, reason: &str) -> String {
+    format!("waits on {step}, which did not run: {reason}")
+}
+
+/// What a skipped step lacks: an input, a step before it, or a fix to its arithmetic or script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipCause {
+    Inputs,
+    Upstream,
+    Error,
+    Unknown,
+}
+
+impl SkipCause {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inputs => "inputs",
+            Self::Upstream => "upstream",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The cause a skip's reason names, as the resolver, the evaluator and the runner word it, with
+/// the step it waits on when that is the cause. A reason worded otherwise is `Unknown`.
+#[must_use]
+pub fn skip_cause(reason: &str) -> (SkipCause, Option<String>) {
+    if let Some(rest) = reason.strip_prefix("waits on ") {
+        let step = rest.split(',').next().unwrap_or(rest);
+        return (SkipCause::Upstream, Some(step.to_string()));
+    }
+    if reason.starts_with("script error: ") || reason.ends_with("not a finite number") {
+        return (SkipCause::Error, None);
+    }
+    if let Some(name) = reason.strip_prefix("no value for ") {
+        // A formula's own input names its parameter or site property; a step of the set does not.
+        return if name.contains(" (") {
+            (SkipCause::Inputs, None)
+        } else {
+            (SkipCause::Upstream, Some(name.to_string()))
+        };
+    }
+    let inputs = reason.ends_with(" is required")
+        || reason.starts_with("missing required ")
+        || reason.ends_with(" was not supplied")
+        || reason.starts_with("no replicate family ")
+        || reason.starts_with("the visit no longer holds ");
+    if inputs {
+        (SkipCause::Inputs, None)
+    } else {
+        (SkipCause::Unknown, None)
+    }
+}
+
 /// The fingerprint of the run a provenance blob records, comparable with a fresh
 /// [`ResolvedRun::fingerprint`]. `None` when the blob pins no stored script version.
 pub(super) fn blob_fingerprint(blob: &serde_json::Value) -> Option<String> {
@@ -830,15 +926,14 @@ async fn walk_event(
         skipped: Vec::new(),
         findings_raised: 0,
         not_applicable: Vec::new(),
-        slots_minted: 0,
         unchanged: Vec::new(),
     };
 
-    // A calculation applies at a site when the site declares what it reads (Q193, narrowing Q98):
-    // the site parameters are still the declaration, so the calculation set is filtered by them
-    // before the dependency order is walked, rather than every live tool being run wherever
-    // its inputs happen to resolve. The output slot follows from the inputs, minted by the run.
-    let declared = declared_parameters(&state.db, event.site_id).await?;
+    // A calculation runs only at a site it was added to (Q325): the calculation set is filtered by
+    // the site's applied slots before the dependency order is walked.
+    let applied = applied_parameters(&state.db, event.site_id).await?;
+    // The outputs a step in this pass was due to write and did not.
+    let mut failed: HashMap<Uuid, String> = HashMap::new();
 
     for i in order {
         let tool = &tools[i];
@@ -851,10 +946,16 @@ async fn walk_event(
         if saved_outputs.is_empty() {
             continue;
         }
-        if !applies_at_site(&read_inputs(tool, &catalog), &saved_outputs, &declared) {
+        if !applies_at_site(&saved_outputs, &applied) {
             outcome.not_applicable.push(tool.name.clone());
             continue;
         }
+        let reads = read_inputs(tool, &catalog);
+        let awaited = failed_step_awaited(&reads, &failed).map(str::to_string);
+        let explain = |reason: String| match &awaited {
+            Some(step) => awaited_reason(step, &reason),
+            None => reason,
+        };
 
         let prior = blob_at_event(&state.db, &event, &tool.name).await?;
         let body = body_for_run(tool, &event, prior.as_ref());
@@ -873,15 +974,32 @@ async fn walk_event(
         {
             Ok(resolved) => resolved,
             Err(e) => match skip_reason(&e) {
+                Some(_)
+                    if awaited.is_none() && !measured_at(state, tool, &event, staged).await? =>
+                {
+                    outcome.findings_closed +=
+                        withdraw_skips(state, pass, &event, &saved_outputs).await?;
+                    outcome.not_applicable.push(tool.name.clone());
+                    continue;
+                }
                 Some(reason) => {
+                    let reason = explain(reason);
                     outcome.findings_raised +=
                         note_skip(state, pass, &event, &tool.name, &saved_outputs, &reason).await?;
                     outcome.skipped.push((tool.name.clone(), reason));
+                    failed.extend(saved_outputs.iter().map(|(_, id)| (*id, tool.name.clone())));
                     continue;
                 }
                 None => return Err(e),
             },
         };
+        // A visit holding none of what the calculation measures is not its to compute: the audit
+        // raises nothing there, so neither does the chain, and a skip filed before is withdrawn.
+        if !reads_a_measurement(&tool.manifest, &resolved.inputs) && awaited.is_none() {
+            outcome.findings_closed += withdraw_skips(state, pass, &event, &saved_outputs).await?;
+            outcome.not_applicable.push(tool.name.clone());
+            continue;
+        }
         // A run that would consume exactly what the prior run consumed, under the same script
         // version, produces the same outputs: nothing to mint, nothing to rewrite.
         if let Some(blob) = prior.as_ref()
@@ -897,9 +1015,11 @@ async fn walk_event(
             Ok(result) => result,
             Err(e) => match skip_reason(&e) {
                 Some(reason) => {
+                    let reason = explain(reason);
                     outcome.findings_raised +=
                         note_skip(state, pass, &event, &tool.name, &saved_outputs, &reason).await?;
                     outcome.skipped.push((tool.name.clone(), reason));
+                    failed.extend(saved_outputs.iter().map(|(_, id)| (*id, tool.name.clone())));
                     continue;
                 }
                 None => return Err(e),
@@ -950,6 +1070,7 @@ async fn walk_event(
                 raise_skip(&state.db, &event, &tool.name, key, *parameter_id, &reason).await?;
                 outcome.findings_raised += 1;
             }
+            failed.insert(*parameter_id, tool.name.clone());
             outcome
                 .skipped
                 .push((tool.name.clone(), format!("{key}: {reason}")));
@@ -1019,13 +1140,14 @@ async fn walk_event(
             })
             .collect();
         if readings.is_empty() {
-            let reason = "run produced no savable output".to_string();
+            let reason = explain("run produced no savable output".to_string());
             // A refused output already carries the arithmetic that stopped it; the generic reason
             // would replace it with a vaguer one.
             let unexplained = unexplained_outputs(&owned_outputs, &calculation.refused);
             outcome.findings_raised +=
                 note_skip(state, pass, &event, &tool.name, &unexplained, &reason).await?;
             outcome.skipped.push((tool.name.clone(), reason));
+            failed.extend(unexplained.iter().map(|(_, id)| (*id, tool.name.clone())));
             continue;
         }
 
@@ -1061,24 +1183,6 @@ async fn walk_event(
             &calculation.consumed,
         )
         .await?;
-
-        // The site declared the inputs, so it gets the column the run publishes (Q193). The slot
-        // is minted needing review, so a manager confirms it from the site's Parameters tab.
-        for (key, parameter_id) in &owned_outputs {
-            if declared.contains(parameter_id) || calculation.results.get(key).is_none() {
-                continue;
-            }
-            if crate::routes::private::site_parameters::service::mint_tool_slot(
-                &state.db,
-                event.site_id,
-                *parameter_id,
-            )
-            .await?
-            .is_some()
-            {
-                outcome.slots_minted += 1;
-            }
-        }
 
         let auth = crate::common::middleware::AuthContext::Keycloak {
             roles: Vec::new(),
@@ -1371,6 +1475,62 @@ pub(super) async fn supersede_findings(
     .await
 }
 
+/// Whether the visit holds any of what a calculation measures, resolved from the store alone.
+/// Asked where the run itself could not be resolved, so a missing required input does not stand in
+/// for a finding at a visit the calculation has nothing to read at.
+async fn measured_at(
+    state: &AppState,
+    tool: &ActiveTool,
+    event: &EventContext,
+    staged: &StagedVisit,
+) -> AppResult<bool> {
+    let visit = VisitContext {
+        site_id: Some(event.site_id),
+        collected_at: Some(event.collected_at),
+        staged: Some(staged),
+    };
+    let mut inputs = serde_json::Map::new();
+    let mut consumed = Vec::new();
+    resolve_event_inputs(
+        &state.db,
+        &tool.name,
+        &tool.manifest,
+        visit,
+        &mut inputs,
+        &mut consumed,
+    )
+    .await?;
+    resolve_replicate_inputs(&state.db, &tool.manifest, visit, &mut inputs, &mut consumed).await?;
+    Ok(reads_a_measurement(&tool.manifest, &inputs))
+}
+
+/// Close the chain's skip findings on a calculation's outputs at a visit it does not compute.
+async fn withdraw_skips(
+    state: &AppState,
+    pass: &Pass<'_>,
+    event: &EventContext,
+    outputs: &[(String, Uuid)],
+) -> AppResult<usize> {
+    let Pass::Save { .. } = pass else {
+        return Ok(0);
+    };
+    let mut closed = 0;
+    for (_, parameter_id) in outputs {
+        closed += supersede(
+            &state.db,
+            hold_model::of_kinds(
+                hold_model::in_status(
+                    hold_model::slot(event.site_id, *parameter_id, event.collected_at),
+                    HoldStatus::Pending,
+                ),
+                &[HoldKind::SkippedOutput],
+            ),
+        )
+        .await?;
+    }
+    Ok(usize::try_from(closed).unwrap_or(0))
+}
+
 /// The pinned script version a blob names, rebuilt as a runnable tool. `None` when the blob names
 /// no stored version (a draft run) or the version row is gone.
 pub(super) async fn pinned_tool(
@@ -1563,10 +1723,9 @@ pub async fn audit_event(
     order: &[usize],
     counts: &mut AuditCounts,
 ) -> AppResult<()> {
-    // The report covers what the repair covers: a calculation the site declares nothing of,
-    // neither what it reads nor what it writes, does not apply here, so its absent output is not
-    // a finding (Q98, narrowed by Q193).
-    let declared = declared_parameters(&state.db, event.site_id).await?;
+    // The report covers what the repair covers: a calculation not added at the site does not
+    // apply here, so its absent output is not a finding (Q325).
+    let applied = applied_parameters(&state.db, event.site_id).await?;
     for &i in order {
         let tool = &tools[i];
         let saved_outputs: Vec<(String, Uuid)> = tool
@@ -1578,7 +1737,7 @@ pub async fn audit_event(
         if saved_outputs.is_empty() {
             continue;
         }
-        if !applies_at_site(&read_inputs(tool, catalog), &saved_outputs, &declared) {
+        if !applies_at_site(&saved_outputs, &applied) {
             continue;
         }
         // The report covers what the repair covers: a detached slot is the operator's and a
@@ -1841,7 +2000,6 @@ impl Job for EventRecompute {
                     .count("readings_withdrawn", outcome.readings_withdrawn)
                     .count("tools_skipped", outcome.skipped.len())
                     .count("findings_raised", outcome.findings_raised)
-                    .count("slots_minted", outcome.slots_minted)
                     .count("tools_unchanged", outcome.unchanged.len())
                     .count("findings_closed", outcome.findings_closed),
             )
@@ -1883,7 +2041,6 @@ impl Job for EventRecompute {
         let mut tools_skipped = 0usize;
         let mut findings_raised = 0usize;
         let mut findings_closed = 0usize;
-        let mut slots_minted = 0usize;
         for (walked, event_id) in events.iter().enumerate() {
             if ctx.is_cancelled() {
                 break;
@@ -1900,7 +2057,6 @@ impl Job for EventRecompute {
             tools_skipped += outcome.skipped.len();
             findings_raised += outcome.findings_raised;
             findings_closed += outcome.findings_closed;
-            slots_minted += outcome.slots_minted;
             for (tool, reason) in &outcome.skipped {
                 ctx.log(
                     "info",
@@ -1925,7 +2081,6 @@ impl Job for EventRecompute {
                 .count("readings_withdrawn", readings_withdrawn)
                 .count("tools_skipped", tools_skipped)
                 .count("findings_raised", findings_raised)
-                .count("slots_minted", slots_minted)
                 .count("tools_unchanged", tools_unchanged)
                 .count("findings_closed", findings_closed),
         )

@@ -243,8 +243,9 @@ impl CRUDOperations for SharedStepOperations {
         Ok(())
     }
 
-    /// The step becomes nobody's, and the calculation that wrote it keeps reading it the same way
-    /// the declaring one now does.
+    /// The declaring calculation is re-pinned to a version reading the step. A step some other
+    /// calculation owned becomes nobody's, and that calculation keeps reading it the same way the
+    /// declaring one now does; releasing it re-pins every calculation declaring it.
     async fn after_create<C: ConnectionTrait + TransactionTrait>(
         &self,
         db: &C,
@@ -258,7 +259,7 @@ impl CRUDOperations for SharedStepOperations {
         let Promotion::Release { previous_owner } =
             promotion(step.tool_script_id, entity.tool_script_id).map_err(ApiError::bad_request)?
         else {
-            return Ok(());
+            return remint(db, entity.tool_script_id).await;
         };
         let owned = owned_steps(db, previous_owner).await?;
         for formula_id in owned_chain(&step.formula, &owned) {
@@ -268,6 +269,67 @@ impl CRUDOperations for SharedStepOperations {
         declare_step(db, previous_owner, entity.formula_id).await?;
         release_step(db, entity.formula_id).await
     }
+
+    /// A declaration names one calculation and one step for good: re-pointing it would leave the
+    /// calculation it named running a version that still reads the step.
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        _db: &C,
+        _id: Uuid,
+        data: &<Self::Resource as CRUDResource>::UpdateModel,
+    ) -> Result<(), ApiError> {
+        if data.tool_script_id.is_some() || data.formula_id.is_some() {
+            return Err(ApiError::bad_request(
+                "A declaration is dropped and made again, not re-pointed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The calculation stops reading the step, and is re-pinned to a version without it.
+    async fn perform_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Uuid, ApiError> {
+        let declaration = drop_declaration(db, id).await?;
+        remint(db, declaration.tool_script_id).await?;
+        Ok(id)
+    }
+
+    async fn perform_delete_many<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        ids: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>, ApiError> {
+        let mut calculations = Vec::new();
+        for id in &ids {
+            calculations.push(drop_declaration(db, *id).await?.tool_script_id);
+        }
+        calculations.sort();
+        calculations.dedup();
+        for calculation in calculations {
+            remint(db, calculation).await?;
+        }
+        Ok(ids)
+    }
+}
+
+/// Delete one declaration and return what it declared.
+async fn drop_declaration<C: ConnectionTrait>(
+    db: &C,
+    id: Uuid,
+) -> Result<super::models::shared_step::Model, ApiError> {
+    let declaration = super::models::shared_step::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("calculation_shared_step", Some(id.to_string())))?;
+    super::models::shared_step::Entity::delete_by_id(id)
+        .exec(db)
+        .await
+        .map_err(ApiError::database)?;
+    Ok(declaration)
 }
 
 /// A calculation's own steps, as the chain walk reads them.

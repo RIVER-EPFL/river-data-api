@@ -222,3 +222,44 @@ fn test_cell_curves_is_each_distinct_curve_in_replicate_order() {
 fn test_cell_curves_is_empty_for_an_uncorrected_cell() {
     assert!(cell_curves(&[], &std::collections::HashMap::new()).is_empty());
 }
+
+#[test]
+fn test_a_skip_serves_its_reason_and_what_it_waits_on() {
+    let finding = cell_finding(
+        Uuid::nil(),
+        "skipped_output".to_string(),
+        Some("chain_c".to_string()),
+        "pending".to_string(),
+        Some(
+            &serde_json::json!({ "output": "c", "reason": "waits on chain_b, which did not run: pa is required" }),
+        ),
+    );
+    assert_eq!(finding.cause.as_deref(), Some("upstream"));
+    assert_eq!(finding.waits_on.as_deref(), Some("chain_b"));
+    assert!(finding.reason.unwrap().starts_with("waits on chain_b"));
+}
+
+#[test]
+fn test_a_raised_script_is_an_error_not_missing_inputs() {
+    let finding = cell_finding(
+        Uuid::nil(),
+        "skipped_output".to_string(),
+        Some("chain_b".to_string()),
+        "pending".to_string(),
+        Some(&serde_json::json!({ "reason": "script error: division by zero" })),
+    );
+    assert_eq!(finding.cause.as_deref(), Some("error"));
+    assert_eq!(finding.waits_on, None);
+}
+
+#[test]
+fn test_a_stale_output_carries_no_skip_account() {
+    let finding = cell_finding(
+        Uuid::nil(),
+        "stale_output".to_string(),
+        Some("abstar".to_string()),
+        "pending".to_string(),
+        Some(&serde_json::json!({ "reason": "inputs", "value": 1.0 })),
+    );
+    assert_eq!((finding.reason, finding.cause), (None, None));
+}

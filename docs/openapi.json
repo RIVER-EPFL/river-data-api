@@ -3457,6 +3457,10 @@
       },
       "CellFinding": {
         "properties": {
+          "cause": {
+            "description": "What a skipped step lacks: `inputs`, `upstream`, `error` or `unknown`.",
+            "type": "string"
+          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -3465,10 +3469,18 @@
             "description": "`missing_output`, `stale_output` or `skipped_output`.",
             "type": "string"
           },
+          "reason": {
+            "description": "Why a skipped step did not run, as the chain recorded it.",
+            "type": "string"
+          },
           "status": {
             "type": "string"
           },
           "tool": {
+            "type": "string"
+          },
+          "waits_on": {
+            "description": "The step a skipped one waits on, when that step failed.",
             "type": "string"
           }
         },
@@ -23442,7 +23454,7 @@
             "type": "string"
           },
           "needs_review": {
-            "description": "Carried by a slot the chain minted where the site declared the calculation's inputs and\nnot its output (Q193); cleared by a manager confirming the slot from the site's Parameters\ntab.",
+            "description": "Carried by a slot the chain minted before Q325 made adding a calculation the only thing that\nruns it; cleared by a manager confirming the slot or applying the calculation at the site.\nA slot carrying it does not make a calculation run there (Q317).",
             "type": "boolean"
           },
           "parameter": {
@@ -23563,7 +23575,7 @@
             "type": "string"
           },
           "needs_review": {
-            "description": "Carried by a slot the chain minted where the site declared the calculation's inputs and\nnot its output (Q193); cleared by a manager confirming the slot from the site's Parameters\ntab.",
+            "description": "Carried by a slot the chain minted before Q325 made adding a calculation the only thing that\nruns it; cleared by a manager confirming the slot or applying the calculation at the site.\nA slot carrying it does not make a calculation run there (Q317).",
             "type": "boolean"
           },
           "parameter": {
@@ -45634,7 +45646,7 @@
     },
     "/api/sites/{site_id}/calculations": {
       "post": {
-        "description": "Refused while an input is undeclared, naming each one: the calculation would be\n`not_applicable` there, learned after the fact from a job log. The outputs a successful apply\nmints are the site's declaration of the calculation, so they carry no review flag; the ones the\nchain mints on its own still do (Q193). Applying twice creates nothing the second time.",
+        "description": "Refused while an input is undeclared, naming each one. The output slots are the site's\ndeclaration of the calculation, the only thing that makes it run there (Q325), so they carry no\nreview flag, and an output slot still waiting on review is confirmed. Applying twice creates\nnothing the second time.",
         "operationId": "apply_calculation",
         "parameters": [
           {
@@ -45681,7 +45693,7 @@
             "description": "The calculation is switched off"
           }
         },
-        "summary": "Apply a calculation at a site: check the site declares everything the calculation reads, and\nmint the output slots it lacks.",
+        "summary": "Apply a calculation at a site: check the site declares everything the calculation reads, and\ncreate the output slots it lacks.",
         "tags": [
           "site_parameters"
         ]

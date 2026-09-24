@@ -1,10 +1,10 @@
-//! A site that declares what a calculation reads gets the column the calculation publishes: the
-//! run mints the output slot rather than reporting itself not applicable there (Q193). The slot
-//! arrives needing review, so a manager confirms it from the site's Parameters tab.
+//! A calculation runs only at a site it was added to (Q325, Q274). Holding every input it reads,
+//! or an output slot the chain minted needing review (Q317), is not an assignment: the visit runs
+//! nothing and mints nothing.
 //!
 //! Formula engine only, so no R runs here.
 //!
-//! Run: cargo test --test tools mints_output_slot -- --test-threads=1
+//! Run: cargo test --test tools unassigned_site -- --test-threads=1
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::common::{GLOBAL_PARAM_TEMP_ID, SITE1_ID};
 
-const CALCULATION: &str = "minting_probe";
-const OUTPUT_CODE: &str = "minted_ratio";
+const CALCULATION: &str = "unassigned_probe";
+const OUTPUT_CODE: &str = "unassigned_ratio";
 const EVENT_TIME: &str = "2025-06-18T09:00:00Z";
 
 async fn exec(db: &DatabaseConnection, sql: &str) {
@@ -28,7 +28,7 @@ async fn seed_calculation(db: &DatabaseConnection) -> String {
         format!("DELETE FROM tool_scripts WHERE name = '{CALCULATION}'"),
         format!(
             "INSERT INTO tool_scripts (name, label, engine, created_by) \
-             VALUES ('{CALCULATION}', 'Minting probe', 'formula', 'test')"
+             VALUES ('{CALCULATION}', 'Unassigned probe', 'formula', 'test')"
         ),
     ] {
         exec(db, &sql).await;
@@ -100,22 +100,11 @@ async fn slot(db: &DatabaseConnection, parameter_id: &str) -> Option<(bool, Stri
     })
 }
 
-/// Scenario: a site holds the calculation's input and no slot for its output, which is every
-/// CNET site before somebody adds 19 slots by hand.
-///
-/// Expected behaviour: the chain runs there, the value lands, and the output slot is minted
-/// carrying `needs_review` so a manager confirms the column.
-#[tokio::test]
-#[serial]
-async fn a_run_publishing_where_the_site_declares_its_inputs_mints_the_output_slot() {
-    let f = crate::common::seeded_app().await;
-    let db = f.db.clone();
-    let script_id = seed_calculation(&db).await;
-
+async fn add_formula(f: &crate::common::Fixture, script_id: &str) -> String {
     let (status, text) = crate::common::save_formula_set(
         &f.app,
         &f.token,
-        &script_id,
+        script_id,
         serde_json::json!([{
             "code": OUTPUT_CODE,
             "name": OUTPUT_CODE,
@@ -129,15 +118,37 @@ async fn a_run_publishing_where_the_site_declares_its_inputs_mints_the_output_sl
         (200..300).contains(&status),
         "add the formula ({status}): {text}"
     );
-    let output_id = parameter_id(&db, OUTPUT_CODE)
+    parameter_id(&f.db, OUTPUT_CODE)
         .await
-        .expect("the formula save minted the output parameter");
+        .expect("the formula save minted the output parameter")
+}
 
-    assert_eq!(
-        slot(&db, &output_id).await,
-        None,
-        "the site declares no slot for the output before the run"
-    );
+async fn written_at(db: &DatabaseConnection, event_id: Uuid, parameter_id: &str) -> i64 {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT COUNT(*)::bigint AS n FROM readings \
+              WHERE collection_event_id = '{event_id}' AND parameter_id = '{parameter_id}'"
+        ),
+    ))
+    .await
+    .expect("query")
+    .expect("a count row")
+    .try_get("", "n")
+    .expect("n")
+}
+
+/// Scenario: a site holds the calculation's input and no slot for its output, and nobody added
+/// the calculation there.
+///
+/// Expected behaviour: the visit runs nothing, writes nothing and mints no output slot.
+#[tokio::test]
+#[serial]
+async fn a_visit_at_a_site_holding_every_input_runs_nothing_and_mints_nothing() {
+    let f = crate::common::seeded_app().await;
+    let db = f.db.clone();
+    let script_id = seed_calculation(&db).await;
+    let output_id = add_formula(&f, &script_id).await;
 
     let event_id = seed_visit(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
@@ -148,43 +159,55 @@ async fn a_run_publishing_where_the_site_declares_its_inputs_mints_the_output_sl
 
     assert_eq!(
         outcome.not_applicable,
-        Vec::<String>::new(),
-        "the site declares what the calculation reads, so it applies here"
+        vec![CALCULATION.to_string()],
+        "holding the input is not the calculation being added here"
     );
-    assert_eq!(
-        outcome.tools_run, 1,
-        "the calculation ran: {:?}",
-        outcome.skipped
-    );
-    assert_eq!(
-        outcome.slots_minted, 1,
-        "the output slot was minted by the run"
-    );
-    assert!(outcome.readings_written >= 1, "the computed value landed");
+    assert_eq!(outcome.tools_run, 0);
+    assert_eq!(written_at(&db, event_id, &output_id).await, 0);
+    assert_eq!(slot(&db, &output_id).await, None, "the run mints no slot");
+}
 
-    let (needs_review, entry_mode, is_public, cadence) = slot(&db, &output_id)
-        .await
-        .expect("the run minted the output slot");
-    assert!(
-        needs_review,
-        "the slot waits for a manager to confirm the column"
-    );
+/// Scenario: the site holds the input and an output slot the chain minted needing review before
+/// Q325, and nobody added the calculation there.
+///
+/// Expected behaviour: the minted slot is not an assignment (Q317), so the visit runs nothing, and
+/// the slot is left as it was.
+#[tokio::test]
+#[serial]
+async fn an_output_slot_waiting_on_review_does_not_run_the_calculation() {
+    let f = crate::common::seeded_app().await;
+    let db = f.db.clone();
+    let script_id = seed_calculation(&db).await;
+    let output_id = add_formula(&f, &script_id).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
+                                          is_active, is_public, needs_review, entry_mode, cadence) \
+             VALUES (gen_random_uuid(), '{SITE1_ID}', '{output_id}', '{OUTPUT_CODE}', '', true, \
+                     false, true, 'tool', 'low')"
+        ),
+    )
+    .await;
+
+    let event_id = seed_visit(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("the run");
+
+    assert_eq!(outcome.not_applicable, vec![CALCULATION.to_string()]);
+    assert_eq!(outcome.tools_run, 0);
+    assert_eq!(written_at(&db, event_id, &output_id).await, 0);
     assert_eq!(
-        entry_mode, "tool",
-        "the slot computes rather than being typed into"
-    );
-    assert!(
-        !is_public,
-        "a minted slot is not published until somebody says so"
-    );
-    assert_eq!(
-        cadence, "low",
-        "the run that minted it was a visit's, so the slot is the visit arm's"
+        slot(&db, &output_id).await,
+        Some((true, "tool".to_string(), false, "low".to_string())),
+        "the minted slot still waits on review"
     );
 }
 
-/// A calculation reading a parameter the site does not declare stays out of that site: the
-/// narrowing is of which declaration counts, not of whether one is needed.
+/// A calculation reading a parameter the site does not declare stays out of that site.
 #[tokio::test]
 #[serial]
 async fn a_calculation_whose_inputs_the_site_lacks_is_still_not_applicable() {
@@ -234,6 +257,5 @@ async fn a_calculation_whose_inputs_the_site_lacks_is_still_not_applicable() {
         vec![CALCULATION.to_string()],
         "the site declares neither the input nor the output"
     );
-    assert_eq!(outcome.slots_minted, 0);
     assert_eq!(slot(&db, &output_id).await, None);
 }

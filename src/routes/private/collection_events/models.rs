@@ -593,4 +593,16 @@ pub struct CellFinding {
     #[schema(nullable = false)]
     pub tool: Option<String>,
     pub status: String,
+    /// Why a skipped step did not run, as the chain recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub reason: Option<String>,
+    /// What a skipped step lacks: `inputs`, `upstream`, `error` or `unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub cause: Option<String>,
+    /// The step a skipped one waits on, when that step failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub waits_on: Option<String>,
 }

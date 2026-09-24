@@ -1,8 +1,7 @@
 //! The site-parameter handlers: applying a parameter group to a site, and merging two slots.
 //!
-//! A calculation applies at a site when the site declares what it reads (Q193, narrowing Q98), so
-//! the site parameters *are* the declaration and `apply_group` is the flow that writes it; the
-//! output slots follow, minted by the run that first computes them. One
+//! A calculation applies at a site once someone adds it there (Q325), which writes its output
+//! slots: `apply_calculation` for one calculation, `apply_group` for the members of a group. One
 //! action per group rather than one per member: pCO2, DIC and Chl a carry roughly 45 stage-1
 //! intermediates between them (Q95), and there are 23 CNET stations. Applying twice adds only what
 //! is missing, so a group that grows is applied again rather than diffed by hand.
@@ -34,6 +33,7 @@ use super::service::MergeSiteParametersRequest;
 use super::service::MergeSiteParametersResponse;
 use super::service::applied_cadence;
 use super::service::compute_declared_output;
+use super::service::confirm_slots;
 use super::service::partition_calculation;
 use super::service::partition_members;
 use super::service::slot_cadence;
@@ -188,12 +188,12 @@ pub async fn apply_group(
 }
 
 /// Apply a calculation at a site: check the site declares everything the calculation reads, and
-/// mint the output slots it lacks.
+/// create the output slots it lacks.
 ///
-/// Refused while an input is undeclared, naming each one: the calculation would be
-/// `not_applicable` there, learned after the fact from a job log. The outputs a successful apply
-/// mints are the site's declaration of the calculation, so they carry no review flag; the ones the
-/// chain mints on its own still do (Q193). Applying twice creates nothing the second time.
+/// Refused while an input is undeclared, naming each one. The output slots are the site's
+/// declaration of the calculation, the only thing that makes it run there (Q325), so they carry no
+/// review flag, and an output slot still waiting on review is confirmed. Applying twice creates
+/// nothing the second time.
 #[utoipa::path(
     post,
     path = "/api/sites/{site_id}/calculations",
@@ -314,6 +314,8 @@ pub async fn apply_calculation(
     // and mints the rest flagged for review, which is the state this action exists to prevent.
     let txn = state.db.begin().await?;
     crate::common::actor::declare(&txn).await?;
+    let existing: Vec<Uuid> = partition.outputs_existing.iter().map(|m| m.0).collect();
+    let confirmed = confirm_slots(&txn, site_id, &existing).await?;
     let mut created = Vec::with_capacity(partition.outputs_to_create.len());
     for member in &partition.outputs_to_create {
         let parameter = crate::routes::private::parameters::Entity::find_by_id(member.0)
@@ -339,12 +341,13 @@ pub async fn apply_calculation(
         .await?;
         created.push(slot(member, Role::Output.as_str(), Some(id)));
     }
-    if !created.is_empty() {
+    let changed = !created.is_empty() || confirmed > 0;
+    if changed {
         compute_declared_output(&txn, tool.script_id, site_id, cadence).await?;
     }
     txn.commit().await?;
 
-    if !created.is_empty() {
+    if changed {
         crate::common::cache::invalidate_site(&state.response_cache, site_id);
     }
 

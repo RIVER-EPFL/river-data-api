@@ -2526,13 +2526,10 @@ pub struct RecomputeOutcome {
     pub skipped: Vec<(String, String)>,
     /// `skipped_output` findings raised because a step did not run and its outputs are absent.
     pub findings_raised: usize,
-    /// Tools the site never declared: it holds no slot for what they read and none for what they
-    /// write, so they do not apply here at all (Q98, narrowed by Q193). Distinct from `skipped`,
-    /// which is an input that did not resolve on a tool that does apply.
+    /// Tools not added at the site: it holds no confirmed slot for what they write, so they do not
+    /// apply here at all (Q325). Distinct from `skipped`, which is an input that did not resolve on
+    /// a tool that does apply.
     pub not_applicable: Vec<String>,
-    /// Output slots minted at the site because the run published where the site declared the
-    /// inputs and not the output (Q193). Each carries `needs_review` until a manager confirms it.
-    pub slots_minted: usize,
     /// Tools whose prior run at this event consumed exactly what a fresh run would, under the
     /// same script version, with its outputs still served: left alone, no run minted.
     pub unchanged: Vec<String>,

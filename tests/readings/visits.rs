@@ -760,6 +760,41 @@ async fn the_csv_download_reproduces_the_grid() {
     }
 }
 
+/// A skipped step waits on its inputs, which a recompute does not supply, so it leaves the visit
+/// `current`; a missing output is one a recompute writes.
+#[tokio::test]
+#[serial]
+async fn a_skip_alone_leaves_the_visit_current() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    let hold = |kind: &str| {
+        format!(
+            "INSERT INTO replicate_audit_holds \
+                 (kind, site_id, parameter_id, group_time, tool, expected, computed, delta, status) \
+             VALUES ('{kind}', '{SITE1_ID}', '{GLOBAL_PARAM_DO_ID}', '{T1}', 'chain_b', \
+                     '{{}}', '{{}}', '{{}}', 'pending')"
+        )
+    };
+    let state = |body: &serde_json::Value| {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["collected_at"] == T1)
+            .expect("the first visit is listed")["recompute"]
+            .clone()
+    };
+
+    crate::common::exec(&db, &hold("skipped_output")).await;
+    let (status, body) = crate::common::get_json_with_token(&app, "/api/visits", &token).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(state(&body), "current", "{body}");
+
+    crate::common::exec(&db, &hold("missing_output")).await;
+    let (_, body) = crate::common::get_json_with_token(&app, "/api/visits", &token).await;
+    assert_eq!(state(&body), "stale", "{body}");
+}
+
 /// Scenario: the cross-site visits list, the way into a site's grid.
 ///
 /// Expected behaviour: each row carries the same fill and open-finding counts the site-scoped

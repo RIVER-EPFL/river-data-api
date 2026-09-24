@@ -314,6 +314,9 @@ impl HoldKind {
     pub const EVENT_AUDIT: [Self; 3] =
         [Self::MissingOutput, Self::StaleOutput, Self::SkippedOutput];
 
+    /// The event-audit kinds a recompute clears. A skip waits on its inputs, so it is not one.
+    pub const RECOMPUTE_CLEARS: [Self; 2] = [Self::MissingOutput, Self::StaleOutput];
+
     /// The kinds a manager owes an action on, which is what `holds_open` announces.
     pub const OWED: [Self; 6] = [
         Self::UnverifiedEntry,

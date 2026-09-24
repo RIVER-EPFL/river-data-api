@@ -152,8 +152,7 @@ pub async fn load_parameter_catalog<'a, C: ConnectionTrait>(
                 codes.push(code.to_lowercase());
             }
         }
-        // The codes a calculation reads at a visit are catalog rows like any other: the chain's
-        // applicability test resolves them through here (Q193).
+        // The codes a calculation reads at a visit are catalog rows like any other.
         for input in &manifest.event_inputs {
             codes.push(input.parameter_code.to_lowercase());
         }
