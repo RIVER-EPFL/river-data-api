@@ -646,7 +646,10 @@ async fn a_formula_edit_enqueues_its_own_audit() {
         .expect("a row")
         .try_get::<i64>("", "n")
         .expect("n");
-    assert_eq!(rewrites, 1, "the edit queues the recompute of what the first version produced");
+    assert_eq!(
+        rewrites, 1,
+        "the edit queues the recompute of what the first version produced"
+    );
 }
 
 /// Scenario: a calculation reading a catalog parameter that belongs to no group of its own, and

@@ -267,3 +267,28 @@ mod the_sites_a_calculation_is_active_at {
         assert!(sites_applied(&[doc], &[], &declared).is_empty());
     }
 }
+
+/// Scenario: a visit run saves nothing, because its only output is a stream slot it skipped.
+///
+/// Expected behaviour: nothing is raised for that output; an output the run owned and left without
+/// a value is raised, unless a refusal already explains it.
+mod a_run_that_saved_nothing {
+    use uuid::Uuid;
+
+    use crate::routes::private::tools::flows::unexplained_outputs;
+
+    #[test]
+    fn raises_only_the_owned_outputs_no_refusal_explains() {
+        let (kept, refused) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let owned = vec![("kept".to_string(), kept), ("refused".to_string(), refused)];
+        assert_eq!(
+            unexplained_outputs(&owned, &["refused".to_string()]),
+            vec![("kept".to_string(), kept)]
+        );
+    }
+
+    #[test]
+    fn raises_nothing_when_every_output_was_skipped_as_another_arm_s() {
+        assert!(unexplained_outputs(&[], &[]).is_empty());
+    }
+}

@@ -133,7 +133,10 @@ async fn a_clean_spot_file_needs_a_check_and_a_continuous_file_is_not_screened()
     )
     .await;
     assert_eq!(status, 200, "{plan}");
-    let check_id = plan["check"]["check_id"].as_str().expect("check id").to_string();
+    let check_id = plan["check"]["check_id"]
+        .as_str()
+        .expect("check id")
+        .to_string();
     let (status, body) = import(
         &app,
         &token,

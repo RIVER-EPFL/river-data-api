@@ -38,6 +38,7 @@ mod m20260923_000007_calibration_instant_unique;
 mod m20260923_000009_drop_formula_required_types;
 mod m20260924_000001_retag_decision_kind;
 mod m20260924_000002_attribution_decision_kind;
+mod m20260924_000013_tool_script_commissions;
 
 pub struct Migrator;
 
@@ -96,6 +97,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260923_000009_drop_formula_required_types::Migration),
             Box::new(m20260924_000001_retag_decision_kind::Migration),
             Box::new(m20260924_000002_attribution_decision_kind::Migration),
+            Box::new(m20260924_000013_tool_script_commissions::Migration),
         ]
     }
 }

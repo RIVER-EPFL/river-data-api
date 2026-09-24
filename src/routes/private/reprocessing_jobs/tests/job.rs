@@ -149,5 +149,8 @@ fn test_site_of_reads_the_site_the_params_name() {
     assert_eq!(site_of(&serde_json::json!({ "site_id": site })), Some(site));
     assert_eq!(site_of(&serde_json::json!({ "calculation": "doc" })), None);
     assert_eq!(site_of(&serde_json::json!({ "site_id": null })), None);
-    assert_eq!(site_of(&serde_json::json!({ "site_id": "not a uuid" })), None);
+    assert_eq!(
+        site_of(&serde_json::json!({ "site_id": "not a uuid" })),
+        None
+    );
 }

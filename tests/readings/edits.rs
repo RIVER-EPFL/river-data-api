@@ -706,7 +706,10 @@ async fn a_grab_correction_is_committed_only_under_a_check_that_screened_it() {
         &json!({ "kind": "value_correction", "value": 12000.0, "check_id": other }),
     )
     .await;
-    assert_eq!(status, 409, "a check over another value does not cover this one: {body}");
+    assert_eq!(
+        status, 409,
+        "a check over another value does not cover this one: {body}"
+    );
     assert_eq!(stored(&f, 0).await.0, 10.0);
 
     // Far outside the range, and still saved: the check warns, it does not block.

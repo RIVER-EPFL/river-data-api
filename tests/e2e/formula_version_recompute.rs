@@ -330,7 +330,10 @@ async fn every_version_change_moves_what_the_replaced_version_stored() {
     // The second formula saved back is the second version again, and the values move back to it.
     let saved = save("FverIn * 3 * fver_factor", Some(formula_id.clone())).await;
     assert_eq!(saved["version_no"], 2, "the version holding it: {saved}");
-    assert_eq!(saved["migrated"], true, "a rollback recomputes too: {saved}");
+    assert_eq!(
+        saved["migrated"], true,
+        "a rollback recomputes too: {saved}"
+    );
     e2e::drain_jobs(&db, 120).await;
     for at in VISITS.iter().chain([&LATER]) {
         assert_eq!(

@@ -4059,6 +4059,37 @@
         ],
         "type": "object"
       },
+      "CommissionRecord": {
+        "description": "One decommission or recommission, newest first in a history.",
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "event": {
+            "description": "`decommissioned` or `recommissioned`.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The name the calculation held before the event.",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "name",
+          "actor",
+          "at",
+          "reason"
+        ],
+        "type": "object"
+      },
       "ComputationInfo": {
         "properties": {
           "created_by": {
@@ -5771,6 +5802,28 @@
         },
         "required": [
           "reason"
+        ],
+        "type": "object"
+      },
+      "DecommissionedBy": {
+        "description": "A decommissioned calculation that published a parameter, and when it was decommissioned.",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "calculation": {
+            "type": "string"
+          },
+          "tool_script_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_script_id",
+          "calculation",
+          "at"
         ],
         "type": "object"
       },
@@ -12908,6 +12961,16 @@
               "null"
             ]
           },
+          "decommissioned_by": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DecommissionedBy"
+              }
+            ]
+          },
           "default_units": {
             "type": "string"
           },
@@ -12945,7 +13008,8 @@
           "aliases",
           "needs_review",
           "created_at",
-          "unpublished_by"
+          "unpublished_by",
+          "decommissioned_by"
         ],
         "type": "object"
       },
@@ -13689,6 +13753,17 @@
               "null"
             ]
           },
+          "decommissioned_by": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DecommissionedBy",
+                "description": "The decommissioned calculation that last published this row, while no live calculation\npublishes it (Q299). Read from the formulas on every fetch, never stored."
+              }
+            ]
+          },
           "default_units": {
             "type": "string"
           },
@@ -13727,7 +13802,8 @@
           "aliases",
           "needs_review",
           "created_at",
-          "unpublished_by"
+          "unpublished_by",
+          "decommissioned_by"
         ],
         "type": "object"
       },
@@ -13940,6 +14016,49 @@
           "time_points",
           "n",
           "nulls"
+        ],
+        "type": "object"
+      },
+      "ParameterTakeover": {
+        "description": "A calculation continuing a parameter's series, as the change audit records it.",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "calculation": {
+            "description": "The calculation computing it since.",
+            "type": "string"
+          },
+          "calculation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "computed_by": {
+            "description": "The decommissioned calculation's name, or the portal function.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "What computed the series before: `decommissioned` (a calculation) or `portal`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "by",
+          "kind",
+          "computed_by",
+          "calculation",
+          "calculation_id"
         ],
         "type": "object"
       },
@@ -16689,6 +16808,13 @@
               "null"
             ]
           },
+          "takeovers": {
+            "description": "Every time a calculation took the parameter's series over (Q299), oldest first. It holds\nfor every value under the parameter, before and after, so no stored record is rewritten.",
+            "items": {
+              "$ref": "#/components/schemas/ParameterTakeover"
+            },
+            "type": "array"
+          },
           "time": {
             "format": "date-time",
             "type": "string"
@@ -18011,6 +18137,34 @@
           "stream_id",
           "total",
           "receipts"
+        ],
+        "type": "object"
+      },
+      "RecommissionRequest": {
+        "properties": {
+          "reason": {
+            "description": "Why the calculation is brought back; recorded with who and when.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "RecommissionResponse": {
+        "description": "A recommissioned calculation, and whether it got its name back: a name another calculation\ntook meanwhile stays with that one.",
+        "properties": {
+          "calculation": {
+            "$ref": "#/components/schemas/ToolScript"
+          },
+          "name_restored": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "calculation",
+          "name_restored"
         ],
         "type": "object"
       },
@@ -20281,6 +20435,13 @@
               "$ref": "#/components/schemas/SavedSharedStep"
             },
             "type": "array"
+          },
+          "take_over": {
+            "description": "The output codes the author confirmed to take over (Q299): a decommissioned calculation's\ncolumn, or one the portal computed. An eligible code not named here is refused with a 409\nwhose detail is the [`Takeover`] list.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -20309,6 +20470,13 @@
           "migrated": {
             "description": "Whether the migration of the superseded version's values was enqueued.",
             "type": "boolean"
+          },
+          "taken_over": {
+            "description": "The codes this save took over, each recorded in `change_audit`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "updated": {
             "minimum": 0,
@@ -25964,6 +26132,99 @@
         },
         "type": "object"
       },
+      "Takeover": {
+        "description": "A catalog parameter a save would take over, as the refusal names it for the confirm.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "computed_by": {
+            "description": "The decommissioned calculation's name, or the portal function that computed the column.",
+            "type": "string"
+          },
+          "first_reading": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "`decommissioned` or `portal`.",
+            "type": "string"
+          },
+          "last_reading": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "parameter_name": {
+            "type": "string"
+          },
+          "readings": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "source_systems": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "units": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "parameter_id",
+          "parameter_name",
+          "units",
+          "kind",
+          "computed_by",
+          "readings",
+          "first_reading",
+          "last_reading",
+          "source_systems"
+        ],
+        "type": "object"
+      },
+      "TakeoverConflict": {
+        "description": "The body of the 409 a save answers with when an output would take over a column unconfirmed.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/TakeoverDetail"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "TakeoverDetail": {
+        "properties": {
+          "take_over": {
+            "items": {
+              "$ref": "#/components/schemas/Takeover"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "take_over"
+        ],
+        "type": "object"
+      },
       "TestResult": {
         "properties": {
           "error": {
@@ -26499,7 +26760,7 @@
             ]
           },
           "decommissioned_at": {
-            "description": "When the calculation was decommissioned. Set, it is never enabled again (Q272).",
+            "description": "When the calculation was decommissioned. Set, it is not enabled until a recommission\nclears it (Q279).",
             "format": "date-time",
             "type": [
               "string",
@@ -26608,7 +26869,7 @@
             ]
           },
           "decommissioned_at": {
-            "description": "When the calculation was decommissioned. Set, it is never enabled again (Q272).",
+            "description": "When the calculation was decommissioned. Set, it is not enabled until a recommission\nclears it (Q279).",
             "format": "date-time",
             "type": [
               "string",
@@ -52102,6 +52363,41 @@
         ]
       }
     },
+    "/api/tool_scripts/{id}/commissions": {
+      "get": {
+        "operationId": "list_commissions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CommissionRecord"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "A calculation's decommissions and recommissions, newest first. Requires Administrator.",
+        "tags": [
+          "tool_scripts"
+        ]
+      }
+    },
     "/api/tool_scripts/{id}/decommission": {
       "post": {
         "operationId": "decommission_script",
@@ -52195,6 +52491,16 @@
           },
           "404": {
             "description": "No such calculation"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakeoverConflict"
+                }
+              }
+            },
+            "description": "An output code would take over a column something else computed; confirm it in `take_over`"
           }
         },
         "summary": "Save a formula calculation's whole formula set as one version.",
@@ -52248,6 +52554,57 @@
           }
         },
         "summary": "Run an unsaved formula set at a visit, in place of the calculation's stored formulas.",
+        "tags": [
+          "tool_scripts"
+        ]
+      }
+    },
+    "/api/tool_scripts/{id}/recommission": {
+      "post": {
+        "operationId": "recommission_script",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecommissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecommissionResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "The reason is blank"
+          },
+          "404": {
+            "description": "No such calculation"
+          },
+          "409": {
+            "description": "Not decommissioned"
+          }
+        },
+        "summary": "Bring a decommissioned calculation back (Q279), switched off: an administrator switches it on\nonce it should fire again. It gets the name it held back unless another calculation took it\nmeanwhile. The recommission records who, when and why. Requires Administrator.",
         "tags": [
           "tool_scripts"
         ]

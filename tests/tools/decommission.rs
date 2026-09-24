@@ -1,6 +1,6 @@
 //! Decommissioning a calculation (Q272): an Administrator stops it at every site and the
 //! decommission records who, when and why. Nothing it computed is withdrawn, and it is not
-//! switched back on.
+//! switched back on until a recommission (Q279). The decommission frees its name (Q300).
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::json;
@@ -58,7 +58,8 @@ async fn install(db: &DatabaseConnection) -> String {
     row.try_get::<uuid::Uuid>("", "id").expect("id").to_string()
 }
 
-/// A value the probe computed at a visit, with the run that produced it.
+/// A value the probe computed at a visit, with the run that produced it, pinned to the probe's
+/// version as every run is.
 async fn computed_value(db: &DatabaseConnection) -> uuid::Uuid {
     let stream_id = uuid::Uuid::new_v4();
     let run_id = uuid::Uuid::new_v4();
@@ -69,7 +70,10 @@ async fn computed_value(db: &DatabaseConnection) -> uuid::Uuid {
         ),
         format!(
             "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, outputs, created_by) \
-             VALUES ('{run_id}', '{TOOL}', '{{}}', '{{\"x\": 2}}', '{{}}', '[]', '{{\"doubled\": 4}}', 'test')"
+             SELECT '{run_id}', '{TOOL}', jsonb_build_object('script_version_id', v.id, 'content_hash', v.content_hash), \
+                    '{{\"x\": 2}}', '{{}}', '[]', '{{\"doubled\": 4}}', 'test' \
+             FROM tool_script_versions v JOIN tool_scripts s ON s.id = v.tool_script_id \
+             WHERE s.name = '{TOOL}'"
         ),
         format!(
             "INSERT INTO readings (stream_id, parameter_id, time, replicate_index, raw_value, \
@@ -127,10 +131,10 @@ async fn listed_in_calculation_sites(app: &axum::Router, admin: &str) -> bool {
 
 /// Scenario: an Administrator decommissions a calculation that has already computed a value.
 ///
-/// Expected behaviour: it leaves the calculation set and a run by name is refused; the record
-/// names the administrator, the instant and the reason; the value it computed is served as it was,
-/// and no ledger row or hold is written. A second decommission and switching it back on are both
-/// refused naming the decommission.
+/// Expected behaviour: it leaves the calculation set and a run by its old name is refused naming
+/// the decommission; the record names the administrator, the instant and the reason, and the name
+/// is freed; the value it computed is served as it was, and no ledger row or hold is written. A
+/// second decommission and switching it back on are both refused naming the decommission.
 #[tokio::test]
 #[serial]
 async fn an_administrator_decommissions_a_calculation_and_its_values_stand() {
@@ -144,8 +148,8 @@ async fn an_administrator_decommissions_a_calculation_and_its_values_stand() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     for sql in [
-        format!("UPDATE tool_scripts SET active_version_id = NULL WHERE name = '{TOOL}'"),
-        format!("DELETE FROM tool_scripts WHERE name = '{TOOL}'"),
+        format!("UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE '{TOOL}%'"),
+        format!("DELETE FROM tool_scripts WHERE name LIKE '{TOOL}%'"),
     ] {
         crate::common::exec(&db, &sql).await;
     }
@@ -185,6 +189,12 @@ async fn an_administrator_decommissions_a_calculation_and_its_values_stand() {
             .is_some_and(|by| by.contains("scriptadmin")),
         "the decommission names who did it: {body}"
     );
+    let today = chrono::Utc::now().format("%Y%m%d");
+    assert_eq!(
+        body["name"],
+        format!("{TOOL}_decommissioned_{today}"),
+        "the decommission frees the name: {body}"
+    );
 
     assert!(
         !listed_in_calculation_sites(&app, &admin).await,
@@ -198,6 +208,12 @@ async fn an_administrator_decommissions_a_calculation_and_its_values_stand() {
     )
     .await;
     assert_eq!(status, 409, "a run by name is refused: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("decommissioned")),
+        "the refusal of the freed name names the decommission: {body}"
+    );
 
     assert_eq!(
         served(&db, stream_id).await,
@@ -270,8 +286,8 @@ async fn only_an_administrator_decommissions() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     for sql in [
-        format!("UPDATE tool_scripts SET active_version_id = NULL WHERE name = '{TOOL}'"),
-        format!("DELETE FROM tool_scripts WHERE name = '{TOOL}'"),
+        format!("UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE '{TOOL}%'"),
+        format!("DELETE FROM tool_scripts WHERE name LIKE '{TOOL}%'"),
     ] {
         crate::common::exec(&db, &sql).await;
     }
@@ -291,5 +307,152 @@ async fn only_an_administrator_decommissions() {
     assert!(
         listed_in_calculation_sites(&app, &admin).await,
         "and it still applies"
+    );
+}
+
+/// Scenario: a calculation is decommissioned, a new calculation takes its freed name, the first is
+/// recommissioned, the second is decommissioned in turn and the first recommissioned again.
+///
+/// Expected behaviour: a recommission leaves the calculation switched off and records who, when
+/// and why; it gets its name back only while no other calculation holds it; the history lists every
+/// decommission and recommission, newest first, under the name held before each.
+#[tokio::test]
+#[serial]
+async fn a_recommission_brings_a_calculation_back_under_the_name_still_free() {
+    if !crate::common::profile::Service::Keycloak
+        .require("a_recommission_brings_a_calculation_back_under_the_name_still_free")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    for sql in [
+        format!("UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE '{TOOL}%'"),
+        format!("DELETE FROM tool_scripts WHERE name LIKE '{TOOL}%'"),
+    ] {
+        crate::common::exec(&db, &sql).await;
+    }
+    let first = install(&db).await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::member_jwt("scriptadmin", "scriptadmin", "riverdata-admin").await;
+    let post = |path: String, reason: &'static str| {
+        let (app, admin) = (&app, &admin);
+        async move {
+            crate::common::post_json_parse_with_token(
+                app,
+                &path,
+                &json!({ "reason": reason }),
+                admin,
+            )
+            .await
+        }
+    };
+    let today = chrono::Utc::now().format("%Y%m%d").to_string();
+
+    let (status, body) = post(format!("/api/tool_scripts/{first}/recommission"), "why not").await;
+    assert_eq!(
+        status, 409,
+        "a live calculation is not recommissioned: {body}"
+    );
+
+    let (status, body) = post(format!("/api/tool_scripts/{first}/decommission"), "a slip").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(format!("/api/tool_scripts/{first}/recommission"), "  ").await;
+    assert_eq!(status, 400, "a blank reason is refused: {body}");
+    let (status, body) = post(
+        format!("/api/tool_scripts/{first}/recommission"),
+        "decommissioned by mistake",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name_restored"], true, "{body}");
+    assert_eq!(body["calculation"]["name"], TOOL, "{body}");
+    assert_eq!(
+        body["calculation"]["enabled"], false,
+        "it comes back switched off: {body}"
+    );
+    assert!(body["calculation"]["decommissioned_at"].is_null(), "{body}");
+
+    let (status, body) = post(
+        format!("/api/tool_scripts/{first}/decommission"),
+        "replaced",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, second) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tool_scripts",
+        &json!({ "name": TOOL, "label": "Probe again" }),
+        &admin,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the freed name is taken by a new calculation: {second}"
+    );
+    let second = second["id"].as_str().expect("an id").to_string();
+
+    let (status, body) = post(
+        format!("/api/tool_scripts/{first}/recommission"),
+        "needed after all",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name_restored"], false, "{body}");
+    assert_eq!(
+        body["calculation"]["name"],
+        format!("{TOOL}_decommissioned_{today}"),
+        "the name another calculation holds stays with it: {body}"
+    );
+
+    let (status, body) = post(format!("/api/tool_scripts/{second}/decommission"), "a slip").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["name"],
+        format!("{TOOL}_decommissioned_{today}_2"),
+        "a second freed name the same day is counted on: {body}"
+    );
+
+    let (status, history) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/tool_scripts/{first}/commissions"),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{history}");
+    let events: Vec<(String, String, String)> = history
+        .as_array()
+        .expect("a history")
+        .iter()
+        .map(|h| {
+            (
+                h["event"].as_str().unwrap().to_string(),
+                h["name"].as_str().unwrap().to_string(),
+                h["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let freed = format!("{TOOL}_decommissioned_{today}");
+    assert_eq!(
+        events,
+        vec![
+            ("recommissioned".into(), freed, "needed after all".into()),
+            ("decommissioned".into(), TOOL.into(), "replaced".into()),
+            (
+                "recommissioned".into(),
+                format!("{TOOL}_decommissioned_{today}"),
+                "decommissioned by mistake".into()
+            ),
+            ("decommissioned".into(), TOOL.into(), "a slip".into()),
+        ],
+        "{history}"
+    );
+    assert!(
+        history[0]["actor"]
+            .as_str()
+            .is_some_and(|by| by.contains("scriptadmin")),
+        "{history}"
     );
 }

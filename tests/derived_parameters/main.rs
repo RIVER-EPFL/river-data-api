@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod calculation_takeover;
 mod continuous_recompute_and_backfill;
 mod excluded_inputs;
 mod formula_rename;

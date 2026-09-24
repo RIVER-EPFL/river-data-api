@@ -26,7 +26,9 @@ fn test_transient_reset_on_migration_statement() {
 
 #[test]
 fn test_transient_pool_acquire() {
-    assert!(transient(&DbErr::ConnectionAcquire(ConnAcquireErr::Timeout)));
+    assert!(transient(&DbErr::ConnectionAcquire(
+        ConnAcquireErr::Timeout
+    )));
     assert!(transient(&DbErr::ConnectionAcquire(
         ConnAcquireErr::ConnectionClosed
     )));

@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use super::{
     PROVENANCE_KINDS, classify_source, decommission_of, provenance_kind_for_run,
-    provenance_kind_for_stream, slot_holds_query, stream_holds_query,
+    provenance_kind_for_stream, slot_holds_query, stream_holds_query, takeover_of,
 };
 
 #[test]
@@ -174,5 +174,38 @@ fn test_a_decommission_is_reported_only_when_the_calculation_records_one() {
         decommission_of(None, None, None),
         None,
         "a live calculation reports none"
+    );
+}
+
+#[test]
+fn test_a_takeover_reads_what_computed_the_series_before_and_after() {
+    let at = Utc.with_ymd_and_hms(2026, 9, 25, 8, 0, 0).unwrap();
+    let calculation = Uuid::from_u128(7);
+    let takeover = takeover_of(
+        at,
+        Some("evan".to_string()),
+        Some(&serde_json::json!({ "kind": "portal", "computed_by": "calcCO2" })),
+        Some(&serde_json::json!({ "calculation": "pco2real", "calculation_id": calculation, "code": "CO2_HS_Um" })),
+    )
+    .expect("a takeover");
+    assert_eq!(takeover.at, at);
+    assert_eq!(takeover.by.as_deref(), Some("evan"));
+    assert_eq!(takeover.kind, "portal");
+    assert_eq!(takeover.computed_by, "calcCO2");
+    assert_eq!(takeover.calculation, "pco2real");
+    assert_eq!(takeover.calculation_id, Some(calculation));
+}
+
+#[test]
+fn test_a_takeover_row_missing_its_calculation_is_no_takeover() {
+    let at = Utc.with_ymd_and_hms(2026, 9, 25, 8, 0, 0).unwrap();
+    assert!(
+        takeover_of(
+            at,
+            None,
+            Some(&serde_json::json!({ "kind": "portal" })),
+            None
+        )
+        .is_none()
     );
 }

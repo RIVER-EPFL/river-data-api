@@ -365,6 +365,7 @@ pub const CLEANUP_DELETED_TABLES: &[&str] = &[
     "parameter_group_members",
     "parameter_groups",
     "tool_script_activations",
+    "tool_script_commissions",
     "tool_script_versions",
     "tool_scripts",
     "constants",
@@ -441,6 +442,8 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         // against a calculation that theme never installed.
         "DELETE FROM tool_script_activations a USING tool_scripts s \
           WHERE a.tool_script_id = s.id AND s.created_by IS DISTINCT FROM 'seed'",
+        "DELETE FROM tool_script_commissions c USING tool_scripts s \
+          WHERE c.tool_script_id = s.id AND s.created_by IS DISTINCT FROM 'seed'",
         "UPDATE tool_scripts SET active_version_id = NULL WHERE created_by IS DISTINCT FROM 'seed'",
         "DELETE FROM tool_script_versions v USING tool_scripts s \
           WHERE v.tool_script_id = s.id AND s.created_by IS DISTINCT FROM 'seed'",

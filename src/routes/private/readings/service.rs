@@ -5444,20 +5444,21 @@ pub async fn assemble_records(
     let override_ledgers = load_override_ledgers(db, &stream_ids, time).await?;
     let run_sources = fetch_run_sources(db, rows).await?;
     let (mut calculations, formula_versions) = fetch_calculations(db, rows).await?;
-    let (retired_by_id, retired_by_name) = fetch_decommissions(
+    let retired = fetch_decommissions(
         db,
         &calculations
             .values()
             .map(|c| c.tool_script_id)
-            .collect::<Vec<_>>(),
-        &run_sources
-            .values()
-            .map(|(_, tool)| tool.clone())
+            .chain(
+                run_sources
+                    .values()
+                    .filter_map(|(_, calculation)| *calculation),
+            )
             .collect::<Vec<_>>(),
     )
     .await?;
     for calc in calculations.values_mut() {
-        calc.decommissioned = retired_by_id.get(&calc.tool_script_id).cloned();
+        calc.decommissioned = retired.get(&calc.tool_script_id).cloned();
     }
     let links = fetch_formula_links(db, rows).await?;
     let served = fetch_served_values(db, rows, &links, time).await?;
@@ -5567,7 +5568,9 @@ pub async fn assemble_records(
         let computation = if blob.is_some() || entered_by.is_some() || sample.is_some() {
             let run = run_id_of(blob.as_ref()).and_then(|id| run_sources.get(&id));
             let run_source = run.map(|(source, _)| source.clone());
-            let decommissioned = run.and_then(|(_, tool)| retired_by_name.get(tool).cloned());
+            let decommissioned = run
+                .and_then(|(_, calculation)| *calculation)
+                .and_then(|c| retired.get(&c).cloned());
             Some(ComputationInfo {
                 sample_id: sample.map(|s| s.id),
                 created_by: entered_by,
@@ -5763,12 +5766,14 @@ pub(super) async fn fetch_consumed_sets(
                 continue;
             };
             newest.entry(row.stream_id).or_insert_with(|| set.clone());
-            behind.entry(row.stream_id).or_insert_with(|| CaptureDecision {
-                id: row.id,
-                seq: row.seq,
-                kind: row.kind.clone(),
-                job_id: row.job_id,
-            });
+            behind
+                .entry(row.stream_id)
+                .or_insert_with(|| CaptureDecision {
+                    id: row.id,
+                    seq: row.seq,
+                    kind: row.kind.clone(),
+                    job_id: row.job_id,
+                });
             first.insert(row.stream_id, set);
         }
         for (stream_id, set) in newest {
@@ -6156,11 +6161,14 @@ pub(super) async fn fetch_slot_holds(
     Ok(out)
 }
 
-/// The minting path and calculation name of every tool run the rows' provenance blobs name.
+/// The minting path and calculation of every tool run the rows' provenance blobs name: the run's
+/// calculation by the version it pinned, since a decommission renames the calculation the run
+/// names.
 pub(super) async fn fetch_run_sources(
     db: &sea_orm::DatabaseConnection,
     rows: &[RawRow],
-) -> AppResult<HashMap<Uuid, (String, String)>> {
+) -> AppResult<HashMap<Uuid, (String, Option<Uuid>)>> {
+    use crate::routes::private::tools::models::version as tool_version;
     let run_ids: Vec<Uuid> = rows
         .iter()
         .filter_map(|r| run_id_of(r.provenance.as_ref()))
@@ -6170,18 +6178,88 @@ pub(super) async fn fetch_run_sources(
     if run_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let found: Vec<(Uuid, String, String)> = tool_run::Entity::find()
+    let found: Vec<(Uuid, String, serde_json::Value)> = tool_run::Entity::find()
         .filter(tool_run::Column::Id.is_in(run_ids))
         .select_only()
         .column(tool_run::Column::Id)
         .column(tool_run::Column::Source)
-        .column(tool_run::Column::ToolName)
+        .column(tool_run::Column::ToolVersion)
         .into_tuple()
         .all(db)
         .await?;
+    let version_of = |pinned: &serde_json::Value| {
+        pinned
+            .get("script_version_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<Uuid>().ok())
+    };
+    let versions: Vec<Uuid> = found.iter().filter_map(|(_, _, v)| version_of(v)).collect();
+    let calculations: HashMap<Uuid, Uuid> = if versions.is_empty() {
+        HashMap::new()
+    } else {
+        tool_version::Entity::find()
+            .filter(tool_version::Column::Id.is_in(versions))
+            .select_only()
+            .column(tool_version::Column::Id)
+            .column(tool_version::Column::ToolScriptId)
+            .into_tuple()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect()
+    };
     Ok(found
         .into_iter()
-        .map(|(id, source, tool)| (id, (source, tool)))
+        .map(|(id, source, pinned)| {
+            let calculation = version_of(&pinned).and_then(|v| calculations.get(&v).copied());
+            (id, (source, calculation))
+        })
+        .collect())
+}
+
+/// A `parameter_takeover` row of the change audit as a takeover, when it names the calculation.
+pub(super) fn takeover_of(
+    at: DateTime<Utc>,
+    by: Option<String>,
+    old: Option<&serde_json::Value>,
+    new: Option<&serde_json::Value>,
+) -> Option<super::models::ParameterTakeover> {
+    let text = |v: Option<&serde_json::Value>, key: &str| {
+        v.and_then(|v| v.get(key))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+    };
+    Some(super::models::ParameterTakeover {
+        at,
+        by,
+        kind: text(old, "kind").unwrap_or_default(),
+        computed_by: text(old, "computed_by").unwrap_or_default(),
+        calculation: text(new, "calculation")?,
+        calculation_id: text(new, "calculation_id").and_then(|id| id.parse().ok()),
+    })
+}
+
+/// The takeovers of a parameter's series, oldest first.
+pub(super) async fn takeovers_of<C: ConnectionTrait>(
+    db: &C,
+    parameter_id: Uuid,
+) -> AppResult<Vec<super::models::ParameterTakeover>> {
+    use crate::routes::private::change_audit::models as audit;
+    Ok(audit::Entity::find()
+        .filter(audit::Column::Subject.eq(format!("parameter:{parameter_id}")))
+        .filter(audit::Column::Change.eq("parameter_takeover"))
+        .order_by_asc(audit::Column::Seq)
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            takeover_of(
+                row.changed_at.with_timezone(&Utc),
+                row.changed_by,
+                row.old_value.as_ref(),
+                row.new_value.as_ref(),
+            )
+        })
         .collect())
 }
 
@@ -6198,49 +6276,31 @@ pub(super) fn decommission_of(
     })
 }
 
-/// The decommissioned calculations among those named, keyed by id and by name: a formula value
-/// names its calculation by id, a run by the name it was executed under.
+/// The decommissioned calculations among those named, keyed by id.
 pub(super) async fn fetch_decommissions(
     db: &sea_orm::DatabaseConnection,
     ids: &[Uuid],
-    names: &[String],
-) -> AppResult<(HashMap<Uuid, Decommission>, HashMap<String, Decommission>)> {
+) -> AppResult<HashMap<Uuid, Decommission>> {
     use crate::routes::private::tools::models::script as tool_script;
-    if ids.is_empty() && names.is_empty() {
-        return Ok((HashMap::new(), HashMap::new()));
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    type Row = (
-        Uuid,
-        String,
-        Option<DateTime<Utc>>,
-        Option<String>,
-        Option<String>,
-    );
+    type Row = (Uuid, Option<DateTime<Utc>>, Option<String>, Option<String>);
     let found: Vec<Row> = tool_script::Entity::find()
         .filter(tool_script::Column::DecommissionedAt.is_not_null())
-        .filter(
-            Condition::any()
-                .add(tool_script::Column::Id.is_in(ids.iter().copied()))
-                .add(tool_script::Column::Name.is_in(names.iter().cloned())),
-        )
+        .filter(tool_script::Column::Id.is_in(ids.iter().copied()))
         .select_only()
         .column(tool_script::Column::Id)
-        .column(tool_script::Column::Name)
         .column(tool_script::Column::DecommissionedAt)
         .column(tool_script::Column::DecommissionedBy)
         .column(tool_script::Column::DecommissionReason)
         .into_tuple()
         .all(db)
         .await?;
-    let mut by_id = HashMap::new();
-    let mut by_name = HashMap::new();
-    for (id, name, at, by, reason) in found {
-        if let Some(decommission) = decommission_of(at, by, reason) {
-            by_id.insert(id, decommission.clone());
-            by_name.insert(name, decommission);
-        }
-    }
-    Ok((by_id, by_name))
+    Ok(found
+        .into_iter()
+        .filter_map(|(id, at, by, reason)| decommission_of(at, by, reason).map(|d| (id, d)))
+        .collect())
 }
 
 /// A calculation formula as `(id, code, name, output_parameter_id, tool_script_id)`.
@@ -10882,7 +10942,8 @@ impl GrabWrite<'_> {
             (HashMap::new(), 0)
         };
         let outcome = if self.replaces() {
-            self.hold_kept_and_withdraw_dropped(txn, edit_set_id).await?
+            self.hold_kept_and_withdraw_dropped(txn, edit_set_id)
+                .await?
         } else {
             ReplaceOutcome {
                 replaced: 0,

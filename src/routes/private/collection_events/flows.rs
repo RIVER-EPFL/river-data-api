@@ -10,8 +10,8 @@ use sea_orm::sea_query::{
     Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, QueryFilter, QuerySelect,
-    Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, QueryFilter,
+    QuerySelect, Statement,
 };
 use uuid::Uuid;
 

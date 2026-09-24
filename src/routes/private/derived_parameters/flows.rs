@@ -261,7 +261,11 @@ fn fills_by_calculation(
         if !filled.contains(&(gap.site_id, gap.time)) {
             continue;
         }
-        let at = fills.entry(gap.tool_script_id).or_default().entry(gap.site_id).or_default();
+        let at = fills
+            .entry(gap.tool_script_id)
+            .or_default()
+            .entry(gap.site_id)
+            .or_default();
         if gap.backfill {
             at.backfilled += 1;
             continue;

@@ -501,7 +501,10 @@ async fn correcting_a_shared_step_mints_a_version_for_each_declaring_calculation
                 &format!("SELECT count(*)::text FROM reprocessing_jobs WHERE dedupe_key = '{key}'"),
             )
             .await;
-            assert_eq!(queued, "1", "the values {calculation}'s replaced version made are queued: {key}");
+            assert_eq!(
+                queued, "1",
+                "the values {calculation}'s replaced version made are queued: {key}"
+            );
         }
     }
 }

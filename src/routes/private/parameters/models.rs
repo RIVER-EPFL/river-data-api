@@ -45,6 +45,19 @@ pub struct Model {
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update))]
     pub unpublished_by: Option<String>,
+    /// The decommissioned calculation that last published this row, while no live calculation
+    /// publishes it (Q299). Read from the formulas on every fetch, never stored.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub decommissioned_by: Option<DecommissionedBy>,
+}
+
+/// A decommissioned calculation that published a parameter, and when it was decommissioned.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct DecommissionedBy {
+    pub tool_script_id: Uuid,
+    pub calculation: String,
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

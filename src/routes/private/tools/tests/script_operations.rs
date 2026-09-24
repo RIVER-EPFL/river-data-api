@@ -188,6 +188,26 @@ fn a_decommissioned_calculation_is_refused_naming_the_decommission() {
     }
 }
 
+#[test]
+fn test_decommissioned_name_frees_the_name_and_counts_on_when_taken() {
+    use super::decommissioned_name;
+    let on = chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+    let none = std::collections::HashSet::new();
+    assert_eq!(
+        decommissioned_name("pco2", on, &none),
+        "pco2_decommissioned_20260924"
+    );
+    let taken: std::collections::HashSet<String> = [
+        "pco2_decommissioned_20260924".to_string(),
+        "pco2_decommissioned_20260924_2".to_string(),
+    ]
+    .into();
+    assert_eq!(
+        decommissioned_name("pco2", on, &taken),
+        "pco2_decommissioned_20260924_3"
+    );
+}
+
 use super::{FormulaWrite, codes_held_elsewhere, plan_formula_set, steps_taken_back};
 
 fn id(n: u128) -> uuid::Uuid {

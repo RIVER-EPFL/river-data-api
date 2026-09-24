@@ -18,15 +18,15 @@ use super::models::script as script_entity;
 use super::models::script::{ToolScript, ToolScriptList};
 use super::models::version::ToolScriptVersion;
 use super::models::{
-    ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth,
-    CalculationSites, ClosureQuery, ClosureResponse, CreateScriptRequest, CreateVersionRequest,
+    ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth, CalculationSites,
+    ClosureQuery, ClosureResponse, CommissionRecord, CreateScriptRequest, CreateVersionRequest,
     CreateVersionResponse, DecommissionRequest, DraftRunFailure, DraftRunFailureKind,
     DraftRunRequest, DraftRunResponse, DraftRunResults, Engine, FormulaDraftRunRequest,
     FormulaDraftRunResponse, FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse,
-    LintFinding, MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse,
-    SavedFormula, SavedSharedStep, ToolCalculation, ToolDescriptor, ToolResult,
-    UpdateScriptRequest, ValidateResponse, VersionLedgerRow, VersionUsage, parse_manifest,
-    reconcile_manifest,
+    LintFinding, MissingConstant, RecommissionRequest, RecommissionResponse, RunTrace,
+    SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula, SavedSharedStep, TakeoverConflict,
+    ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse,
+    VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
 };
 use super::service::{
     FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
@@ -37,8 +37,7 @@ use super::service::{
     load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
     mint_formula_version, normalise_name, normalised_json, plan_formula_set, reads_of_former,
     refuse_decommissioned, renames_of, render, replicated_for, require_context_in_scope,
-    run_stored_cases, run_tool_body, runner_runtime, stamp_decommission, stored_version_content,
-    take_back_steps,
+    run_stored_cases, run_tool_body, runner_runtime, stored_version_content, take_back_steps,
 };
 use crate::common::AppState;
 use crate::common::middleware::{AuthContext, ProjectScope, scope_site_ids};
@@ -376,17 +375,47 @@ pub async fn decommission_script(
     Json(payload): Json<DecommissionRequest>,
 ) -> AppResult<Json<ToolScript>> {
     let reason = decommission_reason(&payload.reason)?;
-    let existing = super::models::script::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("tool script {id} not found")))?;
-    refuse_decommissioned(&existing.name, existing.decommissioned_at)?;
     let by = crate::common::actor::label(&auth);
-    if !stamp_decommission(&state.db, id, &by, &reason).await? {
-        let now = load_script(&state, id).await?;
-        refuse_decommissioned(&now.name, now.decommissioned_at)?;
-    }
+    super::service::decommission(&state.db, id, &by, &reason).await?;
     Ok(Json(load_script(&state, id).await?))
+}
+
+/// Bring a decommissioned calculation back (Q279), switched off: an administrator switches it on
+/// once it should fire again. It gets the name it held back unless another calculation took it
+/// meanwhile. The recommission records who, when and why. Requires Administrator.
+#[utoipa::path(post, path = "/api/tool_scripts/{id}/recommission", params(("id" = Uuid, Path)),
+    request_body = RecommissionRequest,
+    responses(
+        (status = 200, body = RecommissionResponse),
+        (status = 400, description = "The reason is blank"),
+        (status = 404, description = "No such calculation"),
+        (status = 409, description = "Not decommissioned"),
+    ), tag = "tool_scripts")]
+pub async fn recommission_script(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<RecommissionRequest>,
+) -> AppResult<Json<RecommissionResponse>> {
+    let reason = decommission_reason(&payload.reason)?;
+    let by = crate::common::actor::label(&auth);
+    let name_restored = super::service::recommission(&state.db, id, &by, &reason).await?;
+    Ok(Json(RecommissionResponse {
+        calculation: load_script(&state, id).await?,
+        name_restored,
+    }))
+}
+
+/// A calculation's decommissions and recommissions, newest first. Requires Administrator.
+#[utoipa::path(get, path = "/api/tool_scripts/{id}/commissions", params(("id" = Uuid, Path)),
+    responses((status = 200, body = [CommissionRecord])), tag = "tool_scripts")]
+pub async fn list_commissions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<CommissionRecord>>> {
+    Ok(Json(
+        super::service::commission_history(&state.db, id).await?,
+    ))
 }
 
 /// Append an immutable version. Refused when the lint finds forbidden constructs or a syntax
@@ -1118,6 +1147,7 @@ async fn refuse_reads_of_former(
         (status = 200, description = "The set is saved and one version activated", body = SaveFormulaSetResponse),
         (status = 400, description = "A formula the set refuses, a code another calculation holds, or a calculation that is not formula-engined"),
         (status = 404, description = "No such calculation"),
+        (status = 409, description = "An output code would take over a column something else computed; confirm it in `take_over`", body = TakeoverConflict),
     ),
     tag = "tool_scripts")]
 pub async fn save_formula_set(
@@ -1171,9 +1201,15 @@ pub async fn save_formula_set(
         .map(|f| (f.id, f.code.clone()))
         .collect();
     let writes = plan_formula_set(&stored, &named).map_err(AppError::BadRequest)?;
+    let takeovers =
+        super::service::plan_takeovers(&txn, id, &payload.formulas, &payload.take_over).await?;
+    super::service::release_taken_over(&txn, &takeovers).await?;
     let codes: Vec<String> = named.iter().map(|(_, code)| code.clone()).collect();
     let held = formula_codes_held_elsewhere(&txn, id, &codes).await?;
     codes_held_elsewhere(&held).map_err(AppError::BadRequest)?;
+    // A formula taking over a column is written as a step and linked after, so the catalog guard,
+    // which refuses a code something else declared, never meets the code it was confirmed for.
+    let taking = |i: usize| takeovers.iter().any(|t| t.code == payload.formulas[i].code);
 
     let mut created = 0usize;
     let mut updated = 0usize;
@@ -1185,16 +1221,24 @@ pub async fn save_formula_set(
                 deleted += 1;
             }
             FormulaWrite::Create(i) => {
-                CalculationFormula::create(&txn, create_model(id, &payload.formulas[i])).await?;
+                let mut model = create_model(id, &payload.formulas[i]);
+                if taking(i) {
+                    model.intermediate = Some(true);
+                }
+                CalculationFormula::create(&txn, model).await?;
                 created += 1;
             }
             FormulaWrite::Update(formula_id, i) => {
-                CalculationFormula::update(&txn, formula_id, update_model(&payload.formulas[i]))
-                    .await?;
+                let mut model = update_model(&payload.formulas[i]);
+                if taking(i) {
+                    model.intermediate = Some(Some(true));
+                }
+                CalculationFormula::update(&txn, formula_id, model).await?;
                 updated += 1;
             }
         }
     }
+    super::service::link_taken_over(&txn, id, &script.name, &takeovers, &actor).await?;
 
     // One version for the whole save, whatever it touched.
     let version_id = mint_formula_version(&txn, id, Some(&actor)).await?;
@@ -1245,6 +1289,7 @@ pub async fn save_formula_set(
         deleted,
         migrated,
         given_up,
+        taken_over: takeovers.into_iter().map(|t| t.code).collect(),
     }))
 }
 
@@ -1321,6 +1366,8 @@ pub fn script_routes() -> Router<AppState> {
         .route("/tool_scripts", get(list_scripts).post(create_script))
         .route("/tool_scripts/{id}", get(get_script).patch(update_script))
         .route("/tool_scripts/{id}/decommission", post(decommission_script))
+        .route("/tool_scripts/{id}/recommission", post(recommission_script))
+        .route("/tool_scripts/{id}/commissions", get(list_commissions))
         .route("/tool_scripts/draft_run", post(draft_run))
         .route(
             "/tool_scripts/{id}/formulas/draft_run",

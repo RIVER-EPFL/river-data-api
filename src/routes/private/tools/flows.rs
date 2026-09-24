@@ -341,6 +341,17 @@ pub fn output_skip_reason(
     None
 }
 
+/// The outputs a run that saved nothing reports as skipped: the ones it owned, less those a refusal
+/// already explains. An output skipped as another arm's was never the run's to produce.
+#[must_use]
+pub fn unexplained_outputs(owned: &[(String, Uuid)], refused: &[String]) -> Vec<(String, Uuid)> {
+    owned
+        .iter()
+        .filter(|(key, _)| !refused.iter().any(|r| r == key))
+        .cloned()
+        .collect()
+}
+
 /// The outputs an audit compares at a visit: the ones [`output_skip_reason`] lets the chain write,
 /// so every finding raised is one a recompute can act on.
 #[must_use]
@@ -1010,11 +1021,7 @@ async fn walk_event(
             let reason = "run produced no savable output".to_string();
             // A refused output already carries the arithmetic that stopped it; the generic reason
             // would replace it with a vaguer one.
-            let unexplained: Vec<(String, Uuid)> = saved_outputs
-                .iter()
-                .filter(|(key, _)| !calculation.refused.iter().any(|r| r == key))
-                .cloned()
-                .collect();
+            let unexplained = unexplained_outputs(&owned_outputs, &calculation.refused);
             outcome.findings_raised +=
                 note_skip(state, pass, &event, &tool.name, &unexplained, &reason).await?;
             outcome.skipped.push((tool.name.clone(), reason));

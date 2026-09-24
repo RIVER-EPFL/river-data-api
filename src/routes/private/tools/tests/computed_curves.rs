@@ -44,7 +44,12 @@ fn formula_manifest() -> Manifest {
 fn test_computed_curves_names_only_the_output_that_read_the_slot() {
     let curve = Uuid::new_v4();
     let formulas = [
-        formula("x", "raw * curve_slope + curve_intercept", Some("corr"), false),
+        formula(
+            "x",
+            "raw * curve_slope + curve_intercept",
+            Some("corr"),
+            false,
+        ),
         formula("y", "raw * 2", None, false),
     ];
     let snapshots = [snapshot("corr", Some(curve), 1.5)];
@@ -62,7 +67,12 @@ fn test_computed_curves_names_only_the_output_that_read_the_slot() {
 fn test_computed_curves_follows_the_steps_an_output_reads() {
     let curve = Uuid::new_v4();
     let formulas = [
-        formula("k", "raw * curve_slope + curve_intercept", Some("corr"), true),
+        formula(
+            "k",
+            "raw * curve_slope + curve_intercept",
+            Some("corr"),
+            true,
+        ),
         formula("z", "k * 2", None, false),
     ];
     let snapshots = [snapshot("corr", Some(curve), 1.5)];
@@ -74,7 +84,12 @@ fn test_computed_curves_follows_the_steps_an_output_reads() {
 fn test_computed_curves_names_a_curve_once_however_many_paths_reach_it() {
     let curve = Uuid::new_v4();
     let formulas = [
-        formula("k", "raw * curve_slope + curve_intercept", Some("corr"), true),
+        formula(
+            "k",
+            "raw * curve_slope + curve_intercept",
+            Some("corr"),
+            true,
+        ),
         formula("m", "k + 1", Some("corr"), true),
         formula("z", "k * m", None, false),
     ];
@@ -86,8 +101,18 @@ fn test_computed_curves_names_a_curve_once_however_many_paths_reach_it() {
 #[test]
 fn test_computed_curves_names_nothing_for_an_ad_hoc_slope_or_an_unfilled_slot() {
     let formulas = [
-        formula("x", "raw * curve_slope + curve_intercept", Some("corr"), false),
-        formula("w", "raw * curve_slope + curve_intercept", Some("other"), false),
+        formula(
+            "x",
+            "raw * curve_slope + curve_intercept",
+            Some("corr"),
+            false,
+        ),
+        formula(
+            "w",
+            "raw * curve_slope + curve_intercept",
+            Some("other"),
+            false,
+        ),
     ];
     let snapshots = [snapshot("corr", None, 1.5)];
     assert!(computed_curves("x", &formulas, &formula_manifest(), &snapshots).is_empty());
@@ -117,13 +142,19 @@ fn test_computed_curves_reads_a_scripts_aggregate_through_its_replicates_curve()
 
 #[test]
 fn test_output_key_of_finds_the_formula_writing_the_code_or_the_bound_output() {
-    let formulas = [formula("x", "raw", None, false), formula("k", "raw", None, true)];
+    let formulas = [
+        formula("x", "raw", None, false),
+        formula("k", "raw", None, true),
+    ];
     let parameter = Uuid::new_v4();
     assert_eq!(
         output_key_of(parameter, "X", &formulas, &formula_manifest()).as_deref(),
         Some("x")
     );
-    assert_eq!(output_key_of(parameter, "K", &formulas, &formula_manifest()), None);
+    assert_eq!(
+        output_key_of(parameter, "K", &formulas, &formula_manifest()),
+        None
+    );
     let tool = manifest(serde_json::json!({
         "label": "doc",
         "params": [],
@@ -132,7 +163,10 @@ fn test_output_key_of_finds_the_formula_writing_the_code_or_the_bound_output() {
             { "key": "by_id", "label": "B", "parameter_id": parameter }
         ],
     }));
-    assert_eq!(output_key_of(parameter, "DOC", &[], &tool).as_deref(), Some("by_id"));
+    assert_eq!(
+        output_key_of(parameter, "DOC", &[], &tool).as_deref(),
+        Some("by_id")
+    );
     assert_eq!(
         output_key_of(Uuid::new_v4(), "DOC", &[], &tool).as_deref(),
         Some("by_code")

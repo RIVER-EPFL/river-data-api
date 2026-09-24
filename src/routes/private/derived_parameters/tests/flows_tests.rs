@@ -3,7 +3,12 @@ use sea_orm::sea_query::PostgresQueryBuilder;
 use uuid::Uuid;
 
 fn missed(tool: Uuid, site: Uuid, time: chrono::DateTime<chrono::Utc>) -> super::Gap {
-    super::Gap { tool_script_id: tool, site_id: site, time, backfill: false }
+    super::Gap {
+        tool_script_id: tool,
+        site_id: site,
+        time,
+        backfill: false,
+    }
 }
 
 fn sql(since: Option<chrono::DateTime<chrono::Utc>>) -> String {
@@ -98,10 +103,20 @@ fn test_gap_fill_report_into_keeps_the_callers_entries() {
 #[test]
 fn test_fills_by_calculation_credits_each_gap_to_its_own_calculation() {
     use std::collections::HashSet;
-    let (pco2, doc, saxon, sion) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(10), Uuid::from_u128(11));
+    let (pco2, doc, saxon, sion) = (
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        Uuid::from_u128(10),
+        Uuid::from_u128(11),
+    );
     let at: chrono::DateTime<chrono::Utc> = "2025-06-01T10:00:00Z".parse().unwrap();
     let later = at + chrono::Duration::hours(1);
-    let gaps = [missed(pco2, saxon, at), missed(doc, saxon, at), missed(pco2, saxon, later), missed(pco2, sion, at)];
+    let gaps = [
+        missed(pco2, saxon, at),
+        missed(doc, saxon, at),
+        missed(pco2, saxon, later),
+        missed(pco2, sion, at),
+    ];
     let filled: HashSet<_> = [(saxon, at), (saxon, later)].into_iter().collect();
 
     let fills = super::fills_by_calculation(&gaps, &filled);
@@ -128,7 +143,10 @@ fn test_fills_by_calculation_lists_instants_up_to_the_cap_and_counts_them_all() 
     let fills = super::fills_by_calculation(&gaps, &filled);
 
     assert_eq!(fills[&pco2][&saxon].values, super::FILL_INSTANTS_LISTED + 5);
-    assert_eq!(fills[&pco2][&saxon].instants.len(), super::FILL_INSTANTS_LISTED);
+    assert_eq!(
+        fills[&pco2][&saxon].instants.len(),
+        super::FILL_INSTANTS_LISTED
+    );
 }
 
 #[test]
@@ -136,11 +154,19 @@ fn test_gap_fill_report_names_what_each_calculation_had_filled() {
     use crate::routes::private::reprocessing_jobs::service::JobReport;
     let (pco2, saxon) = (Uuid::from_u128(1), Uuid::from_u128(10));
     let at: chrono::DateTime<chrono::Utc> = "2025-06-01T10:00:00Z".parse().unwrap();
-    let mut gaps = super::GapFill { found: 1, filled: 1, ..Default::default() };
-    gaps.by_calculation
-        .entry(pco2)
-        .or_default()
-        .insert(saxon, super::SiteFills { values: 1, backfilled: 2, instants: vec![at] });
+    let mut gaps = super::GapFill {
+        found: 1,
+        filled: 1,
+        ..Default::default()
+    };
+    gaps.by_calculation.entry(pco2).or_default().insert(
+        saxon,
+        super::SiteFills {
+            values: 1,
+            backfilled: 2,
+            instants: vec![at],
+        },
+    );
     let report = gaps.report_into(JobReport::new()).to_value();
     assert_eq!(
         report["scope"]["filled_by_calculation"],
@@ -172,12 +198,22 @@ fn test_fills_by_calculation_counts_a_backfill_apart() {
     let at: chrono::DateTime<chrono::Utc> = "2025-06-01T10:00:00Z".parse().unwrap();
     let earlier = at - chrono::Duration::days(1);
     let gaps = [
-        super::Gap { backfill: true, ..missed(pco2, saxon, earlier) },
+        super::Gap {
+            backfill: true,
+            ..missed(pco2, saxon, earlier)
+        },
         missed(pco2, saxon, at),
     ];
     let filled: HashSet<_> = [(saxon, earlier), (saxon, at)].into_iter().collect();
 
     let fills = super::fills_by_calculation(&gaps, &filled);
 
-    assert_eq!(fills[&pco2][&saxon], super::SiteFills { values: 1, backfilled: 1, instants: vec![at] });
+    assert_eq!(
+        fills[&pco2][&saxon],
+        super::SiteFills {
+            values: 1,
+            backfilled: 1,
+            instants: vec![at]
+        }
+    );
 }

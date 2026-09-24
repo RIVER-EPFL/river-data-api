@@ -33,6 +33,7 @@ use crate::common::middleware::require_write_data;
 use crate::common::middleware::scope_site_ids;
 use crate::error::AppError;
 use crate::error::AppResult;
+use crate::routes::private::collection_events::flows::enqueue_at_slot;
 use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::parameters;
@@ -53,7 +54,6 @@ use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::resolver;
 use crate::routes::private::sensors::models::ResolvedOwner;
 use crate::routes::private::sensors::service::resolve_slot_owner_for_times;
-use crate::routes::private::collection_events::flows::enqueue_at_slot;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::resolve_site_with_project;
 use crate::routes::service::ACTION_BODY_LIMIT;
@@ -1011,6 +1011,10 @@ pub async fn get_reading_provenance(
         decimal_places: slot.as_ref().and_then(|s| s.3),
         duplicate_slot: records.len() > 1,
         records,
+        takeovers: match parameter_id {
+            Some(parameter_id) => super::service::takeovers_of(&state.db, parameter_id).await?,
+            None => Vec::new(),
+        },
     }))
 }
 

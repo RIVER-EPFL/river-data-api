@@ -1567,6 +1567,26 @@ pub struct ProvenanceResponse {
     pub duplicate_slot: bool,
     /// One record per stream serving the instant.
     pub records: Vec<ProvenanceRecord>,
+    /// Every time a calculation took the parameter's series over (Q299), oldest first. It holds
+    /// for every value under the parameter, before and after, so no stored record is rewritten.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub takeovers: Vec<ParameterTakeover>,
+}
+
+/// A calculation continuing a parameter's series, as the change audit records it.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct ParameterTakeover {
+    pub at: DateTime<Utc>,
+    #[schema(required)]
+    pub by: Option<String>,
+    /// What computed the series before: `decommissioned` (a calculation) or `portal`.
+    pub kind: String,
+    /// The decommissioned calculation's name, or the portal function.
+    pub computed_by: String,
+    /// The calculation computing it since.
+    pub calculation: String,
+    #[schema(required)]
+    pub calculation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

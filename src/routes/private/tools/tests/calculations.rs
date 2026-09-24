@@ -95,9 +95,7 @@ fn two_subjects_at_once_are_refused_rather_than_ranked() {
 fn janitor_fills_are_summed_per_calculation_and_site_across_runs() {
     use uuid::Uuid;
     let (pco2, saxon, sion) = (Uuid::from_u128(1), Uuid::from_u128(10), Uuid::from_u128(11));
-    let run = |sites: serde_json::Value| {
-        serde_json::json!({ "scope": { "filled_by_calculation": { pco2.to_string(): sites } } })
-    };
+    let run = |sites: serde_json::Value| serde_json::json!({ "scope": { "filled_by_calculation": { pco2.to_string(): sites } } });
     let details = [
         run(serde_json::json!({ saxon.to_string(): { "values": 3, "instants": [] } })),
         run(serde_json::json!({

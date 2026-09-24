@@ -87,6 +87,8 @@ impl CRUDOperations for ParameterOperations {
     ) -> Result<(), ApiError> {
         let given_up = given_up_codes(db).await.map_err(ApiError::database)?;
         entity.unpublished_by = unpublished_by(entity.id, &given_up);
+        let publishers = publishers(db).await.map_err(ApiError::database)?;
+        entity.decommissioned_by = decommissioned_by(entity.id, &publishers);
         Ok(())
     }
 
@@ -99,8 +101,10 @@ impl CRUDOperations for ParameterOperations {
             return Ok(());
         }
         let given_up = given_up_codes(db).await.map_err(ApiError::database)?;
+        let publishers = publishers(db).await.map_err(ApiError::database)?;
         for entity in entities.iter_mut() {
             entity.unpublished_by = unpublished_by(entity.id, &given_up);
+            entity.decommissioned_by = decommissioned_by(entity.id, &publishers);
         }
         Ok(())
     }
@@ -157,6 +161,73 @@ async fn given_up_codes<C: ConnectionTrait>(db: &C) -> Result<Vec<GivenUp>, sea_
                     .tool_script_id
                     .and_then(|id| labels.get(&id).cloned())
                     .unwrap_or(formula.name),
+            })
+        })
+        .collect())
+}
+
+/// A calculation's formula that publishes a catalog parameter, with the calculation's decommission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Publisher {
+    pub parameter_id: Uuid,
+    pub tool_script_id: Uuid,
+    pub calculation: String,
+    pub decommissioned_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The decommissioned calculation a parameter reads as, where every calculation publishing it is
+/// decommissioned: the latest decommission names it. One live publisher, and it is computed.
+#[must_use]
+pub fn decommissioned_by(
+    parameter_id: Uuid,
+    publishers: &[Publisher],
+) -> Option<super::models::DecommissionedBy> {
+    let own: Vec<&Publisher> = publishers
+        .iter()
+        .filter(|p| p.parameter_id == parameter_id)
+        .collect();
+    if own.iter().any(|p| p.decommissioned_at.is_none()) {
+        return None;
+    }
+    own.into_iter()
+        .filter_map(|p| p.decommissioned_at.map(|at| (p, at)))
+        .max_by_key(|(_, at)| *at)
+        .map(|(p, at)| super::models::DecommissionedBy {
+            tool_script_id: p.tool_script_id,
+            calculation: p.calculation.clone(),
+            at,
+        })
+}
+
+/// Every calculation formula that publishes a catalog parameter, with its calculation's label and
+/// decommission.
+async fn publishers<C: ConnectionTrait>(db: &C) -> Result<Vec<Publisher>, sea_orm::DbErr> {
+    use crate::routes::private::tools::models::script;
+    let formulas = definition::Entity::find()
+        .filter(definition::Column::OutputParameterId.is_not_null())
+        .filter(definition::Column::ToolScriptId.is_not_null())
+        .all(db)
+        .await?;
+    if formulas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let script_ids: Vec<Uuid> = formulas.iter().filter_map(|f| f.tool_script_id).collect();
+    let scripts: std::collections::HashMap<Uuid, script::Model> = script::Entity::find()
+        .filter(script::Column::Id.is_in(script_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s))
+        .collect();
+    Ok(formulas
+        .into_iter()
+        .filter_map(|formula| {
+            let script = scripts.get(&formula.tool_script_id?)?;
+            Some(Publisher {
+                parameter_id: formula.output_parameter_id?,
+                tool_script_id: script.id,
+                calculation: script.label.clone(),
+                decommissioned_at: script.decommissioned_at,
             })
         })
         .collect())

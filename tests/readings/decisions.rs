@@ -690,9 +690,8 @@ async fn a_grab_replace_records_its_decisions_as_one_set_the_save_rolls_back() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let rows = f
-        .db
-        .query_all_raw(Statement::from_string(
+    let rows =
+        f.db.query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, withdrawn_at IS NOT NULL AS withdrawn FROM readings \

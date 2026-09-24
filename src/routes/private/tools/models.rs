@@ -49,6 +49,49 @@ pub mod activation {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod commission {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    /// One decommission or recommission of a calculation, under the name it held before it.
+    /// Append-only, like the activations: a recommission is another row, never an edit.
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "tool_script_commissions")]
+    #[crudcrate(
+        api_struct = "ToolScriptCommission",
+        name_singular = "tool_script_commission",
+        name_plural = "tool_script_commissions"
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        pub tool_script_id: Uuid,
+        /// `decommissioned` or `recommissioned`.
+        pub event: String,
+        /// The calculation's name before the event: the one a decommission freed, or the one a
+        /// recommission left it under.
+        pub name: String,
+        pub actor: String,
+        #[crudcrate(exclude(create, update))]
+        pub at: chrono::DateTime<chrono::Utc>,
+        pub reason: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod script {
     use crudcrate::EntityToModels;
     use sea_orm::entity::prelude::*;
@@ -104,7 +147,8 @@ pub mod script {
         /// `script` (R in the sandbox) or `formula` (the definitions attached to the calculation).
         #[crudcrate(filterable, sortable, on_create = "script".to_string())]
         pub engine: String,
-        /// When the calculation was decommissioned. Set, it is never enabled again (Q272).
+        /// When the calculation was decommissioned. Set, it is not enabled until a recommission
+        /// clears it (Q279).
         #[crudcrate(exclude(create, update), filterable, sortable)]
         pub decommissioned_at: Option<chrono::DateTime<chrono::Utc>>,
         /// The administrator who decommissioned it, from the authenticated caller.
@@ -2081,6 +2125,32 @@ pub struct DecommissionRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct RecommissionRequest {
+    /// Why the calculation is brought back; recorded with who and when.
+    pub reason: String,
+}
+
+/// One decommission or recommission, newest first in a history.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CommissionRecord {
+    /// `decommissioned` or `recommissioned`.
+    pub event: String,
+    /// The name the calculation held before the event.
+    pub name: String,
+    pub actor: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub reason: String,
+}
+
+/// A recommissioned calculation, and whether it got its name back: a name another calculation
+/// took meanwhile stays with that one.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RecommissionResponse {
+    pub calculation: ToolScript,
+    pub name_restored: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateVersionRequest {
     pub script: String,
     #[serde(default)]
@@ -2255,6 +2325,42 @@ pub struct SaveFormulaSetRequest {
     /// mints holds them and the version they supersede is the one the page was editing.
     #[serde(default)]
     pub shared_steps: Vec<SavedSharedStep>,
+    /// The output codes the author confirmed to take over (Q299): a decommissioned calculation's
+    /// column, or one the portal computed. An eligible code not named here is refused with a 409
+    /// whose detail is the [`Takeover`] list.
+    #[serde(default)]
+    pub take_over: Vec<String>,
+}
+
+/// A catalog parameter a save would take over, as the refusal names it for the confirm.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct Takeover {
+    pub code: String,
+    pub parameter_id: Uuid,
+    pub parameter_name: String,
+    pub units: String,
+    /// `decommissioned` or `portal`.
+    pub kind: String,
+    /// The decommissioned calculation's name, or the portal function that computed the column.
+    pub computed_by: String,
+    pub readings: i64,
+    #[schema(required)]
+    pub first_reading: Option<DateTime<Utc>>,
+    #[schema(required)]
+    pub last_reading: Option<DateTime<Utc>>,
+    pub source_systems: Vec<String>,
+}
+
+/// The body of the 409 a save answers with when an output would take over a column unconfirmed.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TakeoverConflict {
+    pub error: String,
+    pub detail: TakeoverDetail,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TakeoverDetail {
+    pub take_over: Vec<Takeover>,
 }
 
 /// What one set-level save wrote.
@@ -2274,6 +2380,9 @@ pub struct SaveFormulaSetResponse {
     /// nothing is deleted, so the entry says what stays behind and who still reads it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub given_up: Vec<GivenUpOutput>,
+    /// The codes this save took over, each recorded in `change_audit`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub taken_over: Vec<String>,
 }
 
 /// A catalog parameter a formula published until this save ticked it as a step.

@@ -305,6 +305,8 @@ pub fn validate_optional_time_range(
         private::tools::views::create_script,
         private::tools::views::update_script,
         private::tools::views::decommission_script,
+        private::tools::views::recommission_script,
+        private::tools::views::list_commissions,
         private::tools::views::create_version,
         private::tools::views::draft_run,
         private::tools::views::draft_run_formulas,

@@ -25,13 +25,14 @@ use super::models::script::{self, ToolScript};
 use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
 use super::models::{
-    ActiveTool, CalculationHealth, CalculationImpact, JanitorFill, CalculationRepair, CaseResult,
-    CatalogFindings, ClosureQuery, ComputedCurve, Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter,
-    LintFinding, Manifest, ManifestCurve, ManifestEventInput, ManifestOutput, ManifestSiteInput,
-    MissingConstant, ParamWhen, ParseCheck, ParseError, PinnedFormula, Produced, ResolvedBy,
-    ResolvedCurve, ResolvedParameter, RunOutcome, RunnerRuntime, ScannedName, ScriptInspection,
-    ScriptScan, SlotCoverage, StoredVersionContent, Subject, ToolScriptOperations, TraceCell,
-    TraceReduction, TraceStep, ValidateResponse, kind_accepts, parse_manifest,
+    ActiveTool, CalculationHealth, CalculationImpact, CalculationRepair, CaseResult,
+    CatalogFindings, ClosureQuery, ComputedCurve, Curve, CurveSnapshot, Engine, Evaluated,
+    ImpactParameter, JanitorFill, LintFinding, Manifest, ManifestCurve, ManifestEventInput,
+    ManifestOutput, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck, ParseError,
+    PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
+    RunnerRuntime, ScannedName, ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent,
+    Subject, ToolScriptOperations, TraceCell, TraceReduction, TraceStep, ValidateResponse,
+    kind_accepts, parse_manifest,
 };
 use super::staged::StagedVisit;
 use crate::common::AppState;
@@ -711,8 +712,8 @@ pub(super) fn decommission_reason(reason: &str) -> AppResult<String> {
     Ok(reason.to_string())
 }
 
-/// A decommissioned calculation is decommissioned once and never switched back on (Q272): the
-/// refusal names the decommission rather than leaving the constraint to answer.
+/// A decommissioned calculation is not switched back on until a recommission clears the stamp
+/// (Q279): the refusal names the decommission rather than leaving the constraint to answer.
 pub(super) fn refuse_decommissioned(
     name: &str,
     decommissioned_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -726,26 +727,200 @@ pub(super) fn refuse_decommissioned(
     )))
 }
 
-/// Stop a calculation at every site and record who, when and why, in one update. False when it was
-/// already decommissioned, so two decommissions racing record one.
-pub(super) async fn stamp_decommission(
+/// The name a decommission leaves a calculation under, freeing the one it held (Q300):
+/// `<name>_decommissioned_<yyyymmdd>`, counted on while another calculation holds it.
+pub(super) fn decommissioned_name(
+    name: &str,
+    on: chrono::NaiveDate,
+    taken: &std::collections::HashSet<String>,
+) -> String {
+    let base = format!("{name}_decommissioned_{}", on.format("%Y%m%d"));
+    (1..)
+        .map(|n| {
+            if n == 1 {
+                base.clone()
+            } else {
+                format!("{base}_{n}")
+            }
+        })
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or(base)
+}
+
+/// The names beginning with `prefix`, lower-cased as they are stored.
+async fn names_like<C: ConnectionTrait>(
+    conn: &C,
+    prefix: &str,
+) -> AppResult<std::collections::HashSet<String>> {
+    let names: Vec<String> = script::Entity::find()
+        .select_only()
+        .column(script::Column::Name)
+        .filter(script::Column::Name.starts_with(prefix))
+        .into_tuple()
+        .all(conn)
+        .await?;
+    Ok(names.into_iter().collect())
+}
+
+async fn locked_script<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<script::Model> {
+    script::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("tool script {id} not found")))
+}
+
+async fn record_commission<C: ConnectionTrait>(
+    conn: &C,
+    id: Uuid,
+    event: &str,
+    name: &str,
+    by: &str,
+    reason: &str,
+) -> AppResult<()> {
+    super::models::commission::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tool_script_id: Set(id),
+        event: Set(event.to_string()),
+        name: Set(name.to_string()),
+        actor: Set(by.to_string()),
+        at: Set(chrono::Utc::now()),
+        reason: Set(reason.to_string()),
+    }
+    .insert(conn)
+    .await?;
+    Ok(())
+}
+
+/// Stop a calculation at every site, free its name, and record who, when and why, in one
+/// transaction. A calculation already decommissioned is refused, so two racing record one.
+pub(super) async fn decommission(
     db: &DatabaseConnection,
     id: Uuid,
     by: &str,
     reason: &str,
-) -> AppResult<bool> {
+) -> AppResult<()> {
+    let txn = db.begin().await?;
+    let existing = locked_script(&txn, id).await?;
+    refuse_decommissioned(&existing.name, existing.decommissioned_at)?;
     let now = chrono::Utc::now();
-    let result = script::Entity::update_many()
+    let freed = decommissioned_name(
+        &existing.name,
+        now.date_naive(),
+        &names_like(&txn, &format!("{}_decommissioned_", existing.name)).await?,
+    );
+    script::Entity::update_many()
         .col_expr(script::Column::Enabled, Expr::value(false))
+        .col_expr(script::Column::Name, Expr::value(freed))
         .col_expr(script::Column::DecommissionedAt, Expr::value(now))
         .col_expr(script::Column::DecommissionedBy, Expr::value(by))
         .col_expr(script::Column::DecommissionReason, Expr::value(reason))
         .col_expr(script::Column::UpdatedAt, Expr::value(now))
         .filter(script::Column::Id.eq(id))
-        .filter(script::Column::DecommissionedAt.is_null())
-        .exec(db)
+        .exec(&txn)
         .await?;
-    Ok(result.rows_affected == 1)
+    record_commission(&txn, id, "decommissioned", &existing.name, by, reason).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Bring a decommissioned calculation back, switched off, under the name it held when it was
+/// decommissioned unless another calculation took that name meanwhile. True when the name came
+/// back.
+pub(super) async fn recommission(
+    db: &DatabaseConnection,
+    id: Uuid,
+    by: &str,
+    reason: &str,
+) -> AppResult<bool> {
+    let txn = db.begin().await?;
+    let existing = locked_script(&txn, id).await?;
+    if existing.decommissioned_at.is_none() {
+        return Err(AppError::Conflict(format!(
+            "Calculation '{}' is not decommissioned",
+            existing.name
+        )));
+    }
+    let held = super::models::commission::Entity::find()
+        .filter(super::models::commission::Column::ToolScriptId.eq(id))
+        .filter(super::models::commission::Column::Event.eq("decommissioned"))
+        .order_by_desc(super::models::commission::Column::At)
+        .one(&txn)
+        .await?
+        .map_or_else(|| existing.name.clone(), |c| c.name);
+    let taken = script::Entity::find()
+        .filter(script::Column::Name.eq(held.clone()))
+        .filter(script::Column::Id.ne(id))
+        .one(&txn)
+        .await?
+        .is_some();
+    let name = if taken { existing.name.clone() } else { held };
+    script::Entity::update_many()
+        .col_expr(script::Column::Name, Expr::value(name.clone()))
+        .col_expr(
+            script::Column::DecommissionedAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .col_expr(
+            script::Column::DecommissionedBy,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            script::Column::DecommissionReason,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(script::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(script::Column::Id.eq(id))
+        .exec(&txn)
+        .await?;
+    record_commission(&txn, id, "recommissioned", &existing.name, by, reason).await?;
+    txn.commit().await?;
+    Ok(!taken)
+}
+
+/// A calculation's decommissions and recommissions, newest first.
+pub(super) async fn commission_history(
+    db: &DatabaseConnection,
+    id: Uuid,
+) -> AppResult<Vec<super::models::CommissionRecord>> {
+    Ok(super::models::commission::Entity::find()
+        .filter(super::models::commission::Column::ToolScriptId.eq(id))
+        .order_by_desc(super::models::commission::Column::At)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|c| super::models::CommissionRecord {
+            event: c.event,
+            name: c.name,
+            actor: c.actor,
+            at: c.at,
+            reason: c.reason,
+        })
+        .collect())
+}
+
+/// Refuse a name a decommission freed and nothing has taken since, as decommissioned rather than
+/// unknown: a run or a link still naming it is told what happened to it.
+async fn refuse_freed_name(db: &DatabaseConnection, name: &str) -> AppResult<()> {
+    use super::models::commission;
+    let freed = commission::Entity::find()
+        .filter(commission::Column::Event.eq("decommissioned"))
+        .filter(commission::Column::Name.eq(name.to_lowercase()))
+        .order_by_desc(commission::Column::At)
+        .one(db)
+        .await?;
+    let Some(freed) = freed else {
+        return Ok(());
+    };
+    let still = script::Entity::find_by_id(freed.tool_script_id)
+        .one(db)
+        .await?;
+    match still {
+        Some(s) if s.decommissioned_at.is_some() => {
+            refuse_decommissioned(name, s.decommissioned_at)
+        }
+        _ => Ok(()),
+    }
 }
 
 pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<ActiveTool> {
@@ -759,10 +934,10 @@ pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<
             .eq(Func::lower(Expr::val(name))),
         )
         .to_owned();
-    let row = db
-        .query_one_raw(build(&query))
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Unknown tool: {name}")))?;
+    let Some(row) = db.query_one_raw(build(&query)).await? else {
+        refuse_freed_name(db, name).await?;
+        return Err(AppError::NotFound(format!("Unknown tool: {name}")));
+    };
     admit_run(name, row.try_get::<bool>("", "enabled")?)?;
     row_to_active(&row)
 }
@@ -4661,9 +4836,13 @@ pub(super) fn sum_janitor_fills(
             continue;
         };
         for (tool, sites) in by_tool {
-            let Ok(tool) = tool.parse::<Uuid>() else { continue };
+            let Ok(tool) = tool.parse::<Uuid>() else {
+                continue;
+            };
             for (site, fill) in sites.as_object().into_iter().flatten() {
-                let Ok(site) = site.parse::<Uuid>() else { continue };
+                let Ok(site) = site.parse::<Uuid>() else {
+                    continue;
+                };
                 if site_ids.is_some_and(|ids| !ids.contains(&site)) {
                     continue;
                 }
@@ -5251,6 +5430,447 @@ pub async fn formula_codes_held_elsewhere<C: ConnectionTrait>(
             (f.code, holder)
         })
         .collect())
+}
+
+// --- Taking over a catalog column (Q299) ---
+
+/// What a save knows about one output code it writes, to decide whether the code takes over a
+/// catalog parameter something else computed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeoverFacts {
+    pub code: String,
+    /// The calculation holding the code on another formula, and whether it is decommissioned.
+    pub code_holder: Option<(String, bool)>,
+    /// The units of the catalog parameter under the code, when there is one.
+    pub catalog_units: Option<String>,
+    /// Whether a formula publishes that parameter.
+    pub published: bool,
+    /// The portal function a group member records as having computed the parameter.
+    pub portal_function: Option<String>,
+    /// What computed the repeats, when a stream bound to the parameter declares a replicate family.
+    pub family: Option<FamilyRepeats>,
+    pub formula_units: String,
+}
+
+/// What the portal computed each repeat of a replicate family with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FamilyRepeats {
+    /// Every repeat is computed by this function.
+    Computed(String),
+    /// The repeats were typed; the portal computed only the mean over them.
+    Typed,
+    /// Some repeats computed and some typed, or the streams disagree.
+    Mixed,
+}
+
+/// What computed a family's repeats, over the `replicate_family` metadata of every stream bound
+/// to the parameter, or `None` when no stream declares one.
+#[must_use]
+pub fn family_repeats(families: &[serde_json::Value]) -> Option<FamilyRepeats> {
+    let per_stream: Vec<FamilyRepeats> = families
+        .iter()
+        .map(|family| {
+            let Some(members) = family
+                .get("member_calculations")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return FamilyRepeats::Typed;
+            };
+            let functions: Vec<Option<&str>> = members
+                .iter()
+                .map(|m| m.get("function").and_then(serde_json::Value::as_str))
+                .collect();
+            match functions.first() {
+                Some(Some(first)) if functions.iter().all(|f| f == &Some(*first)) => {
+                    FamilyRepeats::Computed((*first).to_string())
+                }
+                _ => FamilyRepeats::Mixed,
+            }
+        })
+        .collect();
+    let first = per_stream.first()?;
+    Some(if per_stream.iter().all(|r| r == first) {
+        first.clone()
+    } else {
+        FamilyRepeats::Mixed
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverVerdict {
+    /// Nothing to take over: the save writes the code as it always has.
+    Free,
+    /// A catalog column neither a formula nor the portal computed, measured or typed: the catalog
+    /// guard refuses it, confirmed or not.
+    Typed,
+    Eligible {
+        kind: &'static str,
+        computed_by: String,
+    },
+    Refused(String),
+}
+
+/// Whether an output code takes over a column, may be confirmed to, or is refused.
+#[must_use]
+pub fn takeover_verdict(f: &TakeoverFacts) -> TakeoverVerdict {
+    let decommissioned = match &f.code_holder {
+        Some((holder, false)) => {
+            return TakeoverVerdict::Refused(format!(
+                "{} is a formula of {holder}; a formula code is unique across calculations",
+                f.code
+            ));
+        }
+        Some((holder, true)) => Some(holder.clone()),
+        None => None,
+    };
+    let Some(units) = &f.catalog_units else {
+        return match decommissioned {
+            Some(holder) => TakeoverVerdict::Refused(format!(
+                "{} is a step of the decommissioned calculation {holder}, which publishes no column",
+                f.code
+            )),
+            None => TakeoverVerdict::Free,
+        };
+    };
+    // A family's readings are its repeats, so what computed them decides, not the mean's calculation.
+    let portal = match &f.family {
+        None => f.portal_function.clone(),
+        Some(FamilyRepeats::Computed(function)) => Some(function.clone()),
+        Some(FamilyRepeats::Typed) => None,
+        Some(FamilyRepeats::Mixed) if decommissioned.is_none() && !f.published => {
+            return TakeoverVerdict::Refused(format!(
+                "{} is a replicate family whose repeats the portal did not all compute with one \
+                 calculation; it cannot be taken over",
+                f.code
+            ));
+        }
+        Some(FamilyRepeats::Mixed) => None,
+    };
+    let (kind, computed_by) = match (decommissioned, portal) {
+        (Some(holder), _) => ("decommissioned", holder),
+        (None, _) if f.published => return TakeoverVerdict::Free,
+        (None, Some(function)) => ("portal", function),
+        (None, None) => return TakeoverVerdict::Typed,
+    };
+    if units.trim() != f.formula_units.trim() {
+        return TakeoverVerdict::Refused(format!(
+            "{} is stored in {}, and the formula gives {}; taking it over continues one series, so \
+             the units must match",
+            f.code,
+            display_units(units),
+            display_units(&f.formula_units)
+        ));
+    }
+    TakeoverVerdict::Eligible { kind, computed_by }
+}
+
+fn display_units(units: &str) -> &str {
+    if units.trim().is_empty() {
+        "no units"
+    } else {
+        units.trim()
+    }
+}
+
+/// The code a taken-over formula keeps, so `code` stays unique and the old one reads as history.
+#[must_use]
+pub fn taken_over_code(code: &str, on: chrono::NaiveDate) -> String {
+    format!("{code}~taken-over-{}", on.format("%Y-%m-%d"))
+}
+
+/// A code an output of the save takes over, with what it moves.
+#[derive(Debug, Clone)]
+pub struct PlannedTakeover {
+    pub code: String,
+    pub parameter_id: Uuid,
+    pub parameter_name: String,
+    pub kind: &'static str,
+    pub computed_by: String,
+    /// The decommissioned calculation's formula giving the column up.
+    pub holder_formula: Option<Uuid>,
+}
+
+/// The takeovers the save's outputs make, refusing a code no confirm may take and, when an
+/// eligible one is not in `confirmed`, answering with the list for the page's confirm.
+pub async fn plan_takeovers<C: ConnectionTrait>(
+    conn: &C,
+    id: Uuid,
+    formulas: &[super::models::SavedFormula],
+    confirmed: &[String],
+) -> AppResult<Vec<PlannedTakeover>> {
+    use crate::routes::private::derived_parameters::models::definition as formula_entity;
+    use crate::routes::private::parameter_groups::models::member_model as member;
+    use sea_orm::sea_query::ExprTrait as _;
+
+    let outputs: Vec<&super::models::SavedFormula> =
+        formulas.iter().filter(|f| !f.intermediate).collect();
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lowered: Vec<String> = outputs.iter().map(|f| f.code.to_lowercase()).collect();
+
+    let holders = formula_entity::Entity::find()
+        .filter(formula_entity::Column::Code.is_in(outputs.iter().map(|f| f.code.clone())))
+        .filter(
+            Condition::any()
+                .add(formula_entity::Column::ToolScriptId.ne(id))
+                .add(formula_entity::Column::ToolScriptId.is_null()),
+        )
+        .all(conn)
+        .await?;
+    let scripts: HashMap<Uuid, (String, bool)> = script::Entity::find()
+        .filter(script::Column::Id.is_in(holders.iter().filter_map(|f| f.tool_script_id)))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, (s.name, s.decommissioned_at.is_some())))
+        .collect();
+    let catalog = parameters::Entity::find()
+        .filter(Expr::expr(Func::lower(Expr::col(parameters::Column::Code))).is_in(lowered))
+        .all(conn)
+        .await?;
+    let ids: Vec<Uuid> = catalog.iter().map(|p| p.id).collect();
+    let published: std::collections::HashSet<Uuid> = formula_entity::Entity::find()
+        .filter(formula_entity::Column::OutputParameterId.is_in(ids.clone()))
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter_map(|f| f.output_parameter_id)
+        .collect();
+    let portal: HashMap<Uuid, String> = member::Entity::find()
+        .filter(member::Column::ParameterId.is_in(ids.clone()))
+        .filter(member::Column::SourceCalculation.is_not_null())
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter_map(|m| {
+            let function = m.source_calculation?.get("function")?.as_str()?.to_string();
+            Some((m.parameter_id, function))
+        })
+        .collect();
+    let families = parameters_with_families(conn, &ids).await?;
+
+    let mut planned = Vec::new();
+    let mut unconfirmed = Vec::new();
+    let mut refused = Vec::new();
+    for f in outputs {
+        let holder = holders.iter().find(|h| h.code == f.code);
+        let parameter = catalog
+            .iter()
+            .find(|p| p.code.eq_ignore_ascii_case(&f.code));
+        let facts = TakeoverFacts {
+            code: f.code.clone(),
+            code_holder: holder.map(|h| {
+                h.tool_script_id
+                    .and_then(|s| scripts.get(&s).cloned())
+                    .unwrap_or_else(|| ("a shared step".to_string(), false))
+            }),
+            catalog_units: parameter.map(|p| p.default_units.clone()),
+            published: parameter.is_some_and(|p| published.contains(&p.id)),
+            portal_function: parameter.and_then(|p| portal.get(&p.id).cloned()),
+            family: parameter.and_then(|p| family_repeats(families.get(&p.id)?)),
+            formula_units: f.units.clone().unwrap_or_default(),
+        };
+        match takeover_verdict(&facts) {
+            TakeoverVerdict::Free | TakeoverVerdict::Typed => {}
+            TakeoverVerdict::Refused(why) => refused.push(why),
+            TakeoverVerdict::Eligible { kind, computed_by } => {
+                let Some(parameter) = parameter else { continue };
+                let take = PlannedTakeover {
+                    code: f.code.clone(),
+                    parameter_id: parameter.id,
+                    parameter_name: parameter.name.clone(),
+                    kind,
+                    computed_by,
+                    holder_formula: holder.map(|h| h.id),
+                };
+                if confirmed.iter().any(|c| c == &f.code) {
+                    planned.push(take);
+                } else {
+                    unconfirmed.push((take, parameter.default_units.clone()));
+                }
+            }
+        }
+    }
+    if !refused.is_empty() {
+        return Err(AppError::BadRequest(refused.join("; ")));
+    }
+    if !unconfirmed.is_empty() {
+        return Err(takeover_refusal(conn, unconfirmed).await?);
+    }
+    Ok(planned)
+}
+
+/// The 409 naming each column the save would take over, with the readings already under it.
+async fn takeover_refusal<C: ConnectionTrait>(
+    conn: &C,
+    unconfirmed: Vec<(PlannedTakeover, String)>,
+) -> AppResult<AppError> {
+    let ids: Vec<Uuid> = unconfirmed.iter().map(|(t, _)| t.parameter_id).collect();
+    let coverage: HashMap<Uuid, SlotCoverage> = conn
+        .query_all_raw(coverage_query(&ids, None))
+        .await?
+        .iter()
+        .map(|r| SlotCoverage::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|c| (c.parameter_id, c))
+        .collect();
+    let takeovers: Vec<super::models::Takeover> = unconfirmed
+        .into_iter()
+        .map(|(t, units)| {
+            let c = coverage.get(&t.parameter_id);
+            super::models::Takeover {
+                code: t.code,
+                parameter_id: t.parameter_id,
+                parameter_name: t.parameter_name,
+                units,
+                kind: t.kind.to_string(),
+                computed_by: t.computed_by,
+                readings: c.map_or(0, |c| c.reading_count),
+                first_reading: c.and_then(|c| c.first_reading),
+                last_reading: c.and_then(|c| c.last_reading),
+                source_systems: c.map(|c| c.source_systems.clone()).unwrap_or_default(),
+            }
+        })
+        .collect();
+    let codes: Vec<&str> = takeovers.iter().map(|t| t.code.as_str()).collect();
+    Ok(AppError::ConflictDetail {
+        message: format!(
+            "{} already hold{} readings computed elsewhere; confirm to continue the series",
+            codes.join(", "),
+            if codes.len() == 1 { "s" } else { "" }
+        ),
+        detail: serde_json::to_value(super::models::TakeoverDetail {
+            take_over: takeovers,
+        })
+        .unwrap_or_default(),
+    })
+}
+
+/// The `replicate_family` metadata the portal sync records on every stream declaring a family, by
+/// the parameter it is bound to.
+async fn parameters_with_families<C: ConnectionTrait>(
+    conn: &C,
+    ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<serde_json::Value>>> {
+    use sea_orm::sea_query::ExprTrait as _;
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (s, sp) = (Alias::new("s"), Alias::new("sp"));
+    let query = Query::select()
+        .column((sp.clone(), site_parameters::Column::ParameterId))
+        .column((s.clone(), data_streams::Column::Metadata))
+        .from_as(data_streams::Entity, s.clone())
+        .join_as(
+            JoinType::Join,
+            site_parameters::Entity,
+            sp.clone(),
+            Expr::col((sp.clone(), site_parameters::Column::Id))
+                .equals((s.clone(), data_streams::Column::SiteParameterId)),
+        )
+        .and_where(Expr::col((sp, site_parameters::Column::ParameterId)).is_in(ids.to_vec()))
+        .and_where(crate::routes::private::data_streams::service::declares_replicates(&s))
+        .to_owned();
+    let mut families: HashMap<Uuid, Vec<serde_json::Value>> = HashMap::new();
+    for r in conn.query_all_raw(build(&query)).await? {
+        let parameter_id: Uuid = r.try_get("", "parameter_id")?;
+        let metadata: serde_json::Value = r.try_get("", "metadata")?;
+        let family = metadata
+            .get("replicate_family")
+            .cloned()
+            .unwrap_or_default();
+        families.entry(parameter_id).or_default().push(family);
+    }
+    Ok(families)
+}
+
+/// Free each taken-over column before the save's writes: a decommissioned calculation's formula
+/// gives up the parameter and keeps its code under a dated suffix.
+pub async fn release_taken_over<C: ConnectionTrait>(
+    conn: &C,
+    planned: &[PlannedTakeover],
+) -> AppResult<()> {
+    use crate::routes::private::derived_parameters::models::definition as formula_entity;
+    let today = chrono::Utc::now().date_naive();
+    for take in planned {
+        let Some(formula) = take.holder_formula else {
+            continue;
+        };
+        formula_entity::Entity::update_many()
+            .col_expr(
+                formula_entity::Column::Code,
+                Expr::value(taken_over_code(&take.code, today)),
+            )
+            .col_expr(
+                formula_entity::Column::OutputParameterId,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                formula_entity::Column::GivenUpParameterId,
+                Expr::value(Some(take.parameter_id)),
+            )
+            .filter(formula_entity::Column::Id.eq(formula))
+            .exec(conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Link each taken-over column to the formula of calculation `id` that now writes it, and record
+/// the takeover. The formula was written as a step, so the catalog guard never saw the code; it
+/// publishes from here under the catalog row's own name.
+pub async fn link_taken_over<C: ConnectionTrait>(
+    conn: &C,
+    id: Uuid,
+    calculation: &str,
+    planned: &[PlannedTakeover],
+    actor: &str,
+) -> AppResult<()> {
+    use crate::routes::private::derived_parameters::models::definition as formula_entity;
+    for take in planned {
+        let Some(formula) = formula_entity::Entity::find()
+            .filter(formula_entity::Column::ToolScriptId.eq(id))
+            .filter(formula_entity::Column::Code.eq(take.code.clone()))
+            .one(conn)
+            .await?
+        else {
+            continue;
+        };
+        formula_entity::Entity::update_many()
+            .col_expr(formula_entity::Column::Intermediate, Expr::value(false))
+            .col_expr(
+                formula_entity::Column::OutputParameterId,
+                Expr::value(Some(take.parameter_id)),
+            )
+            .col_expr(
+                formula_entity::Column::GivenUpParameterId,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                formula_entity::Column::Name,
+                Expr::value(take.parameter_name.clone()),
+            )
+            .filter(formula_entity::Column::Id.eq(formula.id))
+            .exec(conn)
+            .await?;
+        crate::routes::private::change_audit::service::record(
+            conn,
+            format!("parameter:{}", take.parameter_id),
+            "parameter_takeover",
+            Some(actor.to_string()),
+            Some(json!({ "kind": take.kind, "computed_by": take.computed_by })),
+            Some(json!({
+                "calculation": calculation,
+                "calculation_id": id,
+                "formula_id": formula.id,
+                "code": take.code,
+            })),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// The dedupe key an edit to one calculation audits under, so a burst of formula edits coalesces
@@ -6291,6 +6911,10 @@ pub(super) async fn run_stored_cases(
 #[cfg(test)]
 #[path = "tests/calculations.rs"]
 mod calculations_tests;
+
+#[cfg(test)]
+#[path = "tests/takeover.rs"]
+mod takeover_tests;
 
 #[cfg(test)]
 #[path = "tests/closure.rs"]
