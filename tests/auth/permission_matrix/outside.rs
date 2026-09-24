@@ -1041,9 +1041,8 @@ async fn seed_other_project(db: &sea_orm::DatabaseConnection) {
     }
 }
 
-/// A calculation active only at the second project's site: it reads a parameter only that site
-/// declares and publishes one no site declares, and the curation ledger holds one value it computed
-/// there. Beside it, an upload session another caller opened.
+/// A calculation reading the second project's input, with a computed value on the curation ledger.
+/// Its output is assigned through the site-parameter route. Beside it, another caller's upload.
 fn other_calculation() -> Vec<String> {
     let manifest = json!({
         "label": "Outside calculation",
@@ -1087,6 +1086,28 @@ fn other_calculation() -> Vec<String> {
     ]
 }
 
+async fn assign_outside_calculation(app: &axum::Router, db: &sea_orm::DatabaseConnection) {
+    let admin = get_keycloak_jwt("admin", "admin").await;
+    crate::common::e2e::assign_site_parameter_minimal(app, &admin, OTHER_SITE_ID, OTHER_OUTPUT_ID)
+        .await;
+    let calculations = river_db::routes::private::tools::flows::calculation_sites(db, None)
+        .await
+        .expect("calculation sites");
+    let calculation = calculations
+        .iter()
+        .find(|c| c.calculation_id.to_string() == OTHER_CALC_ID)
+        .expect("the outside calculation");
+    assert_eq!(
+        calculation
+            .sites
+            .iter()
+            .map(|s| s.id.to_string())
+            .collect::<Vec<_>>(),
+        [OTHER_SITE_ID],
+        "the authorization probe targets a calculation assigned only outside the grant"
+    );
+}
+
 /// What a probe answered, when that is not confinement, or `None` when it is.
 fn leak(probe: &Probe, status: u16, body: &str) -> Option<String> {
     let refused = matches!(status, 403 | 404);
@@ -1121,6 +1142,7 @@ async fn every_project_bound_row_is_refused_outside_the_grant() {
     crate::common::seed_test_data(&db).await;
     seed_other_project(&db).await;
     let app = build_test_app_with_keycloak_admin(db.clone()).await;
+    assign_outside_calculation(&app, &db).await;
 
     ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
     grant_project(&db, &keycloak_user_id("manager1").await, PROJECT_ID).await;
