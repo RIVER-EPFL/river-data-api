@@ -50,7 +50,8 @@ Migrations run on startup. The API is at `http://localhost:3000` and its documen
 - [CrudCrate](https://github.com/evanjt/crudcrate) for the generated CRUD surface and its hooks
 - [utoipa](https://github.com/juhaku/utoipa) and Scalar for the OpenAPI documentation
 - Migrations are a workspace member (`migration/`), applied on startup and runnable by hand
-  with `cargo run -p migration -- up`
+  with `cargo run -p migration -- up`. The single baseline is
+  `migration/src/m20260924_000001_baseline.rs`; the complete earlier chain is in commit `2d9500de`
 
 After a baseline flatten, rebuild an existing dev database. Back up anything to preserve
 for `restore_cutover` first, then run `docker compose down -v && docker compose up -d`
@@ -252,6 +253,11 @@ repository starts that database and a watcher that reruns the suite on every cha
 the same suite against TimescaleDB, Keycloak and a tool runner built from the commit.
 
 ## Deployment
+
+The baseline requires an empty database. Back up the existing database before replacing it,
+then start the API against the fresh database to apply the baseline. It seeds the twelve portal
+constants; projects, sites and calculation definitions are supplied through the application.
+Use `restore_cutover` to carry curated state from the backup after rebuilding the metadata.
 
 Multi-stage Docker build with cargo-chef. The image and the R runner image are published
 together and pinned by digest in the ArgoCD manifests; the runner is a sidecar in the API pod,

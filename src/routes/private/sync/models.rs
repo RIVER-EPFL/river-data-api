@@ -336,7 +336,7 @@ impl HoldKind {
 }
 
 /// Where a hold stands. The table's CHECK is the same list
-/// (`migration/src/m20260905_000001_baseline.rs`), so a value added there is added here and every
+/// (`migration/src/m20260924_000001_baseline.rs`), so a value added there is added here and every
 /// predicate over `status` follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

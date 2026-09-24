@@ -2,12 +2,13 @@
 //! the revision of each (Q215).
 //!
 //! Expected behaviour: every row of the six audited tables has a change_audit row from the moment
-//! the database is built, a later edit adds one with a higher `seq`, and a row that somehow has
-//! none is given one by the backfill.
+//! the database is built, a later edit adds one with a higher `seq`, and running the migrator
+//! again preserves the seeded constants and their revisions.
 //!
 //! Run: cargo test --test migrations entity_revisions -- --test-threads=1
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm_migration::MigratorTrait;
 use serial_test::serial;
 
 use crate::common::scratch;
@@ -37,16 +38,15 @@ async fn every_audited_row_has_a_revision_and_an_edit_advances_it() {
     let server = scratch::server(&base).await;
     let db = scratch::build(&base, &server, &name).await;
 
-    // The twelve seeded constants predate the trigger and are backfilled by the migration.
     let seeded: i64 = one(&db, "SELECT count(*) AS n FROM constants", "n").await;
-    let backfilled: i64 = one(
+    let audited: i64 = one(
         &db,
         "SELECT count(*) AS n FROM change_audit WHERE change = 'constant_insert'",
         "n",
     )
     .await;
     assert_eq!(
-        backfilled, seeded,
+        audited, seeded,
         "one constant_insert row per seeded constant"
     );
 
@@ -93,33 +93,18 @@ async fn every_audited_row_has_a_revision_and_an_edit_advances_it() {
         "the audit row keeps the value before the edit"
     );
 
-    // A row with no audit row is given one by the backfill, and one only.
-    let subject = "constant:".to_string()
-        + &one::<uuid::Uuid>(&db, "SELECT id FROM constants ORDER BY name LIMIT 1", "id")
-            .await
-            .to_string();
-    exec(
+    migration::Migrator::up(&db, None)
+        .await
+        .expect("running the migrator again succeeds");
+    let audited_again: i64 = one(
         &db,
-        &format!("DELETE FROM change_audit WHERE subject = '{subject}'"),
-    )
-    .await;
-    exec(
-        &db,
-        &migration::m20260921_000001_entity_revisions::backfill("constants", "constant"),
-    )
-    .await;
-    exec(
-        &db,
-        &migration::m20260921_000001_entity_revisions::backfill("constants", "constant"),
-    )
-    .await;
-    let again: i64 = one(
-        &db,
-        &format!("SELECT count(*) AS n FROM change_audit WHERE subject = '{subject}'"),
+        "SELECT count(*) AS n FROM change_audit WHERE change = 'constant_insert'",
         "n",
     )
     .await;
-    assert_eq!(again, 1, "the backfill adds a row once");
+    assert_eq!(audited_again, seeded, "the constants are audited once");
+    let latest: i64 = one(&db, "SELECT max(seq) AS seq FROM change_audit", "seq").await;
+    assert_eq!(latest, updated, "running the migrator preserves revisions");
 
     drop(db);
     scratch::discard(&server, &name).await;
