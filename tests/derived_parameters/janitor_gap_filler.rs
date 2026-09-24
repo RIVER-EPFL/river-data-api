@@ -223,11 +223,11 @@ async fn declare_do_calculation(
     calculation
 }
 
-/// Scenario: two calculations read dissolved oxygen at one site, and one new oxygen reading
-/// lands with no recompute behind it.
+/// Scenario: two calculations are declared at a site over a stored oxygen history, and later one
+/// new oxygen reading lands with no recompute behind it.
 ///
-/// Expected behaviour: the janitor's pass credits one filled value to each calculation at that
-/// site, never both to one of them.
+/// Expected behaviour: the first pass is both slots' backfill and counts no missed value; the
+/// second credits one missed value to each calculation at that site, never both to one of them.
 #[tokio::test]
 #[serial]
 async fn test_janitor_credits_each_calculation_with_its_own_fill() {
@@ -236,7 +236,13 @@ async fn test_janitor_credits_each_calculation_with_its_own_fill() {
     let site_id = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
     let first = declare_do_calculation(&db, &app, &token, site_id, 0.032).await;
     let second = declare_do_calculation(&db, &app, &token, site_id, 2.0).await;
-    run_once(&db, None, None).await.unwrap();
+    // The oxygen history predates both slots, so the first pass is their backfill.
+    let backfill = run_once(&db, None, None).await.unwrap();
+    for calculation in [first, second] {
+        let fills = &backfill.by_calculation[&calculation][&site_id];
+        assert!(fills.backfilled > 0, "{calculation}: {fills:?}");
+        assert_eq!(fills.values, 0, "{calculation}: {fills:?}");
+    }
 
     let at: DateTime<Utc> = "2025-02-03T04:05:00Z".parse().unwrap();
     db.execute_raw(Statement::from_sql_and_values(
@@ -262,6 +268,7 @@ async fn test_janitor_credits_each_calculation_with_its_own_fill() {
     for calculation in [first, second] {
         let fills = &pass.by_calculation[&calculation][&site_id];
         assert_eq!(fills.values, 1, "{calculation}: {:?}", pass.by_calculation);
+        assert_eq!(fills.backfilled, 0);
         assert_eq!(fills.instants, vec![at]);
     }
 }

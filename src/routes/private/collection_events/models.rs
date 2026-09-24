@@ -286,6 +286,9 @@ pub struct VisitCell {
     /// Each distinct standard curve the group's replicates were corrected through, in replicate
     /// order (Q97). Empty for a value no curve corrected.
     pub curves: Vec<VisitCellCurve>,
+    /// The catalog curves a calculation computed this value through, read from its run and the
+    /// version that ran (Q268). Apart from `curves`, which a row's own correction names.
+    pub computed_curves: Vec<crate::routes::private::tools::models::ComputedCurve>,
 }
 
 /// A curve a listing's cell was corrected through: what the grid names it by.
@@ -516,6 +519,9 @@ pub struct EventCell {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub written_by: Option<String>,
+    /// The catalog curves a calculation computed this value through, read from its run and the
+    /// version that ran (Q268). Apart from `curves`, which a row's own correction names.
+    pub computed_curves: Vec<crate::routes::private::tools::models::ComputedCurve>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

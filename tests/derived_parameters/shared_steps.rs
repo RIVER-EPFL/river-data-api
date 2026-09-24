@@ -811,3 +811,111 @@ async fn a_cycle_among_shared_steps_is_refused_naming_its_members() {
         "{refused}"
     );
 }
+
+/// A calculation declaring only `kh` receives `water_k`, which `kh` reads, and the step reports
+/// the calculation among those it feeds.
+#[tokio::test]
+#[serial]
+async fn a_calculation_receives_the_shared_steps_its_declared_steps_read() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (db, app, token) = setup().await;
+    let site_id = uuid::Uuid::parse_str(crate::common::SITE1_ID).expect("a uuid");
+    let pco2real = calculation(&db, "pco2real").await;
+
+    let (status, water_k) = shared_step(&app, &token, "water_k", "Dissolved_O2 * 2").await;
+    assert!((200..300).contains(&status), "({status}): {water_k}");
+    let (status, kh) = shared_step(&app, &token, "kh", "water_k + 1").await;
+    assert!((200..300).contains(&status), "({status}): {kh}");
+    post(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": pco2real, "formula_id": id_of(&kh) }),
+        &token,
+    )
+    .await;
+    let output = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "kh_out", "name": "kh out", "units": "",
+            "formula": "kh * 10", "tool_script_id": pco2real, "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    let output_parameter_id = output["output_parameter_id"]
+        .as_str()
+        .expect("the formula minted its output")
+        .to_string();
+    post(
+        &app,
+        "/api/site_parameters",
+        &json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output_parameter_id,
+            "name": "kh_out",
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "cadence": "high",
+        }),
+        &token,
+    )
+    .await;
+
+    let at = chrono::Utc::now() - chrono::Duration::hours(4);
+    let at = at - chrono::Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, written) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 100.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "batch ({status}): {written}");
+    river_db::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp(
+        &db, site_id, at,
+    )
+    .await
+    .expect("the stream pass runs");
+
+    let output_uuid = uuid::Uuid::parse_str(&output_parameter_id).expect("a uuid");
+    let stored: Option<f64> = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT raw_value FROM readings WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
+            [site_id.into(), output_uuid.into(), at.into()],
+        ))
+        .await
+        .expect("a query")
+        .map(|row| row.try_get::<f64>("", "raw_value").expect("a value"));
+    // (100 * 2 + 1) * 10
+    assert_eq!(stored, Some(2010.0), "kh computed from water_k in the run");
+
+    let (status, dependents) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{}/dependents", id_of(&water_k)),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "({status}): {dependents}");
+    let calculations = dependents["calculations"].as_array().expect("calculations");
+    let feeds = calculations
+        .iter()
+        .find(|c| c["name"] == "pco2real")
+        .unwrap_or_else(|| panic!("water_k feeds pco2real through kh: {dependents}"));
+    let readers: Vec<&str> = feeds["formulas"]
+        .as_array()
+        .expect("formulas")
+        .iter()
+        .map(|f| f["code"].as_str().expect("a code"))
+        .collect();
+    assert_eq!(readers, ["kh"], "kh is what reads it there: {feeds}");
+}

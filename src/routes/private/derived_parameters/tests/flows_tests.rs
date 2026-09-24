@@ -2,6 +2,10 @@ use super::gap_scan;
 use sea_orm::sea_query::PostgresQueryBuilder;
 use uuid::Uuid;
 
+fn missed(tool: Uuid, site: Uuid, time: chrono::DateTime<chrono::Utc>) -> super::Gap {
+    super::Gap { tool_script_id: tool, site_id: site, time, backfill: false }
+}
+
 fn sql(since: Option<chrono::DateTime<chrono::Utc>>) -> String {
     gap_scan(since).to_string(PostgresQueryBuilder)
 }
@@ -27,7 +31,8 @@ fn test_gap_scan_bounds_the_readings_side_when_given_a_window() {
 fn test_gap_scan_is_the_anti_join_over_active_tool_slots() {
     let sql = sql(None);
     for expected in [
-        r#"SELECT DISTINCT "r"."site_id", "r"."time", "d"."tool_script_id" FROM "readings" AS "r""#,
+        r#"SELECT "r"."site_id", "r"."time", "d"."tool_script_id", MAX("r"."ingested_at") AS "input_written", MAX("sp"."created_at") AS "slot_declared" FROM "readings" AS "r""#,
+        r#"GROUP BY "r"."site_id", "r"."time", "d"."tool_script_id""#,
         r#"JOIN "site_parameters" AS "sp""#,
         r#""sp"."entry_mode" = 'tool'"#,
         r#""sp"."cadence" = 'high'"#,
@@ -96,7 +101,7 @@ fn test_fills_by_calculation_credits_each_gap_to_its_own_calculation() {
     let (pco2, doc, saxon, sion) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(10), Uuid::from_u128(11));
     let at: chrono::DateTime<chrono::Utc> = "2025-06-01T10:00:00Z".parse().unwrap();
     let later = at + chrono::Duration::hours(1);
-    let gaps = [(pco2, saxon, at), (doc, saxon, at), (pco2, saxon, later), (pco2, sion, at)];
+    let gaps = [missed(pco2, saxon, at), missed(doc, saxon, at), missed(pco2, saxon, later), missed(pco2, sion, at)];
     let filled: HashSet<_> = [(saxon, at), (saxon, later)].into_iter().collect();
 
     let fills = super::fills_by_calculation(&gaps, &filled);
@@ -116,9 +121,9 @@ fn test_fills_by_calculation_lists_instants_up_to_the_cap_and_counts_them_all() 
     let (pco2, saxon) = (Uuid::from_u128(1), Uuid::from_u128(10));
     let start: chrono::DateTime<chrono::Utc> = "2025-06-01T00:00:00Z".parse().unwrap();
     let gaps: Vec<_> = (0..super::FILL_INSTANTS_LISTED + 5)
-        .map(|i| (pco2, saxon, start + chrono::Duration::minutes(i as i64)))
+        .map(|i| missed(pco2, saxon, start + chrono::Duration::minutes(i as i64)))
         .collect();
-    let filled: HashSet<_> = gaps.iter().map(|(_, site, t)| (*site, *t)).collect();
+    let filled: HashSet<_> = gaps.iter().map(|g| (g.site_id, g.time)).collect();
 
     let fills = super::fills_by_calculation(&gaps, &filled);
 
@@ -135,12 +140,44 @@ fn test_gap_fill_report_names_what_each_calculation_had_filled() {
     gaps.by_calculation
         .entry(pco2)
         .or_default()
-        .insert(saxon, super::SiteFills { values: 1, instants: vec![at] });
+        .insert(saxon, super::SiteFills { values: 1, backfilled: 2, instants: vec![at] });
     let report = gaps.report_into(JobReport::new()).to_value();
     assert_eq!(
         report["scope"]["filled_by_calculation"],
         serde_json::json!({
-            pco2.to_string(): { saxon.to_string(): { "values": 1, "instants": ["2025-06-01T10:00:00Z"] } }
+            pco2.to_string(): { saxon.to_string(): { "values": 1, "backfilled": 2, "instants": ["2025-06-01T10:00:00Z"] } }
         })
     );
+}
+
+#[test]
+fn test_is_backfill_when_every_input_arrived_before_the_slot_was_declared() {
+    let declared: chrono::DateTime<chrono::Utc> = "2025-06-01T10:00:00Z".parse().unwrap();
+    let before = declared - chrono::Duration::days(30);
+    let after = declared + chrono::Duration::minutes(5);
+    assert!(super::is_backfill(Some(before), Some(declared)));
+    assert!(!super::is_backfill(Some(after), Some(declared)));
+    // A value that predates arrival tracking is history the slot was declared over.
+    assert!(super::is_backfill(None, Some(declared)));
+    // A slot that predates tracking cannot vouch for the value, so the fill is shown.
+    assert!(!super::is_backfill(Some(before), None));
+}
+
+/// Expected behaviour: a backfill is counted apart and raises no instant, so the health row
+/// counts only the fills a missed recompute left.
+#[test]
+fn test_fills_by_calculation_counts_a_backfill_apart() {
+    use std::collections::HashSet;
+    let (pco2, saxon) = (Uuid::from_u128(1), Uuid::from_u128(10));
+    let at: chrono::DateTime<chrono::Utc> = "2025-06-01T10:00:00Z".parse().unwrap();
+    let earlier = at - chrono::Duration::days(1);
+    let gaps = [
+        super::Gap { backfill: true, ..missed(pco2, saxon, earlier) },
+        missed(pco2, saxon, at),
+    ];
+    let filled: HashSet<_> = [(saxon, earlier), (saxon, at)].into_iter().collect();
+
+    let fills = super::fills_by_calculation(&gaps, &filled);
+
+    assert_eq!(fills[&pco2][&saxon], super::SiteFills { values: 1, backfilled: 1, instants: vec![at] });
 }

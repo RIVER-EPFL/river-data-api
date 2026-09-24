@@ -113,17 +113,9 @@ impl CRUDOperations for CollectionEventOperations {
 /// The `source` a visit the sync created carries.
 pub const PORTAL_SYNC: &str = "portal_sync";
 
-/// Whether a calculation may run at a visit with this source (Q41): a visit the sync created is
-/// the portal's to recompute for as long as the two run side by side, and a correction there
-/// belongs in the portal.
-///
-/// Every door into the chain asks this one function: the enqueue a write goes through, the SELECT
-/// a scoped apply walks, and the per-visit route. A door that decides for itself is how the
-/// boundary came to hold on two of the three.
-#[must_use]
-pub fn chain_may_run(source: &str) -> bool {
-    source != PORTAL_SYNC
-}
+/// The stream sources this system writes itself. A stream of any other source was registered by
+/// a sync service, and its rows are the portal's.
+pub const LOCAL_SOURCE_SYSTEMS: [&str; 4] = ["api", "grab_sample", "csv", "csv_import"];
 
 /// How the event came to exist, decided by the writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +131,11 @@ pub enum EventSource {
 /// a stream this system did not create itself. Shared with the sample backfill, which uses the
 /// same distinction to decide whether a group's readings arrived as declared collections.
 pub fn any_sync_origin_sql() -> String {
-    "bool_or(ds.source_system NOT IN ('api', 'grab_sample', 'csv', 'csv_import'))".to_string()
+    let local: Vec<String> = LOCAL_SOURCE_SYSTEMS
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect();
+    format!("bool_or(ds.source_system NOT IN ({}))", local.join(", "))
 }
 
 impl EventSource {
@@ -869,7 +865,15 @@ pub async fn fill_visit_cells(db: &DatabaseConnection, visits: &mut [VisitRow]) 
     let measurements = replicate_measurements(db, &event_ids).await?;
     let findings = open_findings_by_slot(db, &event_ids).await?;
     let curve_names = curve_names(db, &cell_rows).await?;
-    place_cells(visits, cell_rows, &measurements, &findings, &curve_names);
+    let computed = computed_curves_of(db, &cell_rows).await?;
+    place_cells(
+        visits,
+        cell_rows,
+        &measurements,
+        &findings,
+        &curve_names,
+        &computed,
+    );
     Ok(())
 }
 
@@ -1124,6 +1128,7 @@ fn place_cells(
     measurements: &HashMap<ReplicateAt, Measurement>,
     findings: &Findings,
     curve_names: &HashMap<Uuid, Option<String>>,
+    computed: &HashMap<(Uuid, Uuid), Vec<crate::routes::private::tools::models::ComputedCurve>>,
 ) {
     let mut by_event: HashMap<Uuid, Vec<VisitCell>> = HashMap::new();
     for c in cell_rows {
@@ -1151,6 +1156,10 @@ fn place_cells(
             replicates,
             has_provenance: c.has_provenance.unwrap_or(false),
             tool: c.tool,
+            computed_curves: c
+                .tool_run_id
+                .and_then(|run| computed.get(&(run, c.parameter_id)).cloned())
+                .unwrap_or_default(),
             tool_run_id: c.tool_run_id,
             curves,
         });
@@ -1187,6 +1196,7 @@ fn place_cells(
                     tool: None,
                     tool_run_id: None,
                     curves: Vec::new(),
+                    computed_curves: Vec::new(),
                 });
             }
         }
@@ -1258,6 +1268,39 @@ async fn curve_names(
         .into_iter()
         .map(|c| (c.id, c.name))
         .collect())
+}
+
+/// Name on each detail cell the curves its calculation computed it through.
+pub async fn attach_computed_curves(
+    db: &DatabaseConnection,
+    cells: &mut [super::models::EventCell],
+) -> AppResult<()> {
+    let pairs: Vec<(Uuid, Uuid)> = cells
+        .iter()
+        .filter_map(|c| c.tool_run_id.map(|run| (run, c.parameter_id)))
+        .collect();
+    let computed = crate::routes::private::tools::service::computed_curves_at(db, &pairs).await?;
+    for cell in cells {
+        if let Some(run) = cell.tool_run_id {
+            cell.computed_curves = computed
+                .get(&(run, cell.parameter_id))
+                .cloned()
+                .unwrap_or_default();
+        }
+    }
+    Ok(())
+}
+
+/// The curves each computed cell of the page was computed through, keyed by run and parameter.
+async fn computed_curves_of(
+    db: &DatabaseConnection,
+    rows: &[CellRow],
+) -> AppResult<HashMap<(Uuid, Uuid), Vec<crate::routes::private::tools::models::ComputedCurve>>> {
+    let cells: Vec<(Uuid, Uuid)> = rows
+        .iter()
+        .filter_map(|r| r.tool_run_id.map(|run| (run, r.parameter_id)))
+        .collect();
+    crate::routes::private::tools::service::computed_curves_at(db, &cells).await
 }
 
 /// A cell's curves: each distinct one its replicates name, in replicate order.

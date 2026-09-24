@@ -89,6 +89,7 @@
 /readings/import_csv => require_write_data
 /readings/import_csv/chunk => require_write_data
 /readings/ledger => require_read_data
+/readings/override => require_admin
 /readings/provenance => require_read_data
 /readings/replay => require_read_data
 /readings/return => require_admin

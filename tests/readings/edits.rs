@@ -60,6 +60,33 @@ async fn setup(values: &[f64]) -> Fixture {
     }
 }
 
+/// A tool run standing behind replicate 0, as the grab save stores one.
+async fn attach_run(f: &Fixture) -> Uuid {
+    let run_id = Uuid::new_v4();
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, \
+                 outputs, created_by, context, source) \
+             VALUES ('{run_id}', 'doc', '{{}}'::jsonb, '{{\"DOC\": [1.0, 2.0]}}'::jsonb, \
+                     '{{}}'::jsonb, '[]'::jsonb, '{{\"doc_avg\": 1.5}}'::jsonb, 'tester', \
+                     '{{\"site_id\": \"{SITE1_ID}\", \"collected_at\": \"{AT}\"}}'::jsonb, \
+                     'interactive')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "UPDATE readings SET provenance = '{{\"run_id\": \"{run_id}\"}}'::jsonb \
+             WHERE stream_id = '{}' AND time = '{AT}' AND replicate_index = 0",
+            f.stream
+        ),
+    )
+    .await;
+    run_id
+}
+
 fn one_key(stream: Uuid, index: i16) -> serde_json::Value {
     json!({ "keys": [{ "stream_id": stream, "time": AT, "replicate_index": index }] })
 }
@@ -203,28 +230,7 @@ async fn a_commit_is_held_to_the_preview_of_itself_and_is_reversible() {
 #[serial]
 async fn a_value_a_tool_run_produced_is_reopened_rather_than_corrected() {
     let f = setup(&[10.0, 12.0, 14.0]).await;
-    let run_id = Uuid::new_v4();
-    crate::common::exec(
-        &f.db,
-        &format!(
-            "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, \
-                 outputs, created_by, context, source) \
-             VALUES ('{run_id}', 'doc', '{{}}'::jsonb, '{{\"DOC\": [1.0, 2.0]}}'::jsonb, \
-                     '{{}}'::jsonb, '[]'::jsonb, '{{\"doc_avg\": 1.5}}'::jsonb, 'tester', \
-                     '{{\"site_id\": \"{SITE1_ID}\", \"collected_at\": \"{AT}\"}}'::jsonb, \
-                     'interactive')"
-        ),
-    )
-    .await;
-    crate::common::exec(
-        &f.db,
-        &format!(
-            "UPDATE readings SET provenance = '{{\"run_id\": \"{run_id}\"}}'::jsonb \
-             WHERE stream_id = '{}' AND time = '{AT}' AND replicate_index = 0",
-            f.stream
-        ),
-    )
-    .await;
+    let run_id = attach_run(&f).await;
 
     let (status, inspected) = post(
         &f,
@@ -636,6 +642,94 @@ async fn a_curve_edit_recomposes_the_value_and_its_rollback_restores_it() {
         served().await,
         Some(60.0),
         "120 × 0.5, restored with the curve"
+    );
+}
+
+/// Expected behaviour: an admin overrides a calculated value in one act (Q263). The value is
+/// replaced, the slot detached, and the provenance names the computed value it replaced; a
+/// value no tool produced is refused, and a return restores the computed value.
+#[tokio::test]
+#[serial]
+async fn an_admin_overrides_a_calculated_value_in_one_act() {
+    if !crate::common::profile::Service::Keycloak
+        .require("an_admin_overrides_a_calculated_value_in_one_act")
+        .await
+    {
+        return;
+    }
+    let f = setup(&[10.0]).await;
+    let admin_app = crate::common::keycloak::build_test_app_with_keycloak(f.db.clone()).await;
+    let admin = crate::common::keycloak::get_keycloak_jwt("admin", "admin").await;
+    let override_at = |value: f64| {
+        json!({
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
+            "time": AT,
+            "value": value,
+            "reason": "field log",
+        })
+    };
+    let overridden = async |value: f64| {
+        crate::common::post_json_parse_with_token(
+            &admin_app,
+            "/api/readings/override",
+            &override_at(value),
+            &admin,
+        )
+        .await
+    };
+
+    let (status, refused) = overridden(40.0).await;
+    assert_eq!(
+        status, 400,
+        "no tool produced it, so it is corrected in place: {refused}"
+    );
+
+    attach_run(&f).await;
+    let (status, done) = overridden(40.0).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(stored(&f, 0).await.0, 40.0);
+
+    let (status, record) = crate::common::get_json_with_token(
+        &f.app,
+        &format!("/api/readings/provenance?stream_id={}&time={AT}", f.stream),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{record}");
+    let facet = &record["records"][0]["readings"][0]["overridden"];
+    assert_eq!(facet["computed_value"], 10.0, "{record}");
+    assert_eq!(facet["reason"], "field log");
+    assert!(facet["by"].is_string(), "{record}");
+
+    let (status, _) = overridden(50.0).await;
+    assert_eq!(
+        status, 409,
+        "a detached value is corrected, not overridden again"
+    );
+
+    let (status, returned) = crate::common::post_json_parse_with_token(
+        &admin_app,
+        "/api/readings/return",
+        &json!({ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": AT }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{returned}");
+    assert_eq!(
+        stored(&f, 0).await.0,
+        10.0,
+        "the return restores the computed value"
+    );
+    let (_, record) = crate::common::get_json_with_token(
+        &f.app,
+        &format!("/api/readings/provenance?stream_id={}&time={AT}", f.stream),
+        &f.token,
+    )
+    .await;
+    assert!(
+        record["records"][0]["readings"][0]["overridden"].is_null(),
+        "the calculation owns the value again: {record}"
     );
 }
 

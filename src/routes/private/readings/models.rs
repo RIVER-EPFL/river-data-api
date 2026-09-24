@@ -967,6 +967,21 @@ pub struct OutputSlotRequest {
     pub reason: Option<String>,
 }
 
+/// One calculated value to replace by hand: the output slot at a visit, and the replicate when the
+/// slot holds more than one.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OverrideRequest {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub replicate_index: Option<i16>,
+    pub value: f64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OwnershipResponse {
     pub owner: Owner,
@@ -1142,6 +1157,8 @@ pub enum EditOption {
     Detach,
     /// Give a detached output slot back to its calculation (admin only).
     Return,
+    /// Replace a calculated value by hand, detaching its slot in the same act (admin only, Q263).
+    Override,
     /// Correct the measurement in place.
     ValueCorrection,
     /// Choose a different hand-picked standard curve.
@@ -1166,7 +1183,7 @@ impl EditOption {
         use crate::common::authz::Capability;
         match self {
             Self::Curve | Self::EditDeployment | Self::EditCalibration => Capability::ManageSensors,
-            Self::Detach | Self::Return => Capability::Admin,
+            Self::Detach | Self::Return | Self::Override => Capability::Admin,
             _ => Capability::WriteData,
         }
     }
@@ -1666,6 +1683,18 @@ pub struct ReceiptSummary {
     pub braked: bool,
 }
 
+/// A calculated value a person replaced by hand (Q263): the value the calculation had stored, and
+/// who replaced it, when and why. Read from the ledger, so a rollback or a return clears it.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct OverrideRef {
+    #[schema(required)]
+    pub computed_value: Option<f64>,
+    pub by: String,
+    pub at: DateTime<Utc>,
+    #[schema(required)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadingFacet {
     pub replicate_index: i16,
@@ -1702,6 +1731,11 @@ pub struct ReadingFacet {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub provenance_kind: Option<String>,
+    /// The calculated value this row held before a person replaced it by hand, while its slot
+    /// stays detached. The computation below it is what produced the replaced value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub overridden: Option<OverrideRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub calibration: Option<CalibrationRef>,
@@ -2584,6 +2618,11 @@ pub struct GrabSampleResponse {
     /// write; the save enqueues the visit's recompute when this is not empty.
     #[serde(default)]
     pub calculations: Vec<crate::routes::private::tools::models::CalculationImpact>,
+    /// The decision set a replace recorded its corrections and withdrawals under, which
+    /// `/readings/edits/sets/{set_id}/rollback` undoes as one. `null` when nothing was replaced.
+    #[serde(default)]
+    #[schema(required)]
+    pub edit_set_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

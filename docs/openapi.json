@@ -4160,6 +4160,32 @@
         ],
         "type": "object"
       },
+      "ComputedCurve": {
+        "description": "A catalog curve a calculation's output was computed through, with the coefficients the run\nused.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "intercept": {
+            "format": "double",
+            "type": "number"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slope": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "slope",
+          "intercept"
+        ],
+        "type": "object"
+      },
       "ConflictMode": {
         "description": "How to handle readings that collide with an existing (stream_id, time, replicate_index).",
         "enum": [
@@ -6567,6 +6593,7 @@
           "reopen_run",
           "detach",
           "return",
+          "override",
           "value_correction",
           "curve",
           "edit_deployment",
@@ -6793,6 +6820,13 @@
       },
       "EventCell": {
         "properties": {
+          "computed_curves": {
+            "description": "The catalog curves a calculation computed this value through, read from its run and the\nversion that ran (Q268). Apart from `curves`, which a row's own correction names.",
+            "items": {
+              "$ref": "#/components/schemas/ComputedCurve"
+            },
+            "type": "array"
+          },
           "finding": {
             "$ref": "#/components/schemas/CellFinding",
             "description": "The oldest open finding for this cell, slot-keyed or placed through its stream's pairing."
@@ -6876,7 +6910,8 @@
           "stream_id",
           "origin",
           "has_provenance",
-          "replicates"
+          "replicates",
+          "computed_curves"
         ],
         "type": "object"
       },
@@ -7875,6 +7910,14 @@
             "description": "True when nothing was written.",
             "type": "boolean"
           },
+          "edit_set_id": {
+            "description": "The decision set a replace recorded its corrections and withdrawals under, which\n`/readings/edits/sets/{set_id}/rollback` undoes as one. `null` when nothing was replaced.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "existing_groups": {
             "description": "Replicate groups already stored at the requested (parameter, time) keys, as found before\nthis request wrote anything.",
             "items": {
@@ -7921,7 +7964,8 @@
           "kept_curated",
           "withdrawn",
           "preview",
-          "existing_groups"
+          "existing_groups",
+          "edit_set_id"
         ],
         "type": "object"
       },
@@ -12088,6 +12132,80 @@
           "parameter_id",
           "existing",
           "incoming"
+        ],
+        "type": "object"
+      },
+      "OverrideRef": {
+        "description": "A calculated value a person replaced by hand (Q263): the value the calculation had stored, and\nwho replaced it, when and why. Read from the ledger, so a rollback or a return clears it.",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "computed_value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "computed_value",
+          "by",
+          "at",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "OverrideRequest": {
+        "additionalProperties": false,
+        "description": "One calculated value to replace by hand: the output slot at a visit, and the replicate when the\nslot holds more than one.",
+        "properties": {
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "site_id",
+          "parameter_id",
+          "time",
+          "value"
         ],
         "type": "object"
       },
@@ -17170,6 +17288,10 @@
           },
           "measurement_type": {
             "type": "string"
+          },
+          "overridden": {
+            "$ref": "#/components/schemas/OverrideRef",
+            "description": "The calculated value this row held before a person replaced it by hand, while its slot\nstays detached. The computation below it is what produced the replaced value."
           },
           "provenance_kind": {
             "description": "Where this value came from, one of `PROVENANCE_KINDS`. A `sync` or `derived` row's story is\nresolved from the stream, the receipt and the definition; the others carry a stored blob.",
@@ -27380,6 +27502,13 @@
       },
       "VisitCell": {
         "properties": {
+          "computed_curves": {
+            "description": "The catalog curves a calculation computed this value through, read from its run and the\nversion that ran (Q268). Apart from `curves`, which a row's own correction names.",
+            "items": {
+              "$ref": "#/components/schemas/ComputedCurve"
+            },
+            "type": "array"
+          },
           "curves": {
             "description": "Each distinct standard curve the group's replicates were corrected through, in replicate\norder (Q97). Empty for a value no curve corrected.",
             "items": {
@@ -27483,7 +27612,8 @@
           "n_unverified",
           "replicates",
           "has_provenance",
-          "curves"
+          "curves",
+          "computed_curves"
         ],
         "type": "object"
       },
@@ -31603,14 +31733,11 @@
             },
             "description": "The tracked recompute job"
           },
-          "400": {
-            "description": "The visit was created by the portal sync"
-          },
           "404": {
             "description": "Unknown collection event"
           }
         },
-        "summary": "Recompute a collection event's tool outputs on demand: the chain executor runs every active\ntool whose inputs resolve at this event, in dependency order, and saves the outputs through\nthe grab write path with fresh server-built provenance. A visit the sync created is refused\n(Q41). Tracked job. Requires `write_data`.",
+        "summary": "Recompute a collection event's tool outputs on demand: the chain executor runs every active\ntool whose inputs resolve at this event, in dependency order, and saves the outputs through\nthe grab write path with fresh server-built provenance. Tracked job. Requires `write_data`.",
         "tags": [
           "collection_events"
         ]
@@ -40020,6 +40147,46 @@
           }
         },
         "summary": "Everything that happened to one measured instant, in time order: the decisions taken on it, the\ningest passes that carried it, the review holds it raised, the tool run that computed it, the\njobs that rewrote it and what they skipped, the slot edits that changed how it is served, and\nthe alarms it raised. Requires `read_data`.",
+        "tags": [
+          "readings"
+        ]
+      }
+    },
+    "/api/readings/override": {
+      "post": {
+        "operationId": "override_output",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OverrideRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditResponse"
+                }
+              }
+            },
+            "description": "Overridden"
+          },
+          "400": {
+            "description": "The slot holds several replicates and none was named"
+          },
+          "404": {
+            "description": "No readings at the slot instant"
+          },
+          "409": {
+            "description": "The slot is already detached; correct its value instead"
+          }
+        },
+        "summary": "Replace a calculated value by hand (Q263): the slot is detached from its calculation and the\none value corrected in one transaction, which the provenance record reads back as the computed\nvalue it replaced. Return is the way back. Requires Administrator.",
         "tags": [
           "readings"
         ]

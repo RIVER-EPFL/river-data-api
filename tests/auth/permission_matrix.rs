@@ -739,6 +739,7 @@ fn table() -> Table {
             ("GET", "/api/readings/provenance"),
             ("GET", "/api/readings/ledger"),
             ("GET", "/api/readings/decisions"),
+            ("GET", "/api/readings/edits/sets/{set_id}"),
             ("GET", "/api/readings/replay"),
             ("POST", "/api/readings/edits/inspect"),
             ("GET", "/api/tool_runs/{id}/reload"),
@@ -875,6 +876,7 @@ fn table() -> Table {
             ("POST", "/api/sync/credentials/{id}/revoke"),
             ("POST", "/api/readings/detach"),
             ("POST", "/api/readings/return"),
+            ("POST", "/api/readings/override"),
         ],
     );
 
@@ -1346,10 +1348,11 @@ async fn scope_confinement_denies_another_projects_row() {
         .expect("a decision")
         .to_string();
     let set_id = recorded["set_id"].as_str().expect("a set").to_string();
+    let set_path = format!("/api/readings/edits/sets/{set_id}");
     for (label, token) in restricted {
         for path in [
             format!("/api/readings/edits/{decision_id}/rollback"),
-            format!("/api/readings/edits/sets/{set_id}/rollback"),
+            format!("{set_path}/rollback"),
         ] {
             let s = status_of(&app, "POST", &path, None, Some(token)).await;
             assert_eq!(
@@ -1357,7 +1360,14 @@ async fn scope_confinement_denies_another_projects_row() {
                 "[{label}] {path} over another project's readings, got {s}"
             );
         }
+        let s = status_of(&app, "GET", &set_path, None, Some(token)).await;
+        assert_eq!(
+            s, 403,
+            "[{label}] {set_path} over another project's readings, got {s}"
+        );
     }
+    let s = status_of(&app, "GET", &set_path, None, Some(&unscoped)).await;
+    assert_eq!(s, 200, "an unscoped key reads the set it recorded");
 
     // The unconfined half: an unscoped key reaches both projects, so the denials above are
     // confinement rather than the row being unreachable.

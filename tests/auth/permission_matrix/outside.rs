@@ -146,11 +146,12 @@ const NOT_PROJECT_BOUND: [(&str, &str); 20] = [
 /// `scope_confinement_denies_another_projects_row`, which builds the committed edit a rollback
 /// needs, and the event stream, whose confinement is per frame, by
 /// `tests/events/sse_event_stream.rs`, `a_scoped_token_hears_only_its_own_projects_sites`.
-const PROBED_ELSEWHERE: [&str; 6] = [
+const PROBED_ELSEWHERE: [&str; 7] = [
     "GET /api/events",
     "POST /api/readings/edits/preview",
     "POST /api/readings/edits",
     "POST /api/readings/edits/{id}/rollback",
+    "GET /api/readings/edits/sets/{set_id}",
     "POST /api/readings/edits/sets/{set_id}/rollback",
     "POST /api/readings/edits/inspect",
 ];

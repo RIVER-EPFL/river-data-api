@@ -1468,7 +1468,7 @@ impl ActiveTool {
 
 /// A curve as the runner receives it: coefficients plus, when it came from the catalog, the
 /// identity that resolves them.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolvedCurve {
     pub slope: f64,
     pub intercept: f64,
@@ -1479,10 +1479,22 @@ pub struct ResolvedCurve {
 }
 
 /// One curve as the stored run records it: the slot it filled, and the curve itself.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CurveSnapshot {
     pub name: String,
     pub curve: ResolvedCurve,
+}
+
+/// A catalog curve a calculation's output was computed through, with the coefficients the run
+/// used.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputedCurve {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub name: Option<String>,
+    pub slope: f64,
+    pub intercept: f64,
 }
 
 /// What a declared constant the `constants` table does not hold means for the run that declares it.
@@ -2488,9 +2500,9 @@ impl RecomputeScope {
             || self.constant.is_some()
     }
 
-    /// The SELECT of visit ids this scope covers, oldest first. `portal_sync` visits are never
-    /// in scope (Q41); `only_findings` holds the set to visits with an open event finding, and a
-    /// `calculation` beside it to the findings that calculation raised.
+    /// The SELECT of visit ids this scope covers, oldest first. `only_findings` holds the set to
+    /// visits with an open event finding, and a `calculation` beside it to the findings that
+    /// calculation raised.
     #[must_use]
     pub fn events_query(&self) -> sea_orm::sea_query::SelectStatement {
         use crate::routes::private::collection_events::models as collection_events;
@@ -2521,11 +2533,7 @@ impl RecomputeScope {
         let mut query = Query::select();
         query
             .column((ce.clone(), collection_events::Column::Id))
-            .from_as(collection_events::Entity, ce.clone())
-            .and_where(
-                event(collection_events::Column::Source)
-                    .ne(crate::routes::private::collection_events::service::PORTAL_SYNC),
-            );
+            .from_as(collection_events::Entity, ce.clone());
         if let Some(site_id) = self.site_id {
             query.and_where(event(collection_events::Column::SiteId).eq(site_id));
         }

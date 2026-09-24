@@ -803,3 +803,75 @@ async fn test_grab_save_author_is_the_caller() {
     let caller: String = row.try_get("", "caller").unwrap();
     assert_eq!(author.as_deref(), Some(caller.as_str()));
 }
+
+/// Scenario: an enabled calculation writes the site's temperature, and a save naming no run types
+/// a temperature at a visit.
+///
+/// Expected behaviour: the save is refused naming the calculation, and nothing is stored: the value
+/// is corrected through the calculation's inputs (Q263).
+#[tokio::test]
+#[serial]
+async fn a_hand_value_over_a_calculated_parameter_is_refused() {
+    let (app, token, db) = setup().await;
+    let calculation = Uuid::new_v4();
+    let version = Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO tool_scripts (id, name, label, created_by) \
+             VALUES ('{calculation}', 'temperature_writer', 'Temperature writer', 'test')"
+        ),
+        format!(
+            r#"INSERT INTO tool_script_versions
+                   (id, tool_script_id, version_no, script, entry_function, manifest, test_cases,
+                    content_hash, created_by, validated_at)
+               VALUES ('{version}', '{calculation}', 1, 'tool <- function(...) list()', 'tool',
+                       '{{"label":"Temperature writer","params":[],"outputs":[{{"key":"t","label":"T","per_replicate":false,"parameter_id":"{}"}}]}}'::jsonb,
+                       '{{}}'::jsonb, 'temperature_writer-v1', 'test', now())"#,
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+        format!(
+            "UPDATE tool_scripts SET active_version_id = '{version}' WHERE id = '{calculation}'"
+        ),
+    ] {
+        crate::common::exec(&db, &statement).await;
+    }
+
+    let time = "2025-06-15T10:00:00Z";
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "readings": [
+                { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "value": 12.5, "time": time }
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "a hand value over a calculated parameter: {body}"
+    );
+    assert!(
+        body.contains("temperature_writer"),
+        "names the calculation: {body}"
+    );
+
+    let stored = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT COUNT(*) AS c FROM readings WHERE site_id = '{}' \
+                 AND parameter_id = '{}' AND time = '{time}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "c")
+        .unwrap();
+    assert_eq!(stored, 0, "and nothing is stored");
+}

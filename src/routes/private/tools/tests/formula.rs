@@ -1628,3 +1628,36 @@ fn test_the_manifest_names_the_codes_it_holds() {
     .expect("the manifest reads back");
     assert_eq!(manifest.held_codes(), vec!["alkalinity".to_string()]);
 }
+
+fn shared(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(c, f)| ((*c).to_string(), (*f).to_string()))
+        .collect()
+}
+
+#[test]
+fn test_received_steps_walks_what_a_declared_step_reads() {
+    let steps = shared(&[
+        ("water_k", "WTW_Temp_degC_1 + 273.15"),
+        ("kh", "0.034 * exp(c_const * (1 / water_k - 1 / 298.15))"),
+        ("apart", "Dissolved_O2"),
+    ]);
+    let mut received = received_steps(&["kh".to_string()], &steps);
+    received.sort();
+    assert_eq!(received, ["kh", "water_k"]);
+}
+
+#[test]
+fn test_received_steps_takes_a_step_once_by_two_paths() {
+    let steps = shared(&[("a", "Dissolved_O2"), ("b", "a + 1"), ("c", "a + b")]);
+    let mut received = received_steps(&["c".to_string(), "b".to_string()], &steps);
+    received.sort();
+    assert_eq!(received, ["a", "b", "c"]);
+}
+
+#[test]
+fn test_received_steps_with_nothing_declared_is_empty() {
+    let steps = shared(&[("a", "Dissolved_O2")]);
+    assert!(received_steps(&[], &steps).is_empty());
+}

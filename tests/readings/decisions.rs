@@ -630,6 +630,94 @@ async fn a_grab_replace_records_a_value_correction_only_where_the_value_moved() 
 
 #[tokio::test]
 #[serial]
+async fn a_grab_replace_records_its_decisions_as_one_set_the_save_rolls_back() {
+    let f = setup().await;
+    let save = |values: Vec<f64>, replace: bool| {
+        let app = f.app.clone();
+        let token = f.token.clone();
+        async move {
+            let readings: Vec<serde_json::Value> = values
+                .iter()
+                .map(|v| {
+                    serde_json::json!({
+                        "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                        "value": v,
+                        "time": AT,
+                    })
+                })
+                .collect();
+            let mut body = serde_json::json!({
+                "site_id": crate::common::SITE1_ID,
+                "readings": readings,
+            });
+            if replace {
+                body["mode"] = serde_json::json!("replace");
+            }
+            let (status, resp) =
+                crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &body, &token)
+                    .await;
+            assert_eq!(status, 200, "{resp}");
+            resp
+        }
+    };
+    let first = save(vec![10.0, 20.0], false).await;
+    assert!(first["edit_set_id"].is_null(), "an insert decides nothing");
+    let replaced = save(vec![15.0], true).await;
+    let set_id = replaced["edit_set_id"]
+        .as_str()
+        .expect("a replace names its decision set")
+        .to_string();
+    let in_set =
+        f.db.query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) AS n FROM reading_decisions WHERE set_id = '{set_id}' \
+                 AND kind IN ('value_correction', 'withdraw')"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    // The correction of replicate 0 and the withdrawal of replicate 1.
+    assert_eq!(in_set, 2);
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &f.app,
+        &format!("/api/readings/edits/sets/{set_id}/rollback"),
+        &serde_json::json!({}),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let rows = f
+        .db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value, withdrawn_at IS NOT NULL AS withdrawn FROM readings \
+                 WHERE site_id = '{}' AND parameter_id = '{}' AND time = '{AT}' \
+                   AND measurement_type = 'spot' ORDER BY replicate_index",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap();
+    let stored: Vec<(f64, bool)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get("", "raw_value").unwrap(),
+                r.try_get("", "withdrawn").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(stored, vec![(10.0, false), (20.0, false)]);
+}
+
+#[tokio::test]
+#[serial]
 async fn a_batch_overwrite_records_a_manual_value_correction_once() {
     let f = setup().await;
     let batch = |value: f64| {

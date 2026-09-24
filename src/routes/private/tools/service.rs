@@ -26,7 +26,7 @@ use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
 use super::models::{
     ActiveTool, CalculationHealth, CalculationImpact, JanitorFill, CalculationRepair, CaseResult,
-    CatalogFindings, ClosureQuery, Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter,
+    CatalogFindings, ClosureQuery, ComputedCurve, Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter,
     LintFinding, Manifest, ManifestCurve, ManifestEventInput, ManifestOutput, ManifestSiteInput,
     MissingConstant, ParamWhen, ParseCheck, ParseError, PinnedFormula, Produced, ResolvedBy,
     ResolvedCurve, ResolvedParameter, RunOutcome, RunnerRuntime, ScannedName, ScriptInspection,
@@ -482,8 +482,9 @@ fn pinned_formula(
     }
 }
 
-/// The steps the given calculations declare, as the same pairs their own formulas arrive in. One
-/// step declared by two calculations is one pair each.
+/// The shared steps the given calculations receive, as the same pairs their own formulas arrive
+/// in: each step a calculation declares and every shared step those read (Q254). One step
+/// received by two calculations is one pair each.
 async fn load_declared_steps<C: ConnectionTrait>(
     db: &C,
     script_ids: &[Uuid],
@@ -500,24 +501,69 @@ async fn load_declared_steps<C: ConnectionTrait>(
     if declarations.is_empty() {
         return Ok(Vec::new());
     }
-    let formula_ids: Vec<Uuid> = declarations.iter().map(|d| d.formula_id).collect();
+    let declared_ids: Vec<Uuid> = declarations.iter().map(|d| d.formula_id).collect();
     let steps = definition::Entity::find()
-        .filter(definition::Column::Id.is_in(formula_ids.clone()))
+        .filter(
+            Condition::any()
+                .add(definition::Column::Id.is_in(declared_ids))
+                .add(
+                    Condition::all()
+                        .add(definition::Column::ToolScriptId.is_null())
+                        .add(definition::Column::Intermediate.eq(true)),
+                ),
+        )
         .all(db)
         .await?;
+    let shared: Vec<(String, String)> = steps
+        .iter()
+        .map(|s| (s.code.clone(), s.formula.clone()))
+        .collect();
+
+    let mut received: Vec<(Uuid, &definition::Model)> = Vec::new();
+    for script_id in script_ids {
+        let declared: Vec<String> = declarations
+            .iter()
+            .filter(|d| d.tool_script_id == *script_id)
+            .filter_map(|d| steps.iter().find(|s| s.id == d.formula_id))
+            .map(|s| s.code.clone())
+            .collect();
+        for code in received_steps(&declared, &shared) {
+            if let Some(step) = steps.iter().find(|s| s.code == code) {
+                received.push((*script_id, step));
+            }
+        }
+    }
+    let mut formula_ids: Vec<Uuid> = received.iter().map(|(_, s)| s.id).collect();
+    formula_ids.sort();
+    formula_ids.dedup();
     let sources = formula_sources(db, formula_ids).await?;
 
-    let mut pairs = Vec::with_capacity(declarations.len());
-    for declaration in declarations {
-        let Some(step) = steps.iter().find(|s| s.id == declaration.formula_id) else {
+    Ok(received
+        .into_iter()
+        .map(|(script_id, step)| (script_id, pinned_formula(step, sources.get(&step.id), None)))
+        .collect())
+}
+
+/// The codes of the shared steps a calculation declaring `declared` receives: those, and every
+/// shared step, `(code, formula)`, any of them reads, each once however many paths reach it.
+pub fn received_steps(declared: &[String], shared: &[(String, String)]) -> Vec<String> {
+    let mut received: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = declared.to_vec();
+    while let Some(code) = pending.pop() {
+        if received.contains(&code) {
+            continue;
+        }
+        let Some((_, formula)) = shared.iter().find(|(c, _)| *c == code) else {
             continue;
         };
-        pairs.push((
-            declaration.tool_script_id,
-            pinned_formula(step, sources.get(&step.id), None),
-        ));
+        for name in free_identifiers(formula) {
+            if name != code && shared.iter().any(|(c, _)| *c == name) {
+                pending.push(name);
+            }
+        }
+        received.push(code);
     }
-    Ok(pairs)
+    received
 }
 
 /// The formulas the given calculations own, in evaluation order, ties broken by code.
@@ -574,6 +620,30 @@ pub async fn list_active_tools<C: ConnectionTrait>(db: &C) -> AppResult<Vec<Acti
         .to_owned();
     let rows = db.query_all_raw(build(&query)).await?;
     rows.iter().map(row_to_active).collect()
+}
+
+/// The enabled calculation writing each of `parameter_ids`, by name: the one a hand value over
+/// that parameter would contradict.
+pub async fn calculations_writing<C: ConnectionTrait>(
+    db: &C,
+    parameter_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, String>> {
+    if parameter_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(list_active_tools(db)
+        .await?
+        .into_iter()
+        .flat_map(|tool| {
+            tool.manifest
+                .outputs
+                .iter()
+                .filter_map(|o| o.parameter_id)
+                .filter(|p| parameter_ids.contains(p))
+                .map(|p| (p, tool.name.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect())
 }
 
 /// The formula set a calculation computes on a stream with, as its formulas stand.
@@ -2394,6 +2464,205 @@ pub fn curve_optional(formula: &str) -> bool {
     CURVE_VARIABLES
         .iter()
         .all(|variable| read_only_through_guards(formula, variable))
+}
+
+/// The catalog curves one output of a run was computed through: the curve slot of its formula and
+/// of every formula of the set it reads, or for a script the slot of the replicates its aggregate
+/// reduces, each resolved through the run's snapshot of that slot. A slot the run filled with an
+/// ad hoc slope and intercept, or an output tied to no slot, names nothing.
+#[must_use]
+pub fn computed_curves(
+    output: &str,
+    formulas: &[PinnedFormula],
+    manifest: &Manifest,
+    snapshots: &[CurveSnapshot],
+) -> Vec<ComputedCurve> {
+    let slots = if formulas.is_empty() {
+        script_output_slots(output, manifest)
+    } else {
+        formula_output_slots(output, formulas)
+    };
+    let mut curves: Vec<ComputedCurve> = Vec::new();
+    for slot in slots {
+        let Some(snapshot) = snapshots.iter().find(|s| s.name == slot) else {
+            continue;
+        };
+        let Some(id) = snapshot.curve.standard_curve_id else {
+            continue;
+        };
+        if curves.iter().any(|c| c.id == id) {
+            continue;
+        }
+        curves.push(ComputedCurve {
+            id,
+            name: snapshot.curve.label.clone(),
+            slope: snapshot.curve.slope,
+            intercept: snapshot.curve.intercept,
+        });
+    }
+    curves
+}
+
+/// The output key a calculation stores a parameter under: the formula writing its code, or the
+/// manifest output bound to it, by id first and then by code.
+#[must_use]
+pub fn output_key_of(
+    parameter_id: Uuid,
+    code: &str,
+    formulas: &[PinnedFormula],
+    manifest: &Manifest,
+) -> Option<String> {
+    if !formulas.is_empty() {
+        return formulas
+            .iter()
+            .find(|f| f.output_parameter_code.as_deref() == Some(code))
+            .map(|f| f.code.clone());
+    }
+    manifest
+        .outputs
+        .iter()
+        .find(|o| o.parameter_id == Some(parameter_id))
+        .or_else(|| {
+            manifest
+                .outputs
+                .iter()
+                .find(|o| o.suggested_parameter_code.as_deref() == Some(code))
+        })
+        .map(|o| o.key.clone())
+}
+
+/// [`computed_curves`] for each `(run, parameter)` a page lists, named from the catalog, in one
+/// lookup of the runs, their versions and the curves.
+pub async fn computed_curves_at<C: ConnectionTrait>(
+    db: &C,
+    cells: &[(Uuid, Uuid)],
+) -> AppResult<HashMap<(Uuid, Uuid), Vec<ComputedCurve>>> {
+    use super::models::run;
+    if cells.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let run_ids: Vec<Uuid> = cells.iter().map(|(r, _)| *r).collect();
+    let runs = run::Entity::find()
+        .filter(run::Column::Id.is_in(run_ids))
+        .all(db)
+        .await?;
+    let version_of = |r: &run::Model| {
+        r.tool_version
+            .get("script_version_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<Uuid>().ok())
+    };
+    let version_ids: Vec<Uuid> = runs.iter().filter_map(version_of).collect();
+    let mut versions: HashMap<Uuid, (Vec<PinnedFormula>, Manifest)> = HashMap::new();
+    for (row, calculation) in version_entity::Entity::find()
+        .filter(version_entity::Column::Id.is_in(version_ids))
+        .find_also_related(script::Entity)
+        .all(db)
+        .await?
+    {
+        let Ok(manifest) = parse_manifest(&row.manifest) else {
+            continue;
+        };
+        let engine = calculation
+            .and_then(|c| Engine::parse(&c.engine))
+            .unwrap_or(Engine::Script);
+        let formulas = if engine == Engine::Formula {
+            parse_pinned(&row.script).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        versions.insert(row.id, (formulas, manifest));
+    }
+    let parameter_ids: Vec<Uuid> = cells.iter().map(|(_, p)| *p).collect();
+    let codes: HashMap<Uuid, String> = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in(parameter_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, p.code))
+        .collect();
+    let mut out: HashMap<(Uuid, Uuid), Vec<ComputedCurve>> = HashMap::new();
+    for &(run_id, parameter_id) in cells {
+        let Some(r) = runs.iter().find(|r| r.id == run_id) else {
+            continue;
+        };
+        let Some((formulas, manifest)) = version_of(r).and_then(|v| versions.get(&v)) else {
+            continue;
+        };
+        let Some(code) = codes.get(&parameter_id) else {
+            continue;
+        };
+        let Some(key) = output_key_of(parameter_id, code, formulas, manifest) else {
+            continue;
+        };
+        let snapshots: Vec<CurveSnapshot> =
+            serde_json::from_value(r.curves.clone()).unwrap_or_default();
+        let curves = computed_curves(&key, formulas, manifest, &snapshots);
+        if !curves.is_empty() {
+            out.insert((run_id, parameter_id), curves);
+        }
+    }
+    let curve_ids: Vec<Uuid> = out.values().flatten().map(|c| c.id).collect();
+    if curve_ids.is_empty() {
+        return Ok(out);
+    }
+    let names: HashMap<Uuid, Option<String>> = standard_curves::Entity::find()
+        .filter(standard_curves::Column::Id.is_in(curve_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect();
+    for curve in out.values_mut().flatten() {
+        if let Some(name) = names.get(&curve.id).cloned().flatten() {
+            curve.name = Some(name);
+        }
+    }
+    Ok(out)
+}
+
+/// The curve slots a formula output reads: its own and those of the formulas it reads, walked
+/// through the set once each.
+fn formula_output_slots(output: &str, formulas: &[PinnedFormula]) -> Vec<String> {
+    let mut slots: Vec<String> = Vec::new();
+    let mut visited: Vec<&str> = Vec::new();
+    let mut pending: Vec<&str> = vec![output];
+    while let Some(code) = pending.pop() {
+        if visited.contains(&code) {
+            continue;
+        }
+        visited.push(code);
+        let Some(f) = formulas.iter().find(|f| f.code == code) else {
+            continue;
+        };
+        if let Some(slot) = &f.curve_slot
+            && !slots.contains(slot)
+        {
+            slots.push(slot.clone());
+        }
+        for id in free_identifiers(&f.formula) {
+            if f.sources.iter().any(|(variable, _)| *variable == id) {
+                continue;
+            }
+            if let Some(read) = formulas.iter().find(|g| g.code == id) {
+                pending.push(&read.code);
+            }
+        }
+    }
+    slots
+}
+
+/// The curve slot a script output reads: the slot of the replicates param its aggregate reduces.
+fn script_output_slots(output: &str, manifest: &Manifest) -> Vec<String> {
+    manifest
+        .outputs
+        .iter()
+        .find(|o| o.key == output)
+        .and_then(|o| o.aggregate_of.as_deref())
+        .and_then(|param| manifest.params.iter().find(|p| p.name == param))
+        .and_then(|p| p.curve.clone())
+        .into_iter()
+        .collect()
 }
 
 /// Every identifier a formula names that the language does not define itself, in the order they
@@ -6026,6 +6295,10 @@ mod calculations_tests;
 #[cfg(test)]
 #[path = "tests/closure.rs"]
 mod closure_tests;
+
+#[cfg(test)]
+#[path = "tests/computed_curves.rs"]
+mod computed_curves_tests;
 
 #[cfg(test)]
 #[path = "tests/cnet_formula_sets.rs"]

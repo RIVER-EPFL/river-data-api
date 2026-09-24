@@ -903,11 +903,10 @@ async fn visits_and_sites_holding_every_input() {
 /// Scenario: the lab opens a CNET station whose history was synced, expands a 2025 visit and
 /// presses Recompute tools.
 ///
-/// Expected behaviour: refused, naming where the correction belongs (Q41). The audit takes the
-/// request and raises nothing there: it reports on the set the repair can repair (Q175).
+/// Expected behaviour: queued like any other visit's (Q259), and the audit takes the request too.
 #[tokio::test]
 #[serial]
-async fn the_per_visit_recompute_refuses_a_synced_visit_and_the_audit_does_not() {
+async fn the_per_visit_recompute_and_the_audit_take_a_synced_visit() {
     let (db, app, token) = setup().await;
     crate::common::exec(
         &db,
@@ -933,18 +932,14 @@ async fn the_per_visit_recompute_refuses_a_synced_visit_and_the_audit_does_not()
         &token,
     )
     .await;
-    assert_eq!(status, 400, "{body}");
-    assert!(
-        body.to_string().contains("portal sync"),
-        "the refusal says why: {body}"
-    );
+    assert_eq!(status, 200, "{body}");
     let queued = crate::common::e2e::scalar(
         &db,
         "SELECT count(*)::text AS v FROM reprocessing_jobs \
           WHERE trigger_type = 'event_recompute'",
     )
     .await;
-    assert_eq!(queued, "0", "the refusal queues nothing");
+    assert_eq!(queued, "1", "the recompute is queued");
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -963,10 +958,7 @@ async fn the_per_visit_recompute_refuses_a_synced_visit_and_the_audit_does_not()
         ),
     )
     .await;
-    assert_eq!(
-        raised, "0",
-        "a synced visit is the portal's, so the audit raises nothing against it"
-    );
+    assert_eq!(raised, "0", "a visit holding no values raises nothing");
 }
 
 /// Scenario: an intern's entry, which lands unverified and which the sample trigger counts none of.

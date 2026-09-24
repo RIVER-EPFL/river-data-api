@@ -114,7 +114,7 @@ mod the_arm_a_slot_is_filled_on {
 
     #[test]
     fn a_high_cadence_slot_is_the_stream_engine_s_and_a_visit_skips_it() {
-        let reason = output_skip_reason("pco2", Owner::Tool, Some("high"))
+        let reason = output_skip_reason("pco2", Owner::Tool, Some("high"), false)
             .expect("a high-cadence output is not the chain's to write");
         assert!(reason.contains("pco2"), "{reason}");
         assert!(reason.contains("stream"), "{reason}");
@@ -122,14 +122,17 @@ mod the_arm_a_slot_is_filled_on {
 
     #[test]
     fn a_low_cadence_slot_is_written_at_the_visit() {
-        assert_eq!(output_skip_reason("pco2", Owner::Tool, Some("low")), None);
+        assert_eq!(
+            output_skip_reason("pco2", Owner::Tool, Some("low"), false),
+            None
+        );
     }
 
     /// A site holding no slot for the output is the mint case: the run publishes it, so there is
     /// no declaration to read and nothing to skip.
     #[test]
     fn an_undeclared_output_is_written_and_its_slot_minted() {
-        assert_eq!(output_skip_reason("pco2", Owner::Tool, None), None);
+        assert_eq!(output_skip_reason("pco2", Owner::Tool, None, false), None);
     }
 
     /// The detached ruling is the older gate and outranks cadence: a manual value stands whatever
@@ -137,15 +140,24 @@ mod the_arm_a_slot_is_filled_on {
     #[test]
     fn a_detached_slot_is_skipped_on_either_arm() {
         for cadence in [Some("low"), Some("high"), None] {
-            let reason = output_skip_reason("pco2", Owner::Manual, cadence)
+            let reason = output_skip_reason("pco2", Owner::Manual, cadence, false)
                 .expect("a detached output is never written by the chain");
             assert!(reason.contains("detached"), "{reason}");
         }
     }
+
+    /// A synced visit's slot the portal already fills stays the portal's until Q310 says how the
+    /// chain takes it; an output the portal does not compute is written.
+    #[test]
+    fn a_slot_the_portal_holds_is_skipped() {
+        let reason = output_skip_reason("pco2", Owner::Tool, Some("low"), true)
+            .expect("a portal-held output is not replaced by the chain");
+        assert!(reason.contains("portal"), "{reason}");
+    }
 }
 
 /// Scenario: the audit reports on a visit whose calculation publishes to a detached slot, a
-/// high-cadence slot and a low-cadence one.
+/// high-cadence slot, a low-cadence one and one the portal's value holds.
 ///
 /// Expected behaviour: it compares only the slot the chain would write, so every finding it
 /// raises is one a recompute can act on.
@@ -168,15 +180,30 @@ mod the_outputs_an_audit_compares {
                 detached,
                 Owner::Manual,
                 Some("low".to_string()),
+                false,
             ),
             (
                 "b".to_string(),
                 streamed,
                 Owner::Tool,
                 Some("high".to_string()),
+                false,
             ),
-            ("c".to_string(), visit, Owner::Tool, Some("low".to_string())),
-            ("d".to_string(), minted, Owner::Tool, None),
+            (
+                "c".to_string(),
+                visit,
+                Owner::Tool,
+                Some("low".to_string()),
+                false,
+            ),
+            ("d".to_string(), minted, Owner::Tool, None, false),
+            (
+                "e".to_string(),
+                Uuid::from_u128(5),
+                Owner::Tool,
+                Some("low".to_string()),
+                true,
+            ),
         ]);
         assert_eq!(
             audited,

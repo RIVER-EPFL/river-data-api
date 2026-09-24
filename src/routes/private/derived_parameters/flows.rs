@@ -119,10 +119,19 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
 
     let mut query = SeaQuery::select();
     query
-        .distinct()
         .column((r.clone(), readings::Column::SiteId))
         .column((r.clone(), readings::Column::Time))
         .column((d.clone(), definition::Column::ToolScriptId))
+        // When the newest source value arrived, and when the output slot was declared: a gap
+        // whose inputs all predate the slot is its backfill, not a write that missed its recompute.
+        .expr_as(
+            Func::max(Expr::col((r.clone(), readings::Column::IngestedAt))),
+            Alias::new("input_written"),
+        )
+        .expr_as(
+            Func::max(Expr::col((sp.clone(), site_parameters::Column::CreatedAt))),
+            Alias::new("slot_declared"),
+        )
         .from_as(readings::Entity, r.clone())
         .join_as(
             JoinType::Join,
@@ -155,7 +164,7 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
             definition::Entity,
             f.clone(),
             Expr::col((f.clone(), definition::Column::ToolScriptId))
-                .equals((d, definition::Column::ToolScriptId)),
+                .equals((d.clone(), definition::Column::ToolScriptId)),
         )
         .join_as(
             JoinType::Join,
@@ -170,6 +179,9 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
                 .and(exact_source(&dps)),
         )
         .and_where(Expr::exists(derived_written).not())
+        .group_by_col((r.clone(), readings::Column::SiteId))
+        .group_by_col((r.clone(), readings::Column::Time))
+        .group_by_col((d.clone(), definition::Column::ToolScriptId))
         .order_by((r.clone(), readings::Column::SiteId), Order::Asc)
         .order_by((r.clone(), readings::Column::Time), Order::Asc)
         .limit(MAX_GAPS_PER_RUN as u64);
@@ -202,30 +214,61 @@ struct StaleSlot {
     site_id: Uuid,
     time: chrono::DateTime<chrono::FixedOffset>,
     tool_script_id: Uuid,
+    input_written: Option<chrono::DateTime<chrono::FixedOffset>>,
+    slot_declared: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
-/// What one calculation had filled at one site: every value, and the first instants of them.
+/// One calculation's gap at one site and instant, and whether it is the slot's backfill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gap {
+    pub tool_script_id: Uuid,
+    pub site_id: Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub backfill: bool,
+}
+
+/// Whether a gap is the backfill of a slot declared over values already stored: every input
+/// arrived before the slot was. A value that predates arrival tracking counts as stored; a slot
+/// that predates it cannot vouch, so its fill is shown as missed.
+fn is_backfill(
+    input_written: Option<chrono::DateTime<chrono::Utc>>,
+    slot_declared: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match (input_written, slot_declared) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(input), Some(slot)) => input < slot,
+    }
+}
+
+/// What one calculation had filled at one site: the values a missed recompute left, with the
+/// first instants of them, and apart from them the slot's backfill.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SiteFills {
     pub values: usize,
+    pub backfilled: usize,
     pub instants: Vec<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Each calculation's filled gaps by site, from the scan's `(calculation, site, instant)` rows and
-/// the `(site, instant)` pairs the recompute filled.
+/// Each calculation's filled gaps by site, from the scan's gaps and the `(site, instant)` pairs
+/// the recompute filled.
 fn fills_by_calculation(
-    gaps: &[(Uuid, Uuid, chrono::DateTime<chrono::Utc>)],
+    gaps: &[Gap],
     filled: &HashSet<(Uuid, chrono::DateTime<chrono::Utc>)>,
 ) -> BTreeMap<Uuid, BTreeMap<Uuid, SiteFills>> {
     let mut fills: BTreeMap<Uuid, BTreeMap<Uuid, SiteFills>> = BTreeMap::new();
-    for &(tool, site, time) in gaps {
-        if !filled.contains(&(site, time)) {
+    for gap in gaps {
+        if !filled.contains(&(gap.site_id, gap.time)) {
             continue;
         }
-        let at = fills.entry(tool).or_default().entry(site).or_default();
+        let at = fills.entry(gap.tool_script_id).or_default().entry(gap.site_id).or_default();
+        if gap.backfill {
+            at.backfilled += 1;
+            continue;
+        }
         at.values += 1;
         if at.instants.len() < FILL_INSTANTS_LISTED {
-            at.instants.push(time);
+            at.instants.push(gap.time);
         }
     }
     fills
@@ -286,10 +329,16 @@ pub async fn run_once(
     let mut gaps = Vec::with_capacity(rows.len());
     for row in &rows {
         let slot = StaleSlot::from_query_result(row, "")?;
-        gaps.push((slot.tool_script_id, slot.site_id, slot.time.with_timezone(&chrono::Utc)));
+        let utc = |t: chrono::DateTime<chrono::FixedOffset>| t.with_timezone(&chrono::Utc);
+        gaps.push(Gap {
+            tool_script_id: slot.tool_script_id,
+            site_id: slot.site_id,
+            time: utc(slot.time),
+            backfill: is_backfill(slot.input_written.map(utc), slot.slot_declared.map(utc)),
+        });
     }
     let mut instants: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> =
-        gaps.iter().map(|&(_, site, time)| (site, time)).collect();
+        gaps.iter().map(|g| (g.site_id, g.time)).collect();
     instants.dedup();
 
     let total = i32::try_from(instants.len()).unwrap_or(i32::MAX);

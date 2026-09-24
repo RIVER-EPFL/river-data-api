@@ -16,6 +16,7 @@ fn a_tool_run_value_is_reopened_in_its_tool_and_never_corrected_in_place() {
     let options = edit_options(&p);
     assert!(options.contains(&EditOption::ReopenRun));
     assert!(options.contains(&EditOption::Detach));
+    assert!(options.contains(&EditOption::Override));
     assert!(
         !options.contains(&EditOption::ValueCorrection),
         "correcting it here would leave the run beside a number it did not produce"
@@ -43,6 +44,10 @@ fn a_detached_slot_is_corrected_in_place_and_offers_the_way_back() {
         !options.contains(&EditOption::Detach),
         "it is already detached, so detaching again is refused"
     );
+    assert!(
+        !options.contains(&EditOption::Override),
+        "a detached value is corrected in place, not overridden"
+    );
 }
 
 #[test]
@@ -51,6 +56,7 @@ fn a_value_no_tool_produced_is_corrected_in_place() {
     assert!(options.contains(&EditOption::ValueCorrection));
     assert!(!options.contains(&EditOption::ReopenRun));
     assert!(!options.contains(&EditOption::Detach));
+    assert!(!options.contains(&EditOption::Override));
     // Nothing corrected it, so there is no calibration window to point at; the instrument
     // still comes from a deployment, and with none covering it the fix is to create one.
     assert!(!options.contains(&EditOption::Curve));
@@ -123,6 +129,7 @@ fn attribution_needs_more_than_curation_does() {
         assert_eq!(option.capability(), Capability::ManageSensors, "{option:?}");
     }
     assert_eq!(EditOption::Detach.capability(), Capability::Admin);
+    assert_eq!(EditOption::Override.capability(), Capability::Admin);
 }
 
 mod authorise {
@@ -157,6 +164,7 @@ mod authorise {
         assert!(authorise(&member(Role::Manager), EditOption::EditCalibration).is_ok());
         assert!(authorise(&member(Role::Manager), EditOption::Detach).is_err());
         assert!(authorise(&member(Role::Manager), EditOption::Return).is_err());
+        assert!(authorise(&member(Role::Manager), EditOption::Override).is_err());
     }
 
     #[test]
@@ -211,5 +219,97 @@ mod sites_to_confine {
     fn test_an_unrestricted_caller_edits_an_unpaired_reading() {
         let sites = sites_to_confine(&AccessScope::Unrestricted, &[None]).expect("unrestricted");
         assert!(sites.is_empty());
+    }
+}
+
+mod override_target {
+    use uuid::Uuid;
+
+    use super::super::override_target;
+
+    #[test]
+    fn test_override_target_takes_the_one_row_of_a_single_value_slot() {
+        let stream = Uuid::new_v4();
+        assert_eq!(override_target(&[(stream, 0)], None), Ok((stream, 0)));
+    }
+
+    #[test]
+    fn test_override_target_asks_for_the_replicate_when_the_slot_holds_several() {
+        let stream = Uuid::new_v4();
+        let rows = [(stream, 0), (stream, 1)];
+        let err = override_target(&rows, None).expect_err("ambiguous");
+        assert!(err.contains("replicate_index"), "{err}");
+        assert_eq!(override_target(&rows, Some(1)), Ok((stream, 1)));
+    }
+
+    #[test]
+    fn test_override_target_refuses_a_replicate_the_slot_does_not_hold() {
+        let stream = Uuid::new_v4();
+        assert!(override_target(&[(stream, 0)], Some(2)).is_err());
+    }
+
+    #[test]
+    fn test_override_target_refuses_an_empty_slot() {
+        assert!(override_target(&[], None).is_err());
+    }
+}
+
+mod overridden {
+    use chrono::{Duration, TimeZone, Utc};
+
+    use super::super::{SlotDecision, overridden};
+    use crate::routes::private::readings::models::Kind;
+
+    fn entry(kind: Kind, minutes: i64, replicate: Option<i16>, old: f64) -> SlotDecision {
+        SlotDecision {
+            kind,
+            at: Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap() + Duration::minutes(minutes),
+            replicate_index: replicate,
+            old_raw_value: Some(old),
+            actor: format!("{kind:?}-{minutes}"),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn test_overridden_names_the_computed_value_the_first_correction_after_the_detach_replaced() {
+        let ledger = [
+            entry(Kind::Detach, 0, None, 0.0),
+            entry(Kind::ValueCorrection, 0, Some(0), 331.9),
+            entry(Kind::ValueCorrection, 5, Some(0), 340.0),
+        ];
+        let found = overridden(&ledger, 0).expect("overridden");
+        // the value the calculation had stored, not the person's first number
+        assert_eq!(found.computed_value, Some(331.9));
+        assert_eq!(found.by, "ValueCorrection-0");
+    }
+
+    #[test]
+    fn test_overridden_is_none_without_a_correction_since_the_detach() {
+        let ledger = [
+            entry(Kind::ValueCorrection, 0, Some(0), 1.0),
+            entry(Kind::Detach, 5, None, 0.0),
+        ];
+        assert!(overridden(&ledger, 0).is_none());
+    }
+
+    #[test]
+    fn test_overridden_is_none_once_the_slot_is_returned() {
+        let ledger = [
+            entry(Kind::Detach, 0, None, 0.0),
+            entry(Kind::ValueCorrection, 0, Some(0), 331.9),
+            entry(Kind::Return, 10, None, 0.0),
+        ];
+        assert!(overridden(&ledger, 0).is_none());
+    }
+
+    #[test]
+    fn test_overridden_reads_only_the_named_replicate() {
+        let ledger = [
+            entry(Kind::Detach, 0, None, 0.0),
+            entry(Kind::ValueCorrection, 0, Some(1), 7.0),
+        ];
+        assert!(overridden(&ledger, 0).is_none());
+        assert_eq!(overridden(&ledger, 1).unwrap().computed_value, Some(7.0));
     }
 }

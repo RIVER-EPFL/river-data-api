@@ -2,8 +2,8 @@
 //! visit's recompute, so a calculation reading the value runs without anyone pressing a button.
 //!
 //! Visit-scoped and write-triggered, never timed or global (ADR 0007). A `portal_sync` visit is
-//! never recomputed (Q41), the chain's own save never re-enqueues, and a visit none of the enabled
-//! calculations read is left alone. One queued job per visit coalesces a burst of cell saves; the
+//! recomputed like any other (Q259), the chain's own save never re-enqueues, and a visit none of
+//! the enabled calculations read is left alone. One queued job per visit coalesces a burst of cell saves; the
 //! claim releases the job's dedupe key, so a change landing during a run yields one follow-up.
 
 use sea_orm::sea_query::{
@@ -147,14 +147,10 @@ pub async fn enqueue_for<C: ConnectionTrait>(
     if writer == Writer::Chain {
         return Ok(Vec::new());
     }
-    let candidates: Vec<&TouchedEvent> = events
-        .iter()
-        .filter(|e| super::service::chain_may_run(&e.source))
-        .collect();
-    if candidates.is_empty() {
+    if events.is_empty() {
         return Ok(Vec::new());
     }
-    let mut all_parameters: Vec<Uuid> = candidates
+    let mut all_parameters: Vec<Uuid> = events
         .iter()
         .flat_map(|e| e.parameter_ids.iter().copied())
         .collect();
@@ -162,7 +158,7 @@ pub async fn enqueue_for<C: ConnectionTrait>(
     all_parameters.dedup();
     let fed = tool_service::calculations_fed_by(db, &all_parameters).await?;
     let mut queued = Vec::new();
-    for event in candidates {
+    for event in events {
         let read_here = fed.iter().any(|c| {
             c.reads
                 .iter()
@@ -217,9 +213,6 @@ pub async fn enqueue_at_slot<C: ConnectionTrait>(
     let Some(event) = events::Entity::find_by_id(event_id).one(db).await? else {
         return Ok(None);
     };
-    if !super::service::chain_may_run(&event.source) {
-        return Ok(None);
-    }
     Ok(jobs::enqueue(
         db,
         "event_recompute",

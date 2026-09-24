@@ -3112,6 +3112,27 @@ pub(super) async fn output_rows_at<C: ConnectionTrait>(
         .collect())
 }
 
+/// Whether a live spot reading a sync service stored holds the output slot at one instant: the
+/// portal's own value for a column it computes, which the chain's save does not replace (Q310).
+pub async fn portal_holds_slot<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+) -> AppResult<bool> {
+    Ok(readings::Entity::find()
+        .inner_join(data_streams::Entity)
+        .filter(spot_group(site_id, parameter_id, at))
+        .filter(readings::Column::WithdrawnAt.is_null())
+        .filter(
+            data_streams::models::Column::SourceSystem
+                .is_not_in(collection_events::service::LOCAL_SOURCE_SYSTEMS),
+        )
+        .one(conn)
+        .await?
+        .is_some())
+}
+
 /// The owner of an output slot at a visit, read from the record: the latest live ownership
 /// decision on the slot's rows.
 pub async fn output_owner<C: ConnectionTrait>(
@@ -3724,6 +3745,134 @@ pub(super) async fn alarms<C: ConnectionTrait>(
         .collect())
 }
 
+// --- Override (Q263) ---
+
+/// The one row an override replaces: the slot's only row, or the named replicate when the slot
+/// holds several.
+pub(super) fn override_target(
+    rows: &[(Uuid, i16)],
+    replicate_index: Option<i16>,
+) -> Result<(Uuid, i16), String> {
+    match (rows, replicate_index) {
+        ([], _) => Err("No spot readings at that site, parameter and instant".to_string()),
+        ([only], None) => Ok(*only),
+        (_, None) => Err(format!(
+            "The slot holds {} replicates; name the one to override with replicate_index",
+            rows.len()
+        )),
+        (_, Some(index)) => rows
+            .iter()
+            .find(|(_, r)| *r == index)
+            .copied()
+            .ok_or_else(|| format!("The slot holds no replicate {index}")),
+    }
+}
+
+/// The one row an override names, as an edit selection.
+pub(super) fn override_selection(target: (Uuid, i16), time: DateTime<Utc>) -> Selection {
+    Selection {
+        keys: vec![SelectionKey {
+            stream_id: target.0,
+            time,
+            replicate_index: Some(target.1),
+            value: None,
+        }],
+        ..Default::default()
+    }
+}
+
+/// Detach the output slot and replace the one value in one transaction, so the ledger names who
+/// replaced which computed value. A return restores the computed value; the correction is the
+/// set, since a detach projects nothing a rollback could restore.
+pub(super) async fn record_override<C: ConnectionTrait>(
+    conn: &C,
+    rows: &[(Uuid, i16)],
+    target: (Uuid, i16),
+    req: &OverrideRequest,
+    actor: &str,
+) -> AppResult<(Uuid, Recorded)> {
+    let selection = override_selection(target, req.time);
+    let correction = EditDecision {
+        kind: Kind::ValueCorrection.as_str().to_string(),
+        value: Some(req.value),
+        target_id: None,
+        reason: req.reason.clone(),
+    };
+    let (set_id, recorded) = apply(conn, &selection, &correction, actor, Origin::Manual).await?;
+    let mut streams: Vec<Uuid> = rows.iter().map(|(s, _)| *s).collect();
+    streams.dedup();
+    for stream_id in streams {
+        record(
+            conn,
+            &Decision {
+                key: DecisionKey {
+                    stream_id,
+                    time: req.time,
+                    replicate_index: None,
+                },
+                kind: Kind::Detach,
+                new: serde_json::json!({ "owner": "manual" }),
+                actor: actor.to_string(),
+                reason: req.reason.clone(),
+                origin: Origin::Manual,
+                set_id: None,
+            },
+        )
+        .await?;
+    }
+    Ok((set_id, recorded))
+}
+
+/// The decisions recorded under one set, oldest first.
+pub(super) async fn set_decisions<C: ConnectionTrait>(
+    conn: &C,
+    set_id: Uuid,
+) -> AppResult<Vec<Uuid>> {
+    Ok(decision_model::Entity::find()
+        .select_only()
+        .column(decision_model::Column::Id)
+        .filter(decision_model::Column::SetId.eq(set_id))
+        .order_by_asc(decision_model::Column::At)
+        .into_tuple()
+        .all(conn)
+        .await?)
+}
+
+/// One live decision on a slot's rows, as the override reading needs it.
+#[derive(Debug, Clone)]
+pub(super) struct SlotDecision {
+    pub kind: Kind,
+    pub at: DateTime<Utc>,
+    pub replicate_index: Option<i16>,
+    pub old_raw_value: Option<f64>,
+    pub actor: String,
+    pub reason: Option<String>,
+}
+
+/// The hand override standing on one replicate: the first value correction at or after the
+/// slot's latest ownership decision, when that decision is a detach. The correction's old value
+/// is the one the calculation had stored.
+pub(super) fn overridden(ledger: &[SlotDecision], replicate_index: i16) -> Option<OverrideRef> {
+    let ownership = ledger
+        .iter()
+        .filter(|e| OWNERSHIP_KINDS.contains(&e.kind))
+        .max_by_key(|e| e.at)?;
+    if ownership.kind != Kind::Detach {
+        return None;
+    }
+    ledger
+        .iter()
+        .filter(|e| e.kind == Kind::ValueCorrection)
+        .filter(|e| e.replicate_index == Some(replicate_index) && e.at >= ownership.at)
+        .min_by_key(|e| e.at)
+        .map(|e| OverrideRef {
+            computed_value: e.old_raw_value,
+            by: e.actor.clone(),
+            at: e.at,
+            reason: e.reason.clone(),
+        })
+}
+
 /// The options a row's provenance permits, in the order the surface offers them.
 ///
 /// The rule is Q8's: the provenance already stored decides which path a cell takes. What decides
@@ -3736,6 +3885,7 @@ pub fn edit_options(p: &RowProvenance) -> Vec<EditOption> {
     if p.has_tool_run && !p.slot_detached {
         options.push(EditOption::ReopenRun);
         options.push(EditOption::Detach);
+        options.push(EditOption::Override);
     } else {
         if p.slot_detached {
             options.push(EditOption::Return);
@@ -4856,6 +5006,43 @@ pub(super) async fn load_value_arrivals(
     Ok(out)
 }
 
+/// The live ownership decisions and value corrections on the streams' instant, oldest first,
+/// keyed by stream: what [`overridden`] reads.
+pub(super) async fn load_override_ledgers(
+    db: &sea_orm::DatabaseConnection,
+    stream_ids: &[Uuid],
+    at: DateTime<Utc>,
+) -> AppResult<HashMap<Uuid, Vec<SlotDecision>>> {
+    let kinds: Vec<&str> = OWNERSHIP_KINDS
+        .iter()
+        .chain([Kind::ValueCorrection].iter())
+        .map(|k| k.as_str())
+        .collect();
+    let rows = decision_model::Entity::find()
+        .filter(decision_model::Column::StreamId.is_in(stream_ids.to_vec()))
+        .filter(decision_model::Column::Time.eq(sea_orm::prelude::DateTimeWithTimeZone::from(at)))
+        .filter(decision_model::Column::Kind.is_in(kinds))
+        .filter(decision_model::Column::RolledBackBy.is_null())
+        .order_by_asc(decision_model::Column::At)
+        .all(db)
+        .await?;
+    let mut out: HashMap<Uuid, Vec<SlotDecision>> = HashMap::new();
+    for row in rows {
+        let Some(kind) = Kind::parse(&row.kind) else {
+            continue;
+        };
+        out.entry(row.stream_id).or_default().push(SlotDecision {
+            kind,
+            at: row.at.with_timezone(&Utc),
+            replicate_index: row.replicate_index,
+            old_raw_value: row.old.get("raw_value").and_then(serde_json::Value::as_f64),
+            actor: row.actor,
+            reason: row.reason,
+        });
+    }
+    Ok(out)
+}
+
 /// Live instrument and calibration pins on the streams' instant (ADR 0008, M59), keyed by stream.
 pub(super) async fn load_pins(
     db: &sea_orm::DatabaseConnection,
@@ -5160,6 +5347,7 @@ pub async fn assemble_records(
     let mut holds_by_slot = fetch_slot_holds(db, rows, time).await?;
     let mut pins = load_pins(db, &stream_ids, time).await?;
     let value_arrivals = load_value_arrivals(db, &stream_ids, time).await?;
+    let override_ledgers = load_override_ledgers(db, &stream_ids, time).await?;
     let run_sources = fetch_run_sources(db, rows).await?;
     let (mut calculations, formula_versions) = fetch_calculations(db, rows).await?;
     let (retired_by_id, retired_by_name) = fetch_decommissions(
@@ -5216,6 +5404,9 @@ pub async fn assemble_records(
                     .copied()
                     .or(r.ingested_at),
                 provenance_kind: r.provenance_kind.clone(),
+                overridden: override_ledgers
+                    .get(stream_id)
+                    .and_then(|ledger| overridden(ledger, r.replicate_index)),
                 calibration: r.calibration_id.and_then(|id| {
                     calibration_map.get(&id).map(|c| CalibrationRef {
                         id: c.id,
@@ -9029,12 +9220,10 @@ pub(super) async fn enqueue_ingest_derived<C: ConnectionTrait>(
     Ok(())
 }
 
-/// The parameters a write's touched visits feed calculations from, sorted and once each. A visit
-/// the chain does not run at contributes none.
+/// The parameters a write's touched visits feed calculations from, sorted and once each.
 pub(super) fn chained_parameters(touched_events: &[TouchedEvent]) -> Vec<Uuid> {
     let mut touched: Vec<Uuid> = touched_events
         .iter()
-        .filter(|e| crate::routes::private::collection_events::service::chain_may_run(&e.source))
         .flat_map(|e| e.parameter_ids.iter().copied())
         .collect();
     touched.sort_unstable();
@@ -9444,19 +9633,10 @@ impl GrabFacts<'_> {
                 .notes
                 .map(String::from)
                 .or_else(|| prior.and_then(|p| p.notes.clone())),
-            provenance: self
-                .provenance
-                .cloned()
-                .or_else(|| prior.and_then(|p| p.provenance.clone())),
-            // The origin follows the blob: a rewrite that carries no run of its own keeps the one
-            // the group was computed under rather than reading as a hand entry.
-            kind: Some(if self.provenance.is_some() {
-                self.kind.to_string()
-            } else {
-                prior
-                    .and_then(|p| p.kind.clone())
-                    .unwrap_or_else(|| self.kind.to_string())
-            }),
+            // Value and provenance move together (CID16): a rewrite naming no run is explained by
+            // no run, whatever the group was computed under before.
+            provenance: self.provenance.cloned(),
+            kind: Some(self.kind.to_string()),
         }
     }
 }
@@ -10325,6 +10505,7 @@ pub(super) fn grab_dry_run(
         preview,
         existing_groups,
         calculations,
+        edit_set_id: None,
     }
 }
 
@@ -10405,6 +10586,29 @@ pub(super) fn refuse_unasked_replace(
         ),
         detail,
     })
+}
+
+/// A save naming no run over a parameter a calculation writes (Q263): the value is corrected
+/// through the calculation's inputs, or by an admin override, never typed over.
+pub(super) fn refuse_hand_save_over_calculated(
+    tool_run_id: Option<Uuid>,
+    site_id: Uuid,
+    parameter_ids: &[Uuid],
+    writers: &HashMap<Uuid, String>,
+) -> AppResult<()> {
+    if tool_run_id.is_some() {
+        return Ok(());
+    }
+    let Some((parameter_id, calculation)) = parameter_ids
+        .iter()
+        .find_map(|p| writers.get(p).map(|c| (p, c)))
+    else {
+        return Ok(());
+    };
+    Err(AppError::Conflict(format!(
+        "parameter {parameter_id} at site {site_id} is computed by calculation '{calculation}'; \
+         correct it through the calculation's inputs"
+    )))
 }
 
 /// The grab stream each parameter's readings land on, created on first use.
@@ -10505,6 +10709,7 @@ pub(super) struct GrabWritten {
     pub(super) withdrawn: usize,
     pub(super) created_sample_ids: Vec<Uuid>,
     pub(super) touched_events: Vec<TouchedEvent>,
+    pub(super) edit_set_id: Option<Uuid>,
 }
 
 /// What a replace does to the rows it rewrites.
@@ -10575,14 +10780,15 @@ impl GrabWrite<'_> {
 
     /// The save, in one guarded transaction.
     pub(super) async fn run(&self, txn: &sea_orm::DatabaseTransaction) -> AppResult<GrabWritten> {
-        let prior_facts = if self.replaces() {
-            self.record_replace_decisions(txn).await?;
-            self.prior_facts(txn).await?
+        let edit_set_id = self.open_edit_set(txn).await?;
+        let (prior_facts, corrected) = if self.replaces() {
+            let corrected = self.record_replace_decisions(txn, edit_set_id).await?;
+            (self.prior_facts(txn).await?, corrected)
         } else {
-            HashMap::new()
+            (HashMap::new(), 0)
         };
         let outcome = if self.replaces() {
-            self.hold_kept_and_withdraw_dropped(txn).await?
+            self.hold_kept_and_withdraw_dropped(txn, edit_set_id).await?
         } else {
             ReplaceOutcome {
                 replaced: 0,
@@ -10590,6 +10796,10 @@ impl GrabWrite<'_> {
                 withdrawn: 0,
             }
         };
+        if let Some(set_id) = edit_set_id {
+            let decided = corrected + u64::try_from(outcome.withdrawn).unwrap_or(u64::MAX);
+            close_set(txn, set_id, decided).await?;
+        }
         let stored_facts = self.stored_facts(&prior_facts);
         let models = self.models(&stored_facts);
         let inserted = self.insert(txn, &models).await?;
@@ -10606,14 +10816,51 @@ impl GrabWrite<'_> {
             withdrawn: outcome.withdrawn,
             created_sample_ids,
             touched_events,
+            edit_set_id,
         })
+    }
+
+    /// The decision set a person's replace records its corrections and withdrawals under, which
+    /// is what rolls the save back as one. An insert decides nothing and the chain's supersession
+    /// is not a person's edit, so neither opens one.
+    async fn open_edit_set(&self, txn: &sea_orm::DatabaseTransaction) -> AppResult<Option<Uuid>> {
+        if !self.replaces() || self.writer != flows::Writer::Person {
+            return Ok(None);
+        }
+        let selection = Selection {
+            keys: self
+                .groups
+                .iter()
+                .map(|&(parameter_id, time)| SelectionKey {
+                    stream_id: self.streams[&parameter_id],
+                    time,
+                    replicate_index: None,
+                    value: None,
+                })
+                .collect(),
+            ..Selection::default()
+        };
+        let set_id = open_set(
+            txn,
+            Kind::ValueCorrection,
+            &selection,
+            serde_json::json!({ "mode": "replace" }),
+            self.actor,
+            Some("replaced by a new entry"),
+        )
+        .await?;
+        Ok(Some(set_id))
     }
 
     /// What the replace rewrites is decided before the rows go: a person's correction of a stored
     /// value, or the chain superseding an output with a fresh run (ADR 0008). Rows whose value does
     /// not change decide nothing, and a flagged, withdrawn or hand-curved row stays as it is (SB5)
     /// and gets a hold, not a correction.
-    async fn record_replace_decisions(&self, txn: &sea_orm::DatabaseTransaction) -> AppResult<()> {
+    async fn record_replace_decisions(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        set_id: Option<Uuid>,
+    ) -> AppResult<u64> {
         let (kind, origin, reason) = match self.writer {
             flows::Writer::Chain => (Kind::Chain, Origin::Chain, "superseded by a recompute"),
             flows::Writer::Person => (
@@ -10622,6 +10869,7 @@ impl GrabWrite<'_> {
                 "replaced by a new entry",
             ),
         };
+        let mut decided = 0u64;
         for &group in self.groups {
             let rows: Vec<(DateTime<Utc>, i16, serde_json::Value)> = self
                 .in_group(group)
@@ -10641,7 +10889,7 @@ impl GrabWrite<'_> {
                 "r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL \
                  AND r.standard_curve_id IS NULL"
             };
-            record_keyed(
+            let recorded = record_keyed(
                 txn,
                 kind,
                 self.streams[&group.0],
@@ -10651,11 +10899,12 @@ impl GrabWrite<'_> {
                 origin,
                 Keyed::Changed,
                 Some(guard),
-                None,
+                set_id,
             )
             .await?;
+            decided += recorded.rows;
         }
-        Ok(())
+        Ok(decided)
     }
 
     /// The label, notes, authorship and blob each rewritten group carries, kept on the rewritten
@@ -10702,6 +10951,7 @@ impl GrabWrite<'_> {
     async fn hold_kept_and_withdraw_dropped(
         &self,
         txn: &sea_orm::DatabaseTransaction,
+        set_id: Option<Uuid>,
     ) -> AppResult<ReplaceOutcome> {
         let mut removed: u64 = 0;
         let mut kept_curated: usize = 0;
@@ -10715,9 +10965,16 @@ impl GrabWrite<'_> {
                 .in_group(group)
                 .map(|(_, p)| p.replicate_index)
                 .collect();
-            withdrawn +=
-                withdraw_uncarried(txn, stream_id, time, &carried, supplies_curve, self.actor)
-                    .await?;
+            withdrawn += withdraw_uncarried(
+                txn,
+                stream_id,
+                time,
+                &carried,
+                supplies_curve,
+                self.actor,
+                set_id,
+            )
+            .await?;
             removed += count_rewritten(txn, stream_id, time, carried, supplies_curve).await?;
         }
         Ok(ReplaceOutcome {
@@ -10999,6 +11256,7 @@ async fn withdraw_uncarried(
     carried: &[i16],
     supplies_curve: bool,
     actor: &str,
+    set_id: Option<Uuid>,
 ) -> AppResult<usize> {
     use crate::routes::private::readings::models::Column;
     let mut cond = Condition::all()
@@ -11021,7 +11279,7 @@ async fn withdraw_uncarried(
         actor,
         Some("dropped by a narrower entry"),
         Origin::Manual,
-        None,
+        set_id,
     )
     .await?;
     Ok(usize::try_from(dropped.rows).unwrap_or(usize::MAX))

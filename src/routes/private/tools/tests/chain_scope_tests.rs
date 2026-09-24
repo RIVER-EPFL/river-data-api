@@ -52,13 +52,14 @@ fn an_empty_scope_is_not_bounded_and_any_single_term_is() {
     );
 }
 
+/// A synced visit is recomputed like any other (Q259), so no scope filters on the source.
 #[test]
-fn portal_sync_visits_are_excluded_whatever_the_scope() {
+fn portal_sync_visits_are_in_every_scope() {
     let sql = events_sql(&RecomputeScope {
         only_findings: true,
         ..Default::default()
     });
-    assert!(sql.contains(r#""ce"."source" <> 'portal_sync'"#), "{sql}");
+    assert!(!sql.contains("source"), "{sql}");
 }
 
 #[test]
@@ -283,11 +284,10 @@ fn a_constant_narrows_a_site_scope() {
     assert!(sql.contains("'molar_mass_c'"), "{sql}");
 }
 
-/// The audit reports on the set the repair can repair: a synced visit is the portal's, so neither
-/// covers one (Q175).
+/// The audit reports on the set the repair can repair, which holds synced visits now (Q259).
 #[test]
-fn the_audit_set_excludes_portal_sync_visits_too() {
+fn the_audit_set_holds_portal_sync_visits_too() {
     let sql =
         crate::routes::private::tools::flows::audit_event_set(None, None, None, None).to_string();
-    assert!(sql.contains("portal_sync"), "{sql}");
+    assert!(!sql.contains("source"), "{sql}");
 }

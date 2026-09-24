@@ -1,4 +1,4 @@
-use super::{GrabFacts, StoredFacts, declared_instrument};
+use super::{GrabFacts, StoredFacts, declared_instrument, refuse_hand_save_over_calculated};
 
 fn stored(label: &str, notes: &str, author: &str) -> StoredFacts {
     StoredFacts {
@@ -32,7 +32,7 @@ fn a_row_the_curve_did_not_correct_takes_the_slot_s_declaration() {
 }
 
 #[test]
-fn a_silent_field_keeps_what_the_group_carried() {
+fn a_silent_field_keeps_what_the_group_carried_but_its_run() {
     let prior = stored("batch 7", "filtered on site", "lab");
     let request = GrabFacts {
         created_by: None,
@@ -46,10 +46,49 @@ fn a_silent_field_keeps_what_the_group_carried() {
     assert_eq!(merged.notes.as_deref(), Some("corrected note"));
     assert_eq!(merged.created_by.as_deref(), Some("lab"));
     assert_eq!(
-        merged.provenance,
-        Some(serde_json::json!({ "tool": "doc" })),
-        "a rewrite that names no run keeps the blob behind the value"
+        merged.provenance, None,
+        "a rewrite that names no run explains its value by no run"
     );
+    assert_eq!(merged.kind.as_deref(), Some("manual"));
+}
+
+fn site() -> uuid::Uuid {
+    uuid::Uuid::from_u128(7)
+}
+
+#[test]
+fn test_refuse_hand_save_over_calculated_names_the_calculation() {
+    let calculated = uuid::Uuid::new_v4();
+    let typed = uuid::Uuid::new_v4();
+    let writers = std::collections::HashMap::from([(calculated, "pco2".to_string())]);
+    let err = refuse_hand_save_over_calculated(None, site(), &[typed, calculated], &writers)
+        .expect_err("a hand value over a calculated parameter is refused");
+    assert!(err.to_string().contains("pco2"), "{err}");
+    assert!(err.to_string().contains(&calculated.to_string()), "{err}");
+}
+
+#[test]
+fn test_refuse_hand_save_over_calculated_lets_a_run_save_its_outputs() {
+    let calculated = uuid::Uuid::new_v4();
+    let writers = std::collections::HashMap::from([(calculated, "pco2".to_string())]);
+    assert!(
+        refuse_hand_save_over_calculated(
+            Some(uuid::Uuid::new_v4()),
+            site(),
+            &[calculated],
+            &writers
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn test_refuse_hand_save_over_calculated_lets_a_measurement_through() {
+    let writers = std::collections::HashMap::from([(uuid::Uuid::new_v4(), "pco2".to_string())]);
+    assert!(
+        refuse_hand_save_over_calculated(None, site(), &[uuid::Uuid::new_v4()], &writers).is_ok()
+    );
+    assert!(refuse_hand_save_over_calculated(None, site(), &[], &writers).is_ok());
 }
 
 #[test]

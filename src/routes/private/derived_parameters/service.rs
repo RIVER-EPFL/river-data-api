@@ -135,9 +135,10 @@ pub(crate) async fn declared_steps<C: ConnectionTrait>(
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
 }
 
-/// Everything that reads one step: the calculation that owns it, every calculation that declares
-/// it, and inside each, the formulas whose text names the step's code (M208). A step mints no
-/// catalog parameter, so it cannot be asked about through the parameter graph.
+/// Everything that reads one step: the calculation that owns it, every calculation that receives
+/// it, by a declaration or through another step it declares, and inside each, the formulas whose
+/// text names the step's code (M208). A step mints no catalog parameter, so it cannot be asked
+/// about through the parameter graph.
 pub async fn dependents_of_step<C: ConnectionTrait>(
     db: &C,
     formula_id: Uuid,
@@ -148,14 +149,17 @@ pub async fn dependents_of_step<C: ConnectionTrait>(
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
         .ok_or_else(|| ApiError::not_found("No formula carries that id".to_string(), None))?;
 
-    let declared = super::models::shared_step::Entity::find()
-        .filter(super::models::shared_step::Column::FormulaId.eq(formula_id))
-        .all(db)
-        .await
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-
+    // A shared step reaches a calculation through any step that calculation declares, so every
+    // declaring calculation is a candidate and the loaded sets say which receive it.
+    let declarations = match step.tool_script_id {
+        Some(_) => Vec::new(),
+        None => super::models::shared_step::Entity::find()
+            .all(db)
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?,
+    };
     let mut script_ids: Vec<Uuid> = step.tool_script_id.into_iter().collect();
-    for declaration in &declared {
+    for declaration in &declarations {
         if !script_ids.contains(&declaration.tool_script_id) {
             script_ids.push(declaration.tool_script_id);
         }
@@ -175,6 +179,12 @@ pub async fn dependents_of_step<C: ConnectionTrait>(
         let Some(script) = scripts.iter().find(|s| s.id == script_id) else {
             continue;
         };
+        let receives = formulas
+            .iter()
+            .any(|(owner, formula)| *owner == script_id && formula.code == step.code);
+        if !receives {
+            continue;
+        }
         let readers = formulas
             .iter()
             .filter(|(owner, formula)| {

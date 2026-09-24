@@ -38,15 +38,13 @@ use crate::routes::resolve_site;
 
 /// Recompute a collection event's tool outputs on demand: the chain executor runs every active
 /// tool whose inputs resolve at this event, in dependency order, and saves the outputs through
-/// the grab write path with fresh server-built provenance. A visit the sync created is refused
-/// (Q41). Tracked job. Requires `write_data`.
+/// the grab write path with fresh server-built provenance. Tracked job. Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/api/collection_events/{id}/recompute",
     params(("id" = Uuid, Path, description = "Collection event id")),
     responses(
         (status = 200, description = "The tracked recompute job", body = EnqueuedJobResponse),
-        (status = 400, description = "The visit was created by the portal sync"),
         (status = 404, description = "Unknown collection event"),
     ),
     tag = "collection_events"
@@ -62,13 +60,6 @@ pub async fn recompute_collection_event(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Collection event {id} not found")))?;
     enforce_project_scope_for_sites(&state.db, &scope, &[event.site_id]).await?;
-    if !service::chain_may_run(&event.source) {
-        return Err(AppError::BadRequest(
-            "This visit was created by the portal sync, so calculations do not run at it. \
-             Correct the value in the portal, which recomputes its own outputs."
-                .to_string(),
-        ));
-    }
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "event_recompute",
@@ -907,6 +898,7 @@ pub async fn get_event_detail(
                     finding: finding_by_param.remove(&r.parameter_id),
                     read_by: Vec::new(),
                     written_by: None,
+                    computed_curves: Vec::new(),
                 });
             }
         }
@@ -948,6 +940,7 @@ pub async fn get_event_detail(
             finding: Some(finding),
             read_by: Vec::new(),
             written_by: None,
+            computed_curves: Vec::new(),
         });
     }
     let mut records = crate::routes::private::readings::service::records_for_event(
@@ -959,6 +952,7 @@ pub async fn get_event_detail(
     for cell in &mut cells {
         cell.record = records.remove(&cell.stream_id);
     }
+    service::attach_computed_curves(&state.db, &mut cells).await?;
 
     // Which calculation reads each cell, and which writes it: the grid colours by role and names
     // the script in the tooltip, so the consequence of an edit is visible before it is made.

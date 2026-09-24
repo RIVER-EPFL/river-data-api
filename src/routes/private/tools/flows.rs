@@ -323,6 +323,7 @@ pub fn output_skip_reason(
     key: &str,
     owner: crate::routes::private::readings::models::Owner,
     cadence: Option<&str>,
+    portal_held: bool,
 ) -> Option<String> {
     if owner == crate::routes::private::readings::models::Owner::Manual {
         return Some(format!("output {key} is detached at this visit"));
@@ -330,6 +331,11 @@ pub fn output_skip_reason(
     if cadence == Some("high") {
         return Some(format!(
             "output {key} is a high-cadence slot at this site, computed on its stream"
+        ));
+    }
+    if portal_held {
+        return Some(format!(
+            "output {key} holds the portal's own value at this visit"
         ));
     }
     None
@@ -344,14 +350,15 @@ pub fn outputs_audited(
         Uuid,
         crate::routes::private::readings::models::Owner,
         Option<String>,
+        bool,
     )>,
 ) -> Vec<(String, Uuid)> {
     outputs
         .into_iter()
-        .filter(|(key, _, owner, cadence)| {
-            output_skip_reason(key, *owner, cadence.as_deref()).is_none()
+        .filter(|(key, _, owner, cadence, portal_held)| {
+            output_skip_reason(key, *owner, cadence.as_deref(), *portal_held).is_none()
         })
-        .map(|(key, parameter_id, _, _)| (key, parameter_id))
+        .map(|(key, parameter_id, _, _, _)| (key, parameter_id))
         .collect()
 }
 
@@ -376,7 +383,14 @@ async fn outputs_audited_at(
             *parameter_id,
         )
         .await?;
-        judged.push((key.clone(), *parameter_id, owner, cadence));
+        let portal_held = crate::routes::private::readings::service::portal_holds_slot(
+            db,
+            event.site_id,
+            *parameter_id,
+            event.collected_at,
+        )
+        .await?;
+        judged.push((key.clone(), *parameter_id, owner, cadence, portal_held));
     }
     Ok(outputs_audited(judged))
 }
@@ -875,7 +889,14 @@ async fn walk_event(
                 *parameter_id,
             )
             .await?;
-            match output_skip_reason(key, owner, cadence.as_deref()) {
+            let portal_held = crate::routes::private::readings::service::portal_holds_slot(
+                &state.db,
+                event.site_id,
+                *parameter_id,
+                event.collected_at,
+            )
+            .await?;
+            match output_skip_reason(key, owner, cadence.as_deref(), portal_held) {
                 Some(reason) => outcome.skipped.push((tool.name.clone(), reason)),
                 None => owned_outputs.push((key.clone(), *parameter_id)),
             }
@@ -1926,13 +1947,7 @@ pub(super) fn audit_event_set(
     let mut query = Query::select();
     query
         .column(collection_events::Column::Id)
-        .from(collection_events::Entity)
-        // A synced visit is the portal's, and the repair refuses one (Q41), so the audit that
-        // would raise findings against it covers the same set the recompute does (Q175).
-        .and_where(
-            Expr::col(collection_events::Column::Source)
-                .ne(crate::routes::private::collection_events::service::PORTAL_SYNC),
-        );
+        .from(collection_events::Entity);
     if let Some(id) = event_id {
         query.and_where(Expr::col(collection_events::Column::Id).eq(id));
     } else if let Some(site) = site_id {

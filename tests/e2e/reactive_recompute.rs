@@ -3,8 +3,8 @@
 //! Scenario: `react_b` reads the `ReactA` parameter at the visit and writes `ReactB`. A member
 //! saves ReactA replicates by hand, with no tool run behind them, and ReactB appears with a
 //! `chain` run behind it; a correction re-runs it once; the chain's own save enqueues nothing; a
-//! disabled calculation does not fire; a flag on a replicate fires it; a portal-synced visit never
-//! fires it; the save reports beforehand which calculation it feeds.
+//! disabled calculation does not fire; a flag on a replicate fires it; a portal-synced visit fires
+//! it the same way (Q259); the save reports beforehand which calculation it feeds.
 
 use serde_json::json;
 use serial_test::serial;
@@ -279,7 +279,7 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
         .expect("the visit is listed");
     assert_eq!(row["recompute"], "current", "{row}");
 
-    // A portal-synced visit never fires a calculation (Q41).
+    // A portal-synced visit fires it too, and the output the portal does not compute lands (Q259).
     db.execute_unprepared(&format!(
         "INSERT INTO collection_events (site_id, collected_at, source) \
          VALUES ('{site_id}', '{SYNCED_VISIT}', 'portal_sync')"
@@ -289,8 +289,21 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
     save_a(vec![10.0, 20.0], SYNCED_VISIT, false, false).await;
     assert_eq!(
         recompute_jobs().await,
-        3,
-        "a portal_sync visit enqueues nothing"
+        4,
+        "a portal_sync visit enqueues its recompute"
+    );
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    assert_eq!(
+        river_db::routes::private::tools::flows::served_spot_value(
+            &db,
+            site_id.parse().expect("site uuid"),
+            pb.parse().expect("parameter uuid"),
+            SYNCED_VISIT.parse().expect("visit instant"),
+        )
+        .await
+        .expect("read the served spot value"),
+        Some(20.0),
+        "mean(10, 20) + 5 at the synced visit"
     );
 }
 

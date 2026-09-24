@@ -314,6 +314,60 @@ pub async fn detach_output(
     }))
 }
 
+/// Replace a calculated value by hand (Q263): the slot is detached from its calculation and the
+/// one value corrected in one transaction, which the provenance record reads back as the computed
+/// value it replaced. Return is the way back. Requires Administrator.
+#[utoipa::path(
+    post,
+    path = "/api/readings/override",
+    request_body = OverrideRequest,
+    responses(
+        (status = 200, description = "Overridden", body = EditResponse),
+        (status = 400, description = "The slot holds several replicates and none was named"),
+        (status = 404, description = "No readings at the slot instant"),
+        (status = 409, description = "The slot is already detached; correct its value instead"),
+    ),
+    tag = "readings"
+)]
+pub async fn override_output(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+    Json(req): Json<OverrideRequest>,
+) -> AppResult<Json<EditResponse>> {
+    let actor = label(&auth);
+    let rows = output_rows_at(&state.db, req.site_id, req.parameter_id, req.time).await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(
+            "No spot readings at that site, parameter and instant".to_string(),
+        ));
+    }
+    let target = override_target(&rows, req.replicate_index).map_err(AppError::BadRequest)?;
+    if output_owner(&state.db, req.site_id, req.parameter_id, req.time).await? == Owner::Manual {
+        return Err(AppError::Conflict(
+            "The slot is already detached; correct its value instead".to_string(),
+        ));
+    }
+    refuse_unrouted(
+        &state.db,
+        &override_selection(target, req.time),
+        EditOption::Override,
+    )
+    .await?;
+    let (set_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let (set_id, recorded) = record_override(txn, &rows, target, &req, &actor).await?;
+        queue_visit_recomputes(txn, &recorded, &actor).await?;
+        Ok((set_id, recorded))
+    })
+    .await?;
+    refresh_edited_rollups(&state, &recorded).await;
+    let decision_ids = set_decisions(&state.db, set_id).await?;
+    Ok(Json(EditResponse {
+        rows_decided: recorded.rows,
+        decision_ids,
+        set_id,
+    }))
+}
+
 /// Return a detached output slot to its calculation: the value the last correction since the
 /// detach replaced is restored, the tool owns the slot again, and the visit recomputes to catch
 /// up with inputs that moved while it was detached. Requires Administrator.
@@ -348,7 +402,8 @@ pub async fn return_output(
     let decided = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let mut decided = 0u64;
         for stream_id in &streams {
-            // The value the first correction after the detach replaced is the tool's last value.
+            // The value the first correction since the detach replaced is the tool's last value; an
+            // override records both in one transaction, so at one instant.
             let at = sea_orm::prelude::DateTimeWithTimeZone::from(req.time);
             let detached_at = decision_model::Entity::find()
                 .select_only()
@@ -366,7 +421,7 @@ pub async fn return_output(
                 .filter(decision_model::Column::Time.eq(at))
                 .filter(decision_model::Column::Kind.eq(Kind::ValueCorrection.as_str()))
                 .filter(decision_model::Column::RolledBackBy.is_null())
-                .filter(sea_orm::ExprTrait::gt(
+                .filter(sea_orm::ExprTrait::gte(
                     Expr::col(decision_model::Column::At),
                     detached_at,
                 ))
@@ -1946,6 +2001,22 @@ pub async fn ingest_status_events(
     }))
 }
 
+/// The step of a grab save that keeps a typed value off a calculated parameter (Q263).
+async fn refuse_hand_values_over_calculations(
+    db: &impl sea_orm::ConnectionTrait,
+    tool_run_id: Option<Uuid>,
+    site_id: Uuid,
+    readings: &[GrabSampleReading],
+) -> AppResult<()> {
+    if tool_run_id.is_some() {
+        return Ok(());
+    }
+    let parameter_ids: Vec<Uuid> = readings.iter().map(|r| r.parameter_id).collect();
+    let writers =
+        crate::routes::private::tools::service::calculations_writing(db, &parameter_ids).await?;
+    refuse_hand_save_over_calculated(tool_run_id, site_id, &parameter_ids, &writers)
+}
+
 /// Insert field-collected grab sample readings (manual measurements with replicate sets).
 /// Each request creates one Sample aggregate per parameter and uses dedicated "grab_sample"
 /// streams. Requires `write_data`.
@@ -1973,6 +2044,7 @@ pub async fn insert_grab_samples(
     let site = find_grab_site(db, payload.site_id).await?;
     let slots = load_grab_slots(db, site.id, readings).await?;
     slots.require_configured(&site, readings)?;
+    refuse_hand_values_over_calculations(db, payload.tool_run_id, site.id, readings).await?;
     require_checked_values(db, payload.check_id, site.id, readings).await?;
     let indices = assign_replicate_indices(readings)?;
     let actor = label(&auth);
@@ -2039,6 +2111,7 @@ pub async fn insert_grab_samples(
         kept_curated,
         withdrawn,
         created_sample_ids,
+        edit_set_id,
         ..
     } = written;
 
@@ -2055,6 +2128,7 @@ pub async fn insert_grab_samples(
         preview,
         existing_groups,
         calculations,
+        edit_set_id,
     }))
 }
 
@@ -2877,6 +2951,7 @@ pub fn readings_admin_routes(state: &AppState) -> axum::Router {
     axum::Router::new()
         .route("/readings/detach", post(detach_output))
         .route("/readings/return", post(return_output))
+        .route("/readings/override", post(override_output))
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(axum::middleware::from_fn(require_admin))
         .with_state(state.clone())

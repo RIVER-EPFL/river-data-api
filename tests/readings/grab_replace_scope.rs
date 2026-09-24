@@ -490,3 +490,36 @@ async fn a_replace_rewrites_carried_replicates_in_place() {
         "the changed value is on the record"
     );
 }
+
+/// Scenario: the chain asks whether the portal's own value holds an output slot at a synced visit
+/// before writing it (M391, Q310).
+///
+/// Expected behaviour: a live row on a sync stream holds it; the grab stream's own rows and a
+/// withdrawn portal row do not.
+#[tokio::test]
+#[serial]
+async fn the_portal_holds_a_slot_only_with_a_live_row_on_a_sync_stream() {
+    let fx = setup().await;
+    let site: uuid::Uuid = crate::common::SITE1_ID.parse().unwrap();
+    let parameter: uuid::Uuid = crate::common::GLOBAL_PARAM_TEMP_ID.parse().unwrap();
+    let at: chrono::DateTime<chrono::Utc> = T.parse().unwrap();
+    let holds = || async {
+        river_db::routes::private::readings::service::portal_holds_slot(&fx.db, site, parameter, at)
+            .await
+            .unwrap()
+    };
+
+    let (status, body) = save(&fx, &grab(&[10.0], None)).await;
+    assert_eq!(status, 200, "grab ({status}): {body}");
+    assert!(!holds().await, "a grab row is this system's own");
+
+    let portal = seed_portal_group(&fx).await;
+    assert!(holds().await, "the portal's row holds the slot");
+
+    crate::common::exec(
+        &fx.db,
+        &format!("UPDATE readings SET withdrawn_at = now() WHERE stream_id = '{portal}'"),
+    )
+    .await;
+    assert!(!holds().await, "a withdrawn portal row holds nothing");
+}

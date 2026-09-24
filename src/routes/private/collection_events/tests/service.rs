@@ -109,16 +109,6 @@ fn the_dedupe_key_is_one_per_visit() {
     assert_eq!(dedupe_key(id), format!("event_recompute:{id}"));
 }
 
-/// Q41: the chain runs at a visit a person made and not at one the sync made, and every door asks
-/// this one question rather than spelling the source out for itself.
-#[test]
-fn a_synced_visit_is_the_one_source_the_chain_stays_out_of() {
-    assert!(chain_may_run("manual"));
-    assert!(!chain_may_run(PORTAL_SYNC));
-    // A source nobody writes today is not a reason to withhold the chain.
-    assert!(chain_may_run("csv_import"));
-}
-
 #[test]
 fn test_a_calculation_shows_its_repair_while_it_runs_and_when_it_failed() {
     assert_eq!(calculation_repair(Some("queued")), Some("queued"));
