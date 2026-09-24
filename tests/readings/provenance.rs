@@ -819,10 +819,11 @@ async fn a_per_replicate_chain_is_walkable_in_both_directions() {
     assert_eq!(s2["inputs"][0]["parameter_id"], json!(s1_id));
     assert!(s2.get("consumers").is_none(), "{s2}");
 
-    // A disabled calculation is no longer a consumer; what it produced keeps its inputs.
+    // A decommissioned calculation is no longer a consumer; what it produced keeps its inputs.
     crate::common::exec(
         &db,
-        "UPDATE tool_scripts SET enabled = false WHERE name = 'chain'",
+        "UPDATE tool_scripts SET decommissioned_at = now(), decommissioned_by = 'test', \
+         decommission_reason = 'retired' WHERE name = 'chain'",
     )
     .await;
     let peak = record_of(&app, &token, &peak_id).await;

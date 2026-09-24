@@ -173,7 +173,7 @@ async fn test_a_decommissioned_calculation_s_column_is_taken_over_once_confirmed
         "a live calculation's output is refused, confirmed or not: {body}"
     );
 
-    exec(&f.db, &format!("UPDATE tool_scripts SET decommissioned_at = now(), decommissioned_by = 'admin', decommission_reason = 'Replaced', enabled = false WHERE id = '{old}'")).await;
+    exec(&f.db, &format!("UPDATE tool_scripts SET decommissioned_at = now(), decommissioned_by = 'admin', decommission_reason = 'Replaced' WHERE id = '{old}'")).await;
     let (status, body) = save(&f.app, &f.token, live, &code, "uatm", &[]).await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["detail"]["take_over"][0]["kind"], "decommissioned");

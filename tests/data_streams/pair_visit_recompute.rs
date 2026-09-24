@@ -194,3 +194,36 @@ async fn an_entry_channel_pairing_whose_visit_recompute_cannot_be_queued_pairs_n
     assert_eq!(paired(&db, stream).await, 1);
     assert_eq!(recomputes_queued(&db, event).await, 1);
 }
+
+/// Scenario: a visit whose only reading came through the stream carries a note, and the stream is
+/// unpaired.
+///
+/// Expected behaviour: the visit and its note stay (CID10), with no reading on it.
+#[tokio::test]
+#[serial]
+async fn an_unpairing_keeps_the_visit_it_empties() {
+    let (app, token, db) = setup().await;
+    let stream = create_paired_stream(&db, "visit-unpair-empties", PARAM_S1_TEMP_ID).await;
+    let event = visit_reading(&db, stream, true).await;
+    exec(
+        &db,
+        &format!("UPDATE collection_events SET notes = 'turbid' WHERE id = '{event}'"),
+    )
+    .await;
+
+    let (status, body) = unpair(&app, &token, stream).await;
+
+    assert_eq!(status, 200, "unpair: {body}");
+    assert_eq!(
+        e2e::count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM collection_events \
+                 WHERE id = '{event}' AND notes = 'turbid'"
+            ),
+        )
+        .await,
+        1,
+        "the emptied visit keeps its note"
+    );
+}

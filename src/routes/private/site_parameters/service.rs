@@ -201,24 +201,13 @@ impl CRUDOperations for SiteParameterOperations {
         // site-specific copy would silently shadow a global threshold an operator set. A
         // site-specific row is created only when a user explicitly overrides via the editor.
 
-        // Backfill derived values for the readings already present at this site when a
-        // derived site_parameter is assigned, as a durable `derived_assignment` job. The key
-        // coalesces a second assignment at this site while the first waits; once one is running it
-        // may have read the slots before this one, so this one gets a run of its own.
+        // A calculated slot is computed at the data the site already holds.
         if entity.entry_mode == "tool"
             && let Some(calculation_id) = calculation_producing(db, entity.parameter_id).await?
         {
-            let site_id = entity.site_id;
-            crate::routes::private::reprocessing_jobs::service::enqueue(
-                db,
-                "derived_assignment",
-                None,
-                Some(calculation_id),
-                &serde_json::json!({ "calculation_id": calculation_id, "site_id": site_id }),
-                Some(&assignment_dedupe_key(calculation_id, site_id)),
-            )
-            .await
-            .map_err(ApiError::database)?;
+            compute_declared_output(db, calculation_id, entity.site_id, &entity.cadence)
+                .await
+                .map_err(ApiError::database)?;
         }
 
         Ok(())
@@ -854,6 +843,64 @@ pub(crate) async fn delete_source<C: ConnectionTrait>(
 /// the same calculation is its own job.
 pub(super) fn assignment_dedupe_key(calculation_id: Uuid, site_id: Uuid) -> String {
     format!("derived_assignment:{calculation_id}:{site_id}")
+}
+
+/// The job that computes a calculation's newly declared output at a site's existing data.
+#[derive(Debug, PartialEq)]
+pub struct DeclaredOutputJob {
+    pub trigger_type: &'static str,
+    pub subject: Uuid,
+    pub params: serde_json::Value,
+    pub dedupe_key: String,
+}
+
+/// The job for a declared output on the arm its slot declares: a visit slot recomputes the site's
+/// visits, as "Compute at listed visits" does, and a stream slot backfills the site's pulses. The
+/// key coalesces a second declaration at the site while the first waits.
+#[must_use]
+pub fn declared_output_job(
+    calculation_id: Uuid,
+    site_id: Uuid,
+    cadence: &str,
+) -> DeclaredOutputJob {
+    if cadence == "high" {
+        return DeclaredOutputJob {
+            trigger_type: "derived_assignment",
+            subject: calculation_id,
+            params: serde_json::json!({ "calculation_id": calculation_id, "site_id": site_id }),
+            dedupe_key: assignment_dedupe_key(calculation_id, site_id),
+        };
+    }
+    DeclaredOutputJob {
+        trigger_type: "event_recompute",
+        subject: site_id,
+        params: serde_json::json!({
+            "site_id": site_id,
+            "only_findings": false,
+            "actor": crate::common::actor::current(),
+        }),
+        dedupe_key: format!("event_recompute:declared:{site_id}"),
+    }
+}
+
+/// Queue the computation of a calculation's newly declared output at a site's existing data.
+pub async fn compute_declared_output<C: ConnectionTrait>(
+    db: &C,
+    calculation_id: Uuid,
+    site_id: Uuid,
+    cadence: &str,
+) -> Result<(), sea_orm::DbErr> {
+    let job = declared_output_job(calculation_id, site_id, cadence);
+    crate::routes::private::reprocessing_jobs::service::enqueue(
+        db,
+        job.trigger_type,
+        None,
+        Some(job.subject),
+        &job.params,
+        Some(&job.dedupe_key),
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

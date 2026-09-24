@@ -40,6 +40,8 @@ mod m20260924_000001_retag_decision_kind;
 mod m20260924_000002_attribution_decision_kind;
 mod m20260924_000011_drop_source_alignment;
 mod m20260924_000013_tool_script_commissions;
+mod m20260924_000017_drop_tool_script_enabled;
+mod m20260924_000019_withdraw_reentered_portal_replicates;
 
 pub struct Migrator;
 
@@ -100,6 +102,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260924_000002_attribution_decision_kind::Migration),
             Box::new(m20260924_000011_drop_source_alignment::Migration),
             Box::new(m20260924_000013_tool_script_commissions::Migration),
+            Box::new(m20260924_000017_drop_tool_script_enabled::Migration),
+            Box::new(m20260924_000019_withdraw_reentered_portal_replicates::Migration),
         ]
     }
 }

@@ -33,6 +33,7 @@ use super::service::CalculationMember;
 use super::service::MergeSiteParametersRequest;
 use super::service::MergeSiteParametersResponse;
 use super::service::applied_cadence;
+use super::service::compute_declared_output;
 use super::service::partition_calculation;
 use super::service::partition_members;
 use super::service::slot_cadence;
@@ -337,6 +338,9 @@ pub async fn apply_calculation(
         .insert(&txn)
         .await?;
         created.push(slot(member, Role::Output.as_str(), Some(id)));
+    }
+    if !created.is_empty() {
+        compute_declared_output(&txn, tool.script_id, site_id, cadence).await?;
     }
     txn.commit().await?;
 

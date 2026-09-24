@@ -140,14 +140,10 @@ pub mod script {
         pub created_at: chrono::DateTime<chrono::Utc>,
         #[crudcrate(exclude(create, update), sortable)]
         pub updated_at: chrono::DateTime<chrono::Utc>,
-        /// Whether the tool is part of the calculation set: fired at visits by the chain, audited,
-        /// and listed on the Tools page. Off, it can still be run by name.
-        #[crudcrate(filterable, sortable, on_create = true)]
-        pub enabled: bool,
         /// `script` (R in the sandbox) or `formula` (the definitions attached to the calculation).
         #[crudcrate(filterable, sortable, on_create = "script".to_string())]
         pub engine: String,
-        /// When the calculation was decommissioned. Set, it is not enabled until a recommission
+        /// When the calculation was decommissioned. Set, it runs nowhere until a recommission
         /// clears it (Q279).
         #[crudcrate(exclude(create, update), filterable, sortable)]
         pub decommissioned_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1976,7 +1972,7 @@ pub struct CalculationRepair {
     pub state: String,
 }
 
-/// Where one enabled calculation is active: the sites that declare every parameter it reads, or
+/// Where one live calculation is active: the sites that declare every parameter it reads, or
 /// already hold one of its outputs. The same test the chain applies before it runs at a visit.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CalculationSites {
@@ -2082,10 +2078,6 @@ pub struct UpdateScriptRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
-    /// Switch the tool in or out of the calculation set. A disabled tool keeps its versions and
-    /// activation and fires at no visit until it is switched back on.
-    #[serde(default)]
-    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

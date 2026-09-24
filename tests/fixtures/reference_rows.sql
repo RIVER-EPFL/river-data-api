@@ -9,7 +9,7 @@
 -- that leaves the hash behind fails there. The script row goes in naming no version, because the
 -- version it names is inserted after it.
 
-INSERT INTO public.tool_scripts (id, name, label, description, active_version_id, created_by, created_at, updated_at, enabled, engine) VALUES ('8183564e-05b4-4956-89d4-c8013cca066f', 'doc', 'DOC', 'Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.', NULL, 'seed', '2026-09-04 12:10:27.924083+00', '2026-09-04 12:10:27.924083+00', true, 'script') ON CONFLICT DO NOTHING;
+INSERT INTO public.tool_scripts (id, name, label, description, active_version_id, created_by, created_at, updated_at, engine) VALUES ('8183564e-05b4-4956-89d4-c8013cca066f', 'doc', 'DOC', 'Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.', NULL, 'seed', '2026-09-04 12:10:27.924083+00', '2026-09-04 12:10:27.924083+00', 'script') ON CONFLICT DO NOTHING;
 
 INSERT INTO public.tool_script_versions (id, tool_script_id, version_no, script, entry_function, manifest, test_cases, content_hash, created_by, created_at, validated_at, note) VALUES ('abc3ee60-2bb7-474b-91e9-d76754dea651', '8183564e-05b4-4956-89d4-c8013cca066f', 1, '# DOC is data entry: the replicates are stored as readings, the chosen standard curve corrects
 # them, and the manifest''s aggregate outputs (mean, sd) are computed by the engine over the

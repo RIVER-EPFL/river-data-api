@@ -14,7 +14,7 @@ async fn install(db: &DatabaseConnection) -> String {
     for statement in [
         Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO tool_scripts (name, label, enabled, created_by) VALUES ($1, 'Probe', true, 'test')",
+            "INSERT INTO tool_scripts (name, label, created_by) VALUES ($1, 'Probe', 'test')",
             [TOOL.into()],
         ),
         Statement::from_sql_and_values(
@@ -134,7 +134,8 @@ async fn listed_in_calculation_sites(app: &axum::Router, admin: &str) -> bool {
 /// Expected behaviour: it leaves the calculation set and a run by its old name is refused naming
 /// the decommission; the record names the administrator, the instant and the reason, and the name
 /// is freed; the value it computed is served as it was, and no ledger row or hold is written. A
-/// second decommission and switching it back on are both refused naming the decommission.
+/// second decommission and a run under the name it now holds are both refused naming the
+/// decommission.
 #[tokio::test]
 #[serial]
 async fn an_administrator_decommissions_a_calculation_and_its_values_stand() {
@@ -177,7 +178,6 @@ async fn an_administrator_decommissions_a_calculation_and_its_values_stand() {
     )
     .await;
     assert_eq!(status, 200, "decommissioned: {body}");
-    assert_eq!(body["enabled"], false, "{body}");
     assert!(body["decommissioned_at"].is_string(), "{body}");
     assert_eq!(
         body["decommission_reason"],
@@ -255,14 +255,14 @@ async fn an_administrator_decommissions_a_calculation_and_its_values_stand() {
     .await;
     assert_eq!(status, 409, "a second decommission is refused: {body}");
 
-    let (status, body) = crate::common::patch_json_parse_with_token(
+    let (status, body) = crate::common::post_json_parse_with_token(
         &app,
-        &format!("/api/tool_scripts/{id}"),
-        &json!({ "enabled": true }),
+        &format!("/api/tools/{TOOL}_decommissioned_{today}/calculate"),
+        &json!({}),
         &admin,
     )
     .await;
-    assert_eq!(status, 409, "switching it back on is refused: {body}");
+    assert_eq!(status, 409, "a run under its new name is refused: {body}");
     assert!(
         body["error"]
             .as_str()
@@ -313,8 +313,8 @@ async fn only_an_administrator_decommissions() {
 /// Scenario: a calculation is decommissioned, a new calculation takes its freed name, the first is
 /// recommissioned, the second is decommissioned in turn and the first recommissioned again.
 ///
-/// Expected behaviour: a recommission leaves the calculation switched off and records who, when
-/// and why; it gets its name back only while no other calculation holds it; the history lists every
+/// Expected behaviour: a recommission puts the calculation back in the calculation set and records
+/// who, when and why; it gets its name back only while no other calculation holds it; the history lists every
 /// decommission and recommission, newest first, under the name held before each.
 #[tokio::test]
 #[serial]
@@ -369,11 +369,11 @@ async fn a_recommission_brings_a_calculation_back_under_the_name_still_free() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["name_restored"], true, "{body}");
     assert_eq!(body["calculation"]["name"], TOOL, "{body}");
-    assert_eq!(
-        body["calculation"]["enabled"], false,
-        "it comes back switched off: {body}"
-    );
     assert!(body["calculation"]["decommissioned_at"].is_null(), "{body}");
+    assert!(
+        listed_in_calculation_sites(&app, &admin).await,
+        "it is back in the calculation set: {body}"
+    );
 
     let (status, body) = post(
         format!("/api/tool_scripts/{first}/decommission"),

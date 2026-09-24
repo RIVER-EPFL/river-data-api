@@ -36,7 +36,7 @@ use super::service::{
     formula_codes_held_elsewhere, insert_version, lint_script, list_active_tools,
     load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
     mint_formula_version, normalise_name, normalised_json, plan_formula_set, reads_of_former,
-    refuse_decommissioned, renames_of, render, replicated_for, require_context_in_scope,
+    renames_of, render, replicated_for, require_context_in_scope,
     run_stored_cases, run_tool_body, runner_runtime, stored_version_content, take_back_steps,
 };
 use crate::common::AppState;
@@ -221,7 +221,7 @@ async fn coverage_sites(
     }
 }
 
-/// Every enabled calculation and the sites it is active at, confined to the caller's projects.
+/// Every live calculation and the sites it is active at, confined to the caller's projects.
 #[utoipa::path(
     get,
     path = "/api/calculations/sites",
@@ -322,14 +322,11 @@ pub async fn create_script(
     Ok(Json(load_script(&state, created.id).await?))
 }
 
-/// Update a calculation's label, description or enabled switch (the code lives in versions). A
-/// decommissioned calculation is not switched back on. Requires Administrator.
+/// Update a calculation's label or description (the code lives in versions). Requires
+/// Administrator.
 #[utoipa::path(patch, path = "/api/tool_scripts/{id}", params(("id" = Uuid, Path)),
     request_body = UpdateScriptRequest,
-    responses(
-        (status = 200, body = ToolScript),
-        (status = 409, description = "Switching on a decommissioned calculation"),
-    ), tag = "tool_scripts")]
+    responses((status = 200, body = ToolScript)), tag = "tool_scripts")]
 pub async fn update_script(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -339,18 +336,12 @@ pub async fn update_script(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("tool script {id} not found")))?;
-    if payload.enabled == Some(true) {
-        refuse_decommissioned(&existing.name, existing.decommissioned_at)?;
-    }
     let mut model: super::models::script::ActiveModel = existing.into();
     if let Some(label) = payload.label {
         model.label = Set(label);
     }
     if payload.description.is_some() {
         model.description = Set(payload.description);
-    }
-    if let Some(enabled) = payload.enabled {
-        model.enabled = Set(enabled);
     }
     model.updated_at = Set(chrono::Utc::now());
     model.update(&state.db).await?;

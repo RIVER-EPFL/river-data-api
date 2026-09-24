@@ -424,6 +424,40 @@ pub async fn set_site_parameter_public(app: &Router, token: &str, sp_id: &str) {
     assert_eq!(status, 200, "mark site_parameter {sp_id} public: {body}");
 }
 
+/// Take a calculation out of the calculation set by decommissioning it, or bring it back by
+/// recommissioning it, as `admin`. A decommission frees the name, so the way back finds the
+/// calculation under the name it was left with.
+pub async fn set_live(app: &Router, admin: &str, name: &str, live: bool) {
+    let (status, scripts) =
+        crate::common::client::get_json_with_token(app, "/api/tool_scripts", admin).await;
+    assert_eq!(status, 200, "{scripts}");
+    let freed = format!("{name}_decommissioned_");
+    let id = scripts
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|s| {
+            let listed = s["name"].as_str().unwrap_or_default();
+            if live {
+                listed.starts_with(&freed) && !s["decommissioned_at"].is_null()
+            } else {
+                listed == name
+            }
+        })
+        .and_then(|s| s["id"].as_str())
+        .unwrap_or_else(|| panic!("{name} is listed: {scripts}"))
+        .to_string();
+    let verb = if live { "recommission" } else { "decommission" };
+    let (status, body) = crate::common::client::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{id}/{verb}"),
+        &json!({ "reason": "staged by the story" }),
+        admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{verb} {name}: {body}");
+}
+
 /// Author, validate and activate one tool version as `admin`. Runner-backed: validation runs
 /// the stored cases.
 pub async fn author_tool(

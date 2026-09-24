@@ -1611,7 +1611,7 @@ pub struct ProvenanceRecord {
     /// chain. Each names the key its own record is read by.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub inputs: Vec<InputRef>,
-    /// Every enabled formula reading this parameter, one hop down the chain, with its output's
+    /// Every live formula reading this parameter, one hop down the chain, with its output's
     /// value at this instant where one exists.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub consumers: Vec<ConsumerRef>,
@@ -2227,7 +2227,7 @@ pub(super) struct LinkRow {
     pub(super) output_parameter_id: Option<Uuid>,
     pub(super) output_parameter_code: Option<String>,
     pub(super) calculation: Option<String>,
-    pub(super) enabled: bool,
+    pub(super) live: bool,
 }
 
 #[derive(FromQueryResult)]
@@ -2678,6 +2678,12 @@ pub struct ExistingReplicate {
     pub calibrated_value: Option<f64>,
     #[schema(required)]
     pub standard_curve_id: Option<Uuid>,
+    /// The stream holding it, which a replace corrects or withdraws it on.
+    #[serde(skip)]
+    pub stream_id: Uuid,
+    /// Not withdrawn.
+    #[serde(skip)]
+    pub live: bool,
 }
 
 /// A replicate a replace kept, and why curation kept it.

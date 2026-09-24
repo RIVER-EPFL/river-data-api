@@ -659,6 +659,65 @@ async fn a_revert_queues_the_recompute_of_the_visits_it_empties() {
     crate::common::cleanup_test_db(&db).await;
 }
 
+/// Scenario: a visit whose only reading came through the plan's stream carries a note, and the
+/// plan is reverted.
+///
+/// Expected behaviour: the visit and its note stay (CID10), with no reading on it.
+#[tokio::test]
+#[serial]
+async fn a_revert_keeps_the_visit_it_empties() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (plan_id, stream_id) =
+        reviewed_single_stream_plan(&db, &app, &token, "loc-revert-empties").await;
+    let event = Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO collection_events (id, site_id, collected_at, source, notes) \
+             VALUES ('{event}', '{}', '2025-02-01T00:00:00Z', 'manual', 'turbid')",
+            crate::common::SITE1_ID
+        ),
+        format!(
+            "INSERT INTO readings \
+                 (stream_id, time, raw_value, replicate_index, measurement_type, collection_event_id) \
+             VALUES ('{stream_id}', '2025-02-01T00:00:00Z', 1.0, 0, 'spot', '{event}')"
+        ),
+    ] {
+        crate::common::exec(&db, &statement).await;
+    }
+    river_db::routes::private::sync::service::apply_plan(&db, plan_id, None)
+        .await
+        .expect("the plan applies");
+    river_db::routes::private::sync::service::revert_plan(&db, plan_id, None)
+        .await
+        .expect("the plan reverts");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!("collection_events WHERE id = '{event}' AND notes = 'turbid'")
+        )
+        .await,
+        1,
+        "the emptied visit keeps its note"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("readings WHERE collection_event_id = '{event}'")
+        )
+        .await,
+        0,
+        "the revert takes the reading off the visit"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
 /// Scenario: a plan was applied and its attribution job is gone (lost before this fix, or pruned),
 /// and the `plan_apply` row runs again.
 ///

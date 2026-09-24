@@ -895,7 +895,6 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
     target: &RetireTarget,
 ) -> AppResult<TouchedRange> {
     let sample_ids = referenced_ids(conn, target, "sample_id").await?;
-    let event_ids = referenced_ids(conn, target, "collection_event_id").await?;
     let mut touched = TouchedRange::default();
 
     for slot in SLOT_TABLES {
@@ -966,33 +965,6 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
                 .await?;
             }
         }
-    }
-
-    // A visit describes a group of readings the same way a sample does, but it is keyed on
-    // (site, collected_at) rather than on the slot, so it is released here rather than through
-    // SLOT_TABLES: nothing that walks that list by parameter_id can address it.
-    if !event_ids.is_empty() {
-        let (sql, values) = SeaQuery::delete()
-            .from_table(crate::routes::private::collection_events::models::Entity)
-            .and_where(Expr::cust_with_values("id = ANY($1)", [event_ids]))
-            .and_where(
-                Expr::exists(
-                    SeaQuery::select()
-                        .expr(Expr::value(1))
-                        .from_as(readings_model::Entity, Alias::new("r"))
-                        .and_where(Expr::cust("r.collection_event_id = collection_events.id"))
-                        .take(),
-                )
-                .not(),
-            )
-            .take()
-            .build(PostgresQueryBuilder);
-        conn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await?;
     }
 
     if let Some(sp_id) = target.site_parameter_id {

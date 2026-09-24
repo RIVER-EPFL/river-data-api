@@ -1,5 +1,5 @@
 //! The scoped apply (M24): after a change the reactive hook does not see (a constant, a curve, or
-//! here a calculation switched off while its input was corrected), the
+//! here a calculation decommissioned while its input was corrected), the
 //! audit reports every stale visit at a site and one site-scoped recompute repairs them all and
 //! closes the findings it repaired.
 
@@ -10,27 +10,6 @@ use crate::common::e2e;
 use crate::common::keycloak as kc;
 
 const VISITS: [&str; 2] = ["2025-06-15T09:00:00Z", "2025-06-22T09:00:00Z"];
-
-async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool) {
-    let (status, scripts) =
-        crate::common::get_json_with_token(app, "/api/tool_scripts", admin).await;
-    assert_eq!(status, 200, "{scripts}");
-    let id = scripts
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["name"] == name)
-        .map(|s| s["id"].as_str().unwrap().to_string())
-        .unwrap_or_else(|| panic!("{name} is listed"));
-    let (status, patched) = crate::common::patch_json_with_token(
-        app,
-        &format!("/api/tool_scripts/{id}"),
-        &json!({ "enabled": enabled }),
-        admin,
-    )
-    .await;
-    assert_eq!(status, 200, "{patched}");
-}
 
 #[tokio::test]
 #[serial]
@@ -164,12 +143,12 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     assert_eq!(served_b(other_site.clone(), VISITS[0]).await, Some(15.0));
 
     // The corrections land while the calculation is off, so every B at the site is stale.
-    set_enabled(&app, &admin, "scope_b", false).await;
+    e2e::set_live(&app, &admin, "scope_b", false).await;
     for at in VISITS {
         save_a(site_id.clone(), 20.0, at, true).await;
     }
     save_a(other_site.clone(), 20.0, VISITS[0], true).await;
-    set_enabled(&app, &admin, "scope_b", true).await;
+    e2e::set_live(&app, &admin, "scope_b", true).await;
     // A member granted one project names the site an audit covers.
     for site in [&site_id, &other_site] {
         let (status, audit) = crate::common::post_json_parse_with_token(

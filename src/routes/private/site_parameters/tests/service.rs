@@ -255,3 +255,23 @@ fn test_stream_refusal_names_a_visit_only_input() {
     assert!(refusal.contains("Alkalinity"), "{refusal}");
     assert!(super::stream_refusal(&[read("Alkalinity", None)]).is_some());
 }
+
+/// Expected behaviour: a declared visit slot recomputes the site's visits, a stream slot backfills
+/// its pulses (B649).
+#[test]
+fn test_declared_output_job_follows_the_slot_arm() {
+    let (calculation, site) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let visit = super::declared_output_job(calculation, site, "low");
+    assert_eq!(visit.trigger_type, "event_recompute");
+    assert_eq!(visit.subject, site);
+    assert_eq!(visit.params["site_id"], site.to_string());
+    assert_eq!(visit.params["only_findings"], false);
+
+    let stream = super::declared_output_job(calculation, site, "high");
+    assert_eq!(stream.trigger_type, "derived_assignment");
+    assert_eq!(stream.subject, calculation);
+    assert_eq!(
+        stream.dedupe_key,
+        super::assignment_dedupe_key(calculation, site)
+    );
+}

@@ -3101,7 +3101,7 @@
         "type": "object"
       },
       "CalculationSites": {
-        "description": "Where one enabled calculation is active: the sites that declare every parameter it reads, or\nalready hold one of its outputs. The same test the chain applies before it runs at a visit.",
+        "description": "Where one live calculation is active: the sites that declare every parameter it reads, or\nalready hold one of its outputs. The same test the chain applies before it runs at a visit.",
         "properties": {
           "calculation": {
             "description": "The calculation's name, as the chain and its findings record it.",
@@ -16696,7 +16696,7 @@
             "type": "array"
           },
           "consumers": {
-            "description": "Every enabled formula reading this parameter, one hop down the chain, with its output's\nvalue at this instant where one exists.",
+            "description": "Every live formula reading this parameter, one hop down the chain, with its output's\nvalue at this instant where one exists.",
             "items": {
               "$ref": "#/components/schemas/ConsumerRef"
             },
@@ -26726,7 +26726,7 @@
             ]
           },
           "decommissioned_at": {
-            "description": "When the calculation was decommissioned. Set, it is not enabled until a recommission\nclears it (Q279).",
+            "description": "When the calculation was decommissioned. Set, it runs nowhere until a recommission\nclears it (Q279).",
             "format": "date-time",
             "type": [
               "string",
@@ -26745,10 +26745,6 @@
               "string",
               "null"
             ]
-          },
-          "enabled": {
-            "description": "Whether the tool is part of the calculation set: fired at visits by the chain, audited,\nand listed on the Tools page. Off, it can still be run by name.",
-            "type": "boolean"
           },
           "engine": {
             "description": "`script` (R in the sandbox) or `formula` (the definitions attached to the calculation).",
@@ -26789,7 +26785,6 @@
           "created_by",
           "created_at",
           "updated_at",
-          "enabled",
           "engine",
           "decommissioned_at",
           "decommissioned_by",
@@ -26835,7 +26830,7 @@
             ]
           },
           "decommissioned_at": {
-            "description": "When the calculation was decommissioned. Set, it is not enabled until a recommission\nclears it (Q279).",
+            "description": "When the calculation was decommissioned. Set, it runs nowhere until a recommission\nclears it (Q279).",
             "format": "date-time",
             "type": [
               "string",
@@ -26854,10 +26849,6 @@
               "string",
               "null"
             ]
-          },
-          "enabled": {
-            "description": "Whether the tool is part of the calculation set: fired at visits by the chain, audited,\nand listed on the Tools page. Off, it can still be run by name.",
-            "type": "boolean"
           },
           "engine": {
             "description": "`script` (R in the sandbox) or `formula` (the definitions attached to the calculation).",
@@ -26892,7 +26883,6 @@
           "created_by",
           "created_at",
           "updated_at",
-          "enabled",
           "engine",
           "decommissioned_at",
           "decommissioned_by",
@@ -27496,13 +27486,6 @@
           "description": {
             "type": [
               "string",
-              "null"
-            ]
-          },
-          "enabled": {
-            "description": "Switch the tool in or out of the calculation set. A disabled tool keeps its versions and\nactivation and fires at no visit until it is switched back on.",
-            "type": [
-              "boolean",
               "null"
             ]
           },
@@ -31070,7 +31053,7 @@
             "description": "Where each calculation fires"
           }
         },
-        "summary": "Every enabled calculation and the sites it is active at, confined to the caller's projects.",
+        "summary": "Every live calculation and the sites it is active at, confined to the caller's projects.",
         "tags": [
           "tools"
         ]
@@ -52283,12 +52266,9 @@
               }
             },
             "description": ""
-          },
-          "409": {
-            "description": "Switching on a decommissioned calculation"
           }
         },
-        "summary": "Update a calculation's label, description or enabled switch (the code lives in versions). A\ndecommissioned calculation is not switched back on. Requires Administrator.",
+        "summary": "Update a calculation's label or description (the code lives in versions). Requires\nAdministrator.",
         "tags": [
           "tool_scripts"
         ]

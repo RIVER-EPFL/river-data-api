@@ -337,7 +337,7 @@ pub(super) fn active_tool_query() -> sea_orm::sea_query::SelectStatement {
             (s.clone(), script::Column::Label),
             (s.clone(), script::Column::Description),
             (s.clone(), script::Column::Engine),
-            (s.clone(), script::Column::Enabled),
+            (s.clone(), script::Column::DecommissionedAt),
         ])
         .expr_as(
             Expr::col((v.clone(), version_entity::Column::Id)),
@@ -604,20 +604,20 @@ async fn load_own_formulas<C: ConnectionTrait>(
         .collect())
 }
 
-/// The calculation set: every enabled tool with an active version. A disabled tool is left out
-/// here, so the chain, the audit and the tools list do not see it.
+/// The calculation set: every tool with an active version that is not decommissioned. A
+/// decommissioned one is left out here, so the chain, the audit and the tools list do not see it.
 pub async fn list_active_tools<C: ConnectionTrait>(db: &C) -> AppResult<Vec<ActiveTool>> {
     use sea_orm::sea_query::ExprTrait;
     let s = Alias::new("s");
     let query = active_tool_query()
-        .and_where(Expr::col((s.clone(), script::Column::Enabled)).eq(true))
+        .and_where(Expr::col((s.clone(), script::Column::DecommissionedAt)).is_null())
         .order_by((s, script::Column::Name), Order::Asc)
         .to_owned();
     let rows = db.query_all_raw(build(&query)).await?;
     rows.iter().map(row_to_active).collect()
 }
 
-/// The enabled calculation writing each of `parameter_ids`, by name: the one a hand value over
+/// The live calculation writing each of `parameter_ids`, by name: the one a hand value over
 /// that parameter would contradict.
 pub async fn calculations_writing<C: ConnectionTrait>(
     db: &C,
@@ -645,7 +645,7 @@ pub async fn calculations_writing<C: ConnectionTrait>(
 /// never the rows as they stand, so the version a stored value names is the arithmetic that made
 /// it (Q256). An edit reaches the stream once a version holding it is activated.
 ///
-/// `None` where the id names nothing, the calculation is switched off (Q174), it is a script
+/// `None` where the id names nothing, the calculation is decommissioned, it is a script
 /// calculation (a script runs at a visit, where somebody chose its inputs), or no version is
 /// active: a set nobody has saved computes nothing.
 pub async fn stream_calculation<C: ConnectionTrait>(
@@ -655,13 +655,16 @@ pub async fn stream_calculation<C: ConnectionTrait>(
     let Some(row) = script::Entity::find_by_id(script_id).one(db).await? else {
         return Ok(None);
     };
-    if !row.enabled || Engine::parse(&row.engine) != Some(Engine::Formula) {
+    if row.decommissioned_at.is_some() || Engine::parse(&row.engine) != Some(Engine::Formula) {
         return Ok(None);
     }
     let Some(version_id) = row.active_version_id else {
         return Ok(None);
     };
-    let Some(version) = version_entity::Entity::find_by_id(version_id).one(db).await? else {
+    let Some(version) = version_entity::Entity::find_by_id(version_id)
+        .one(db)
+        .await?
+    else {
         return Ok(None);
     };
     let formulas = version_formulas(&row.name, Engine::Formula, &version.script)?;
@@ -682,17 +685,6 @@ pub struct StreamCalculation {
     pub formulas: Vec<PinnedFormula>,
 }
 
-/// The switch a run by name is held to: a calculation switched off is refused, and the refusal
-/// names the switch rather than reporting the calculation missing (Q174).
-pub(super) fn admit_run(name: &str, enabled: bool) -> AppResult<()> {
-    if enabled {
-        return Ok(());
-    }
-    Err(AppError::Conflict(format!(
-        "Calculation '{name}' is switched off"
-    )))
-}
-
 /// The reason a decommission records, trimmed. A blank one is refused: the record is the reason.
 pub(super) fn decommission_reason(reason: &str) -> AppResult<String> {
     let reason = reason.trim();
@@ -704,8 +696,8 @@ pub(super) fn decommission_reason(reason: &str) -> AppResult<String> {
     Ok(reason.to_string())
 }
 
-/// A decommissioned calculation is not switched back on until a recommission clears the stamp
-/// (Q279): the refusal names the decommission rather than leaving the constraint to answer.
+/// A decommissioned calculation runs nowhere until a recommission clears the stamp (Q279): the
+/// refusal names the decommission rather than reporting the calculation missing.
 pub(super) fn refuse_decommissioned(
     name: &str,
     decommissioned_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -802,7 +794,6 @@ pub(super) async fn decommission(
         &names_like(&txn, &format!("{}_decommissioned_", existing.name)).await?,
     );
     script::Entity::update_many()
-        .col_expr(script::Column::Enabled, Expr::value(false))
         .col_expr(script::Column::Name, Expr::value(freed))
         .col_expr(script::Column::DecommissionedAt, Expr::value(now))
         .col_expr(script::Column::DecommissionedBy, Expr::value(by))
@@ -816,8 +807,8 @@ pub(super) async fn decommission(
     Ok(())
 }
 
-/// Bring a decommissioned calculation back, switched off, under the name it held when it was
-/// decommissioned unless another calculation took that name meanwhile. True when the name came
+/// Bring a decommissioned calculation back into the calculation set, under the name it held when it
+/// was decommissioned unless another calculation took that name meanwhile. True when the name came
 /// back.
 pub(super) async fn recommission(
     db: &DatabaseConnection,
@@ -930,12 +921,12 @@ pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<
         refuse_freed_name(db, name).await?;
         return Err(AppError::NotFound(format!("Unknown tool: {name}")));
     };
-    admit_run(name, row.try_get::<bool>("", "enabled")?)?;
+    refuse_decommissioned(name, row.try_get("", "decommissioned_at")?)?;
     row_to_active(&row)
 }
 
-/// The active calculation a site-apply names by id. Same switch as a run by name: a calculation
-/// switched off is refused naming the switch (Q174).
+/// The active calculation a site-apply names by id. Refused as a run by name is: a decommissioned
+/// calculation is refused naming the decommission.
 pub async fn find_active_tool_by_id(db: &DatabaseConnection, id: Uuid) -> AppResult<ActiveTool> {
     use sea_orm::sea_query::ExprTrait;
     let query = active_tool_query()
@@ -946,7 +937,7 @@ pub async fn find_active_tool_by_id(db: &DatabaseConnection, id: Uuid) -> AppRes
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Calculation {id} not found")))?;
     let name: String = row.try_get("", "name")?;
-    admit_run(&name, row.try_get::<bool>("", "enabled")?)?;
+    refuse_decommissioned(&name, row.try_get("", "decommissioned_at")?)?;
     row_to_active(&row)
 }
 
@@ -4247,7 +4238,7 @@ pub async fn calculations_fed_by_subject(
     calculations_fed_by(db, &ids).await
 }
 
-/// Every enabled calculation that reads one of `parameter_ids` at a visit, directly or through a
+/// Every live calculation that reads one of `parameter_ids` at a visit, directly or through a
 /// calculation downstream of it, in the order the chain would run them. Empty when no calculation
 /// reads any of them, which is the common case for a logger parameter.
 pub async fn calculations_fed_by<C: ConnectionTrait>(
@@ -5956,13 +5947,13 @@ pub fn formulas_read_constant(formulas: &[PinnedFormula], name: &str) -> bool {
     })
 }
 
-/// The enabled formula calculations whose formula set, as it stands, reads the constant `name`.
+/// The live formula calculations whose formula set, as it stands, reads the constant `name`.
 pub async fn calculations_reading_constant<C: ConnectionTrait>(
     db: &C,
     name: &str,
 ) -> AppResult<Vec<Uuid>> {
     let ids: Vec<Uuid> = script::Entity::find()
-        .filter(script::Column::Enabled.eq(true))
+        .filter(script::Column::DecommissionedAt.is_null())
         .filter(script::Column::Engine.eq("formula"))
         .select_only()
         .column(script::Column::Id)

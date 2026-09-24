@@ -228,7 +228,7 @@ pub async fn declared_parameters_by_site(
     Ok(declared)
 }
 
-/// Every enabled calculation with the sites it is active at, named, read the way the chain reads
+/// Every live calculation with the sites it is active at, named, read the way the chain reads
 /// them. `site_ids` confines the sites considered; `None` is every site.
 pub async fn calculation_sites(
     db: &DatabaseConnection,
@@ -836,7 +836,7 @@ async fn walk_event(
 
     // A calculation applies at a site when the site declares what it reads (Q193, narrowing Q98):
     // the site parameters are still the declaration, so the calculation set is filtered by them
-    // before the dependency order is walked, rather than every enabled tool being run wherever
+    // before the dependency order is walked, rather than every live tool being run wherever
     // its inputs happen to resolve. The output slot follows from the inputs, minted by the run.
     let declared = declared_parameters(&state.db, event.site_id).await?;
 

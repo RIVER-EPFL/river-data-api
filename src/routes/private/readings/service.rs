@@ -6003,11 +6003,8 @@ fn formulas_one_hop_query(parameter_ids: &[Uuid]) -> sea_orm::sea_query::SelectS
             Alias::new("calculation"),
         )
         .expr_as(
-            Func::coalesce([
-                Expr::col((sc.clone(), tool_script::Column::Enabled)),
-                Expr::value(true),
-            ]),
-            Alias::new("enabled"),
+            Expr::col((sc.clone(), tool_script::Column::DecommissionedAt)).is_null(),
+            Alias::new("live"),
         )
         .from_as(FormulaEntity, d.clone())
         .join_as(
@@ -6470,7 +6467,7 @@ pub(super) struct FormulaLink {
     pub(super) output_parameter_id: Option<Uuid>,
     pub(super) output_parameter_code: Option<String>,
     pub(super) calculation: Option<String>,
-    pub(super) enabled: bool,
+    pub(super) live: bool,
     pub(super) sources: Vec<SourceLink>,
 }
 
@@ -6615,7 +6612,7 @@ impl FormulaLinks {
         out
     }
 
-    /// Every enabled formula reading `parameter_id`, with its output at the record's indexes.
+    /// Every live formula reading `parameter_id`, with its output at the record's indexes.
     pub(super) fn consumers_of(
         &self,
         parameter_id: Uuid,
@@ -6624,7 +6621,7 @@ impl FormulaLinks {
         site_id: Uuid,
     ) -> Vec<ConsumerRef> {
         let mut out = Vec::new();
-        for formula in self.formulas.iter().filter(|f| f.enabled) {
+        for formula in self.formulas.iter().filter(|f| f.live) {
             for source in formula
                 .sources
                 .iter()
@@ -6686,7 +6683,7 @@ pub(super) async fn fetch_formula_links(
             output_parameter_id: row.output_parameter_id,
             output_parameter_code: row.output_parameter_code,
             calculation: row.calculation,
-            enabled: row.enabled,
+            live: row.live,
             sources: Vec::new(),
         });
     }
@@ -9627,6 +9624,42 @@ pub(super) fn entered_rows(
         .collect()
 }
 
+/// Where a carried row lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Lands {
+    /// Inserted, or rewritten in place, on the parameter's grab stream.
+    Grab,
+    /// Already stored at that number on another stream, so nothing is written.
+    Stored,
+}
+
+/// Where each carried row lands, in the order carried. A live replicate another stream holds at
+/// the carried index and number is that stream's and stays there; anything else lands on the grab
+/// stream.
+pub(super) fn landing(
+    carried: &[(Uuid, chrono::DateTime<chrono::Utc>, i16, f64)],
+    existing: &[ExistingGroup],
+    grab_streams: &HashMap<Uuid, Uuid>,
+) -> Vec<Lands> {
+    carried
+        .iter()
+        .map(|(parameter_id, time, index, value)| {
+            let grab = grab_streams.get(parameter_id).copied();
+            let at_index: Vec<&ExistingReplicate> = existing
+                .iter()
+                .filter(|g| g.parameter_id == *parameter_id && g.time == *time)
+                .flat_map(|g| &g.replicates)
+                .filter(|r| r.replicate_index == *index)
+                .filter(|r| r.live || Some(r.stream_id) == grab)
+                .collect();
+            match at_index.iter().find(|r| r.raw_value == *value) {
+                Some(same) if Some(same.stream_id) != grab => Lands::Stored,
+                _ => Lands::Grab,
+            }
+        })
+        .collect()
+}
+
 pub(super) async fn fetch_existing_groups(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -9640,6 +9673,8 @@ pub(super) async fn fetch_existing_groups(
             .column(readings::Column::RawValue)
             .column(readings::Column::CalibratedValue)
             .column(readings::Column::StandardCurveId)
+            .column(readings::Column::StreamId)
+            .column_as(readings::Column::WithdrawnAt.is_null(), "live")
             .filter(spot_group(site_id, *parameter_id, *time))
             .order_by_asc(readings::Column::ReplicateIndex)
             .into_model::<ExistingReplicate>()
@@ -10935,6 +10970,23 @@ impl GrabWrite<'_> {
         self.payload.mode == Some(GrabWriteMode::Replace)
     }
 
+    /// Where each carried row lands, in the order carried.
+    fn landing(&self) -> Vec<Lands> {
+        landing(self.carried, self.existing_groups, self.streams)
+    }
+
+    /// The readings the save writes on the grab stream, with their preview. A replicate another
+    /// stream holds stays there.
+    fn written(&self) -> impl Iterator<Item = (&GrabSampleReading, &GrabPreview)> {
+        self.payload
+            .readings
+            .iter()
+            .zip(self.preview)
+            .zip(self.landing())
+            .filter(|(_, lands)| *lands == Lands::Grab)
+            .map(|(row, _)| row)
+    }
+
     /// The readings of one group, with their preview.
     fn in_group(
         &self,
@@ -11182,10 +11234,7 @@ impl GrabWrite<'_> {
 
     /// The row each reading is stored as.
     fn models(&self, stored_facts: &HashMap<GrabGroup, StoredFacts>) -> Vec<readings::ActiveModel> {
-        self.payload
-            .readings
-            .iter()
-            .zip(self.preview)
+        self.written()
             .map(|(r, p)| {
                 let instrument = self.slots.instrument_of(r);
                 let stream_id = self.streams[&r.parameter_id];
@@ -11234,9 +11283,8 @@ impl GrabWrite<'_> {
         let mut inserted = 0usize;
         for curved in [false, true] {
             let batch: Vec<readings::ActiveModel> = self
-                .payload
-                .readings
-                .iter()
+                .written()
+                .map(|(r, _)| r)
                 .zip(models)
                 .filter(|(r, _)| curved_groups.contains(&(r.parameter_id, r.time)) == curved)
                 .map(|(_, m)| m.clone())
@@ -11274,10 +11322,21 @@ impl GrabWrite<'_> {
         if self.entry_state != Some(Kind::UnverifiedEntry) {
             return Ok(());
         }
-        let entered = entered_rows(self.carried, self.existing_groups);
+        let lands = self.landing();
+        let entered: Vec<bool> = entered_rows(self.carried, self.existing_groups)
+            .into_iter()
+            .zip(&lands)
+            .map(|(entered, lands)| entered && *lands == Lands::Grab)
+            .collect();
+        let written: Vec<bool> = entered
+            .iter()
+            .zip(&lands)
+            .filter(|(_, lands)| **lands == Lands::Grab)
+            .map(|(entered, _)| *entered)
+            .collect();
         let entries: Vec<readings::ActiveModel> = models
             .iter()
-            .zip(&entered)
+            .zip(&written)
             .filter(|(_, entered)| **entered)
             .map(|(m, _)| m.clone())
             .collect();
@@ -11305,7 +11364,7 @@ impl GrabWrite<'_> {
         txn: &sea_orm::DatabaseTransaction,
         stored_facts: &HashMap<GrabGroup, StoredFacts>,
     ) -> AppResult<()> {
-        for (r, p) in self.payload.readings.iter().zip(self.preview) {
+        for (r, p) in self.written() {
             let stored = &stored_facts[&(r.parameter_id, r.time)];
             if stored.is_empty() {
                 continue;

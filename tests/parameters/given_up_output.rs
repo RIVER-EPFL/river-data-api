@@ -112,7 +112,7 @@ async fn a_decommissioned_calculation_leaves_its_parameter_named_in_the_catalogu
     crate::common::exec(
         &db,
         &format!(
-            "UPDATE tool_scripts SET enabled = false, decommissioned_at = '2026-09-24T10:00:00Z', \
+            "UPDATE tool_scripts SET decommissioned_at = '2026-09-24T10:00:00Z', \
              decommissioned_by = 'admin', decommission_reason = 'replaced' \
              WHERE id = '{calculation}'"
         ),

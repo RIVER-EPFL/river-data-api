@@ -2,7 +2,7 @@
 //!
 //! Scenario: a member stages a visit, runs one tool and saves it; a second tool's `event_inputs`
 //! resolve from the first tool's saved output at the same (site, collected_at) and it runs by
-//! itself (ADR 0007). A third tool, switched on after the visit was entered, is what the
+//! itself (ADR 0007). A third tool, recommissioned after the visit was entered, is what the
 //! missing/stale audit reports; the chain executor recomputes the event on demand and fills it,
 //! and the trigger statistics are correct throughout.
 
@@ -74,7 +74,6 @@ async fn author_chain(app: &axum::Router, admin: &str) {
     .await;
 }
 
-/// Switch a calculation in or out of the set that fires at visits and is audited.
 /// The site declares the slots the chain writes: a grab save refuses a parameter the site does not
 /// carry (Q98), so every story applies the group its three parameters belong to before saving.
 async fn declare_chain_slots(
@@ -145,29 +144,8 @@ async fn add_slot(
     assert_eq!(status, 200, "apply the group again: {applied}");
 }
 
-async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool) {
-    let (status, scripts) =
-        crate::common::get_json_with_token(app, "/api/tool_scripts", admin).await;
-    assert_eq!(status, 200, "{scripts}");
-    let id = scripts
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["name"] == name)
-        .map(|s| s["id"].as_str().unwrap().to_string())
-        .unwrap_or_else(|| panic!("{name} is listed"));
-    let (status, patched) = crate::common::patch_json_with_token(
-        app,
-        &format!("/api/tool_scripts/{id}"),
-        &json!({ "enabled": enabled }),
-        admin,
-    )
-    .await;
-    assert_eq!(status, 200, "{patched}");
-}
-
-/// Expected behaviour: saving A's output fires B by itself (ADR 0007); C, switched off while the
-/// visit was entered, is what the audit reports missing once it is switched on, and the
+/// Expected behaviour: saving A's output fires B by itself (ADR 0007); C, decommissioned while the
+/// visit was entered, is what the audit reports missing once it is recommissioned, and the
 /// on-demand executor fills it in dependency order with trigger statistics and a chain-run blob.
 #[tokio::test]
 #[serial]
@@ -215,7 +193,7 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     let pb = e2e::create_parameter(&app, &admin, "ChainPB", "Chain PB", "ppb").await;
     let pc = e2e::create_parameter(&app, &admin, "ChainPC", "Chain PC", "ppb").await;
     author_chain(&app, &admin).await;
-    set_enabled(&app, &admin, "chain_c", false).await;
+    e2e::set_live(&app, &admin, "chain_c", false).await;
     let group_id = declare_chain_slots(&db, &app, &admin, &site_id, &pa, &pb, &pc).await;
 
     kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
@@ -313,9 +291,9 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
         "a value the run did not produce is refused: {saved}"
     );
 
-    // C is switched on after the visit was entered: the audit reports its absent output, since
+    // C is recommissioned after the visit was entered: the audit reports its absent output, since
     // its input (ChainPB) exists.
-    set_enabled(&app, &admin, "chain_c", true).await;
+    e2e::set_live(&app, &admin, "chain_c", true).await;
     let (status, audit) = crate::common::post_json_parse_with_token(
         &app,
         "/api/actions/event_audit",
@@ -528,9 +506,9 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
 }
 
 /// Expected behaviour: an upstream correction landing while the downstream calculations are
-/// switched off leaves their outputs demonstrably stale (the audit recomputes each saved output
+/// decommissioned leaves their outputs demonstrably stale (the audit recomputes each saved output
 /// under its pinned version with the event's current values and reports the disagreement), and
-/// the chain executor converges the event, after which the audit finds nothing. (Switched on, the
+/// the chain executor converges the event, after which the audit finds nothing. (Live, the
 /// correction itself would have re-run them: ADR 0007.)
 #[tokio::test]
 #[serial]
@@ -633,10 +611,10 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
         assert_eq!(mean, Some(expected), "the save fired the chain for {param}");
     }
 
-    // The upstream correction lands while B and C are switched off: A's input was mistyped and
+    // The upstream correction lands while B and C are decommissioned: A's input was mistyped and
     // the corrected run replaces PA with 50, and nothing downstream moves.
-    set_enabled(&app, &admin, "chain_b", false).await;
-    set_enabled(&app, &admin, "chain_c", false).await;
+    e2e::set_live(&app, &admin, "chain_b", false).await;
+    e2e::set_live(&app, &admin, "chain_c", false).await;
     let (status, a2) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/chain_a/calculate",
@@ -653,10 +631,10 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
         )
         .await,
         1,
-        "a switched-off calculation does not fire"
+        "a decommissioned calculation does not fire"
     );
-    set_enabled(&app, &admin, "chain_b", true).await;
-    set_enabled(&app, &admin, "chain_c", true).await;
+    e2e::set_live(&app, &admin, "chain_b", true).await;
+    e2e::set_live(&app, &admin, "chain_c", true).await;
 
     // The audit recomputes B and C under their pinned versions with the corrected event values
     // and reports both stale. Nothing is written by the auditor.

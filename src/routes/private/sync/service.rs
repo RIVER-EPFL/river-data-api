@@ -6180,11 +6180,6 @@ pub async fn revert_plan(
     // Samples referenced by this plan's readings, so only those can be removed below.
     let sample_ids =
         plan_reading_references(&txn, plan_id, readings::models::Column::SampleId).await?;
-    // The visit is attributed state too: `collection_events::attach` only stamps a reading whose
-    // collection_event_id is NULL, so a reading left pointing at the reverted site's visit would
-    // never be re-attached when the stream is paired somewhere else.
-    let event_ids =
-        plan_reading_references(&txn, plan_id, readings::models::Column::CollectionEventId).await?;
     let touched_events = plan_touched_events(&txn, plan_id).await?;
     let changed = plan_slot_tally(&txn, plan_id).await?;
 
@@ -6221,26 +6216,6 @@ pub async fn revert_plan(
                         .from(readings::models::Entity)
                         .and_where(readings::models::Column::SampleId.is_in(sample_ids))
                         .take(),
-                ),
-            )
-            .exec(&txn)
-            .await?;
-    }
-
-    if !event_ids.is_empty() {
-        // A visit that still has readings on it is not this plan's to delete. The subquery is
-        // bounded to the same ids, so it stays the anti-join the correlated form was.
-        collection_events::models::Entity::delete_many()
-            .filter(collection_events::models::Column::Id.is_in(event_ids.clone()))
-            .filter(
-                collection_events::models::Column::Id.not_in_subquery(
-                    sea_orm::sea_query::Query::select()
-                        .column(readings::models::Column::CollectionEventId)
-                        .from(readings::models::Entity)
-                        .and_where(
-                            readings::models::Column::CollectionEventId.is_in(event_ids.clone()),
-                        )
-                        .to_owned(),
                 ),
             )
             .exec(&txn)

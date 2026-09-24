@@ -511,3 +511,103 @@ async fn derived_served_at(
         .unwrap();
     n > 0
 }
+
+/// Scenario: a calculation reading a value the site records at visits is applied at a site that
+/// already holds two such visits (B649).
+///
+/// Expected behaviour: the apply computes the output at both, on the visit arm the slot declares,
+/// without anyone recomputing a visit by hand.
+#[tokio::test]
+#[serial]
+async fn applying_a_visit_calculation_computes_it_at_the_sites_existing_visits() {
+    let f = crate::common::seeded_app().await;
+    let (db, app, token) = (f.db, f.app, f.token);
+    let (site, temp) = (crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID);
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE site_parameters SET cadence = 'low' \
+              WHERE site_id = '{site}' AND parameter_id = '{temp}'"
+        ),
+    )
+    .await;
+
+    let calculation = crate::common::seed_formula_calculation(&db, "visit_applied_set").await;
+    let (status, saved) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &calculation.to_string(),
+        serde_json::json!([{
+            "code": "visit_applied", "name": "Visit applied", "units": "degC",
+            "formula": "DO_Temperature * 2", "ordinal": 1,
+        }]),
+    )
+    .await;
+    assert!((200..300).contains(&status), "({status}): {saved}");
+    let output = e2e::scalar(
+        &db,
+        "SELECT output_parameter_id::text FROM calculation_formulas WHERE code = 'visit_applied'",
+    )
+    .await;
+
+    let stream = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, is_active) \
+             VALUES ('{stream}', 'grab_sample', '{site}:{temp}:b649', true)"
+        ),
+    )
+    .await;
+    let visits = [
+        ("2025-07-02T09:00:00Z", 12.0),
+        ("2025-07-16T09:00:00Z", 14.0),
+    ];
+    for (at, value) in visits {
+        let event = uuid::Uuid::new_v4();
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO collection_events (id, site_id, collected_at, source) \
+                 VALUES ('{event}', '{site}', '{at}', 'manual')"
+            ),
+        )
+        .await;
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO readings (stream_id, site_id, parameter_id, time, replicate_index, \
+                     raw_value, measurement_type, collection_event_id) \
+                 VALUES ('{stream}', '{site}', '{temp}', '{at}', 0, {value}, 'spot', '{event}')"
+            ),
+        )
+        .await;
+    }
+
+    let (status, applied) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/sites/{site}/calculations"),
+        &serde_json::json!({ "calculation_id": calculation }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{applied}");
+    e2e::drain_jobs(&db, 60).await;
+
+    for (at, value) in visits {
+        let stored = e2e::scalar(
+            &db,
+            &format!(
+                "SELECT COALESCE(MAX(raw_value)::text, 'none') FROM readings \
+                  WHERE site_id = '{site}' AND parameter_id = '{output}' AND time = '{at}'"
+            ),
+        )
+        .await;
+        // value * 2
+        assert_eq!(
+            stored,
+            (value * 2.0).to_string(),
+            "computed at the visit of {at}"
+        );
+    }
+}

@@ -32,9 +32,20 @@ fn test_stale_slots_query_walks_each_cadence_at_the_slot() {
         "{sql}"
     );
     assert!(sql.contains(r#""sp"."is_active""#), "{sql}");
+    assert!(
+        sql.contains(r#"CASE WHEN (EXISTS(SELECT"#)
+            && sql.contains(r#""d"."site_parameter_id" = "sp"."id""#)
+            && sql.contains(r#"("d"."measurement_type" <> $"#)
+            && sql.contains(r#"OR "d"."measurement_type" IS NULL)"#),
+        "the continuous walk runs only at a slot with a non-spot stream: {sql}"
+    );
     // The gap is measured over the five newest instants; every literal is bound, LIMIT included.
     let bound = format!("{:?}", statement.values);
     assert!(bound.contains('5'), "{bound}");
+    assert!(
+        bound.contains("spot"),
+        "the stream's spot test is bound too: {bound}"
+    );
 }
 
 /// Scenario: the battery-trend probe is built rather than written out.

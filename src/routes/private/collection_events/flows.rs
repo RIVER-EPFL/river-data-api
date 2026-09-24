@@ -3,7 +3,7 @@
 //!
 //! Visit-scoped and write-triggered, never timed or global (ADR 0007). A `portal_sync` visit is
 //! recomputed like any other (Q259), the chain's own save never re-enqueues, and a visit none of
-//! the enabled calculations read is left alone. One queued job per visit coalesces a burst of cell saves; the
+//! the live calculations read is left alone. One queued job per visit coalesces a burst of cell saves; the
 //! claim releases the job's dedupe key, so a change landing during a run yields one follow-up.
 
 use sea_orm::sea_query::{
@@ -136,7 +136,7 @@ pub async fn events_from_pairs<C: ConnectionTrait>(
         .collect())
 }
 
-/// Enqueue `event_recompute` for every touched visit an enabled calculation reads. Returns the
+/// Enqueue `event_recompute` for every touched visit a live calculation reads. Returns the
 /// ids of the jobs this call queued; a visit with a job already queued adds none.
 pub async fn enqueue_for<C: ConnectionTrait>(
     db: &C,

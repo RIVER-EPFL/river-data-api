@@ -3,7 +3,7 @@
 //! Scenario: `react_b` reads the `ReactA` parameter at the visit and writes `ReactB`. A member
 //! saves ReactA replicates by hand, with no tool run behind them, and ReactB appears with a
 //! `chain` run behind it; a correction re-runs it once; the chain's own save enqueues nothing; a
-//! disabled calculation does not fire; a flag on a replicate fires it; a portal-synced visit fires
+//! decommissioned calculation does not fire; a flag on a replicate fires it; a portal-synced visit fires
 //! it the same way (Q259); the save reports beforehand which calculation it feeds.
 
 use serde_json::json;
@@ -190,37 +190,18 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
     );
     assert_eq!(recompute_jobs().await, 2);
 
-    // Switched off, the calculation is not part of the set a save feeds: nothing is enqueued.
-    let (status, scripts) =
-        crate::common::get_json_with_token(&app, "/api/tool_scripts", &admin).await;
-    assert_eq!(status, 200, "{scripts}");
-    let script_id = scripts
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["name"] == "react_b")
-        .map(|s| s["id"].as_str().unwrap().to_string())
-        .expect("react_b listed");
-    let (status, patched) = crate::common::patch_json_with_token(
-        &app,
-        &format!("/api/tool_scripts/{script_id}"),
-        &json!({ "enabled": false }),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "{patched}");
-    let patched: serde_json::Value = serde_json::from_str(&patched).unwrap();
-    assert_eq!(patched["enabled"], false);
+    // Decommissioned, the calculation is not part of the set a save feeds: nothing is enqueued.
+    e2e::set_live(&app, &admin, "react_b", false).await;
     let preview = save_a(vec![10.0, 40.0], VISIT, true, true).await;
     assert!(
         preview["calculations"].as_array().unwrap().is_empty(),
-        "a disabled calculation is not reported: {preview}"
+        "a decommissioned calculation is not reported: {preview}"
     );
     save_a(vec![10.0, 40.0], VISIT, true, false).await;
     assert_eq!(
         recompute_jobs().await,
         2,
-        "a disabled calculation enqueues nothing"
+        "a decommissioned calculation enqueues nothing"
     );
     assert_eq!(chain_runs().await, 2);
     assert_eq!(
@@ -229,15 +210,8 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
         "the output stands"
     );
 
-    // Switched back on, a flag on one replicate changes the served mean and fires it again.
-    let (status, patched) = crate::common::patch_json_with_token(
-        &app,
-        &format!("/api/tool_scripts/{script_id}"),
-        &json!({ "enabled": true }),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "{patched}");
+    // Recommissioned, a flag on one replicate changes the served mean and fires it again.
+    e2e::set_live(&app, &admin, "react_b", true).await;
     let (status, flagged) = crate::common::patch_json_with_token(
         &app,
         "/api/readings/flag",

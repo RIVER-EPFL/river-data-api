@@ -386,3 +386,73 @@ async fn a_withdrawn_replicate_is_served_marked_and_outside_n() {
         .collect();
     assert_eq!(withdrawn, vec![2], "the stamped replicate says so: {stats}");
 }
+
+#[tokio::test]
+#[serial]
+async fn a_grab_save_carrying_portal_replicates_leaves_them_on_the_portal_stream() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let portal = "7a3e2f10-5b52-4c6a-9d11-000000000652";
+    crate::common::seed_data_stream(&db, portal, "cnet", "SITE1:TEMP:reps").await;
+    for (index, value) in [(0, 10.0), (1, 20.0)] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, measurement_type, \
+                  replicate_index) \
+                 VALUES ('{portal}', '{}', '{}', '{GRAB_TIME}', {value}, 'spot', {index})",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        )
+        .await;
+    }
+
+    let mut save = grab_payload();
+    save["mode"] = serde_json::json!("replace");
+    save["readings"] = serde_json::json!(
+        [0, 1, 2]
+            .iter()
+            .zip([10.0, 20.0, 60.0])
+            .map(|(index, value)| serde_json::json!({
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "value": value,
+                "time": GRAB_TIME,
+                "replicate_index": index,
+            }))
+            .collect::<Vec<_>>()
+    );
+    let (status, body) = crate::common::post_checked_grab(&app, &save, &token).await;
+    assert_eq!(status, 200, "grid save ({status}): {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        resp["inserted"], 1,
+        "only the typed replicate is new: {resp}"
+    );
+    assert_eq!(resp["withdrawn"], 0, "{resp}");
+
+    let on_portal = scalar_i64(
+        &db,
+        &format!(
+            "SELECT COUNT(*) AS n FROM readings \
+             WHERE stream_id = '{portal}' AND withdrawn_at IS NULL"
+        ),
+    )
+    .await;
+    assert_eq!(on_portal, 2, "the portal's replicates stay where they are");
+    let n = scalar_i64(
+        &db,
+        &format!(
+            "SELECT n::bigint AS n FROM samples \
+             WHERE site_id = '{}' AND parameter_id = '{}'",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+    assert_eq!(n, 3, "each measurement counts once");
+}

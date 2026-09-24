@@ -119,8 +119,11 @@ fn a_first_write_carries_only_what_the_request_says() {
 }
 
 mod moved {
-    use super::super::{ExistingGroup, ExistingReplicate, entered_rows, stored_values_moved};
+    use super::super::{
+        ExistingGroup, ExistingReplicate, Lands, entered_rows, landing, stored_values_moved,
+    };
     use chrono::{DateTime, TimeZone, Utc};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     fn at() -> DateTime<Utc> {
@@ -128,11 +131,17 @@ mod moved {
     }
 
     fn replicate(index: i16, raw_value: f64) -> ExistingReplicate {
+        on(Uuid::nil(), index, raw_value)
+    }
+
+    fn on(stream_id: Uuid, index: i16, raw_value: f64) -> ExistingReplicate {
         ExistingReplicate {
             replicate_index: index,
             raw_value,
             calibrated_value: None,
             standard_curve_id: None,
+            stream_id,
+            live: true,
         }
     }
 
@@ -163,6 +172,74 @@ mod moved {
             entered_rows(&carried, &existing),
             [false, true, true, false]
         );
+    }
+
+    #[test]
+    fn a_portal_replicate_carried_as_stored_stays_on_the_portal_stream() {
+        let dic = Uuid::new_v4();
+        let portal = Uuid::new_v4();
+        let grab = Uuid::new_v4();
+        let carried = [
+            (dic, at(), 0, 0.8436),
+            (dic, at(), 1, 0.8484),
+            (dic, at(), 2, 2.5),
+        ];
+        let existing = [group(
+            dic,
+            vec![on(portal, 0, 0.8436), on(portal, 1, 0.8484)],
+        )];
+        let grabs = HashMap::from([(dic, grab)]);
+        assert_eq!(
+            landing(&carried, &existing, &grabs),
+            [Lands::Stored, Lands::Stored, Lands::Grab]
+        );
+    }
+
+    #[test]
+    fn a_changed_portal_replicate_is_appended_on_the_grab_stream() {
+        let dic = Uuid::new_v4();
+        let portal = Uuid::new_v4();
+        let grab = Uuid::new_v4();
+        let carried = [(dic, at(), 0, 0.9), (dic, at(), 1, 0.8484)];
+        let existing = [group(
+            dic,
+            vec![on(portal, 0, 0.8436), on(portal, 1, 0.8484)],
+        )];
+        let grabs = HashMap::from([(dic, grab)]);
+        assert_eq!(
+            landing(&carried, &existing, &grabs),
+            [Lands::Grab, Lands::Stored]
+        );
+    }
+
+    #[test]
+    fn a_replicate_on_the_grab_stream_is_rewritten_there() {
+        let dic = Uuid::new_v4();
+        let portal = Uuid::new_v4();
+        let grab = Uuid::new_v4();
+        let carried = [(dic, at(), 0, 1.0), (dic, at(), 1, 2.0)];
+        let existing = [group(
+            dic,
+            vec![on(grab, 0, 1.0), on(grab, 1, 1.5), on(portal, 1, 2.0)],
+        )];
+        let grabs = HashMap::from([(dic, grab)]);
+        assert_eq!(
+            landing(&carried, &existing, &grabs),
+            [Lands::Grab, Lands::Stored]
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_portal_replicate_is_not_what_the_save_carries() {
+        let dic = Uuid::new_v4();
+        let portal = Uuid::new_v4();
+        let grab = Uuid::new_v4();
+        let carried = [(dic, at(), 0, 0.8436)];
+        let mut withdrawn = on(portal, 0, 0.8436);
+        withdrawn.live = false;
+        let existing = [group(dic, vec![withdrawn])];
+        let grabs = HashMap::from([(dic, grab)]);
+        assert_eq!(landing(&carried, &existing, &grabs), [Lands::Grab]);
     }
 
     #[test]
@@ -226,6 +303,8 @@ mod staleness {
                     raw_value: 12.0,
                     calibrated_value: None,
                     standard_curve_id: None,
+                    stream_id: Uuid::nil(),
+                    live: true,
                 })
                 .collect(),
         }

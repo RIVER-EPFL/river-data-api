@@ -637,8 +637,8 @@ pub async fn seed_labelled_formula_calculation(
     exec(
         db,
         &format!(
-            "INSERT INTO tool_scripts (id, name, label, engine, enabled) \
-             VALUES ('{id}', '{name}', '{label}', 'formula', true)"
+            "INSERT INTO tool_scripts (id, name, label, engine) \
+             VALUES ('{id}', '{name}', '{label}', 'formula')"
         ),
     )
     .await;

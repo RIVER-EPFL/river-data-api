@@ -59,8 +59,8 @@ async fn calculation(db: &sea_orm::DatabaseConnection, name: &str) -> String {
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO tool_scripts (id, name, label, engine, enabled) \
-             VALUES ('{id}', '{name}', '{name}', 'formula', true)"
+            "INSERT INTO tool_scripts (id, name, label, engine) \
+             VALUES ('{id}', '{name}', '{name}', 'formula')"
         ),
     )
     .await;

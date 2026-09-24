@@ -290,6 +290,26 @@ pub fn stale_slots_query() -> Statement {
         .order_by((r.clone(), readings::Column::Time), Order::Desc)
         .limit(1)
         .to_owned();
+    // A slot fed only by spot streams holds no continuous reading, and walking it would probe
+    // every chunk to find none.
+    let d = Alias::new("d");
+    let continuous_stream = Query::select()
+        .expr(Expr::value(1))
+        .from_as(data_streams::Entity, d.clone())
+        .and_where(
+            Expr::col((d.clone(), data_streams::Column::SiteParameterId))
+                .equals((sp.clone(), site_parameters::Column::Id)),
+        )
+        .cond_where(
+            Condition::any()
+                .add(
+                    Expr::col((d.clone(), data_streams::Column::MeasurementType))
+                        .ne(readings_service::SPOT),
+                )
+                .add(Expr::col((d.clone(), data_streams::Column::MeasurementType)).is_null()),
+        )
+        .to_owned();
+    let last_continuous = Expr::case(Expr::exists(continuous_stream), last_continuous);
 
     let spot_at_slot = |alias: &Alias| {
         readings_at_slot(alias)

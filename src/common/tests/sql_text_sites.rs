@@ -28,7 +28,7 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/collection_events/flows.rs", 0, 2),
     ("src/routes/private/collection_events/service.rs", 12, 6),
     ("src/routes/private/collection_events/views.rs", 0, 2),
-    ("src/routes/private/data_streams/service.rs", 1, 16),
+    ("src/routes/private/data_streams/service.rs", 1, 14),
     ("src/routes/private/data_streams/views.rs", 4, 0),
     ("src/routes/private/derived_parameters/views.rs", 0, 2),
     ("src/routes/private/me.rs", 3, 0),
