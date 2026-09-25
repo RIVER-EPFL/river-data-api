@@ -692,10 +692,17 @@ pub struct PairingPlanSummary {
     pub(super) summary: serde_json::Value,
     pub(super) created_at: chrono::DateTime<chrono::FixedOffset>,
     pub(super) applied_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    /// The version an apply or an edit names as the one it read.
+    pub(super) version: i32,
     /// Streams of this source that are unpaired now and not in the plan, so a draft built while a
     /// sync service was still registering says how much of the source it leaves behind. Counted for
     /// a draft only; a plan that has been applied or superseded is history.
     pub(super) uncovered_streams: Option<i64>,
+    /// Readings an `applying` plan has attributed in committed batches; null on any other status.
+    pub(super) readings_backfilled: Option<u64>,
+    /// Whether an apply job for an `applying` plan is still queued or running. False means the job
+    /// gave up and the plan waits to be resumed; null on any other status.
+    pub(super) apply_in_flight: Option<bool>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

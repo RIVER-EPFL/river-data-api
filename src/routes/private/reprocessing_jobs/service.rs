@@ -846,6 +846,8 @@ pub struct JobContext {
     params: serde_json::Value,
     final_attempt: bool,
     retry: bool,
+    /// The worker and lease epoch the run was claimed under.
+    lease: Option<(String, i64)>,
 }
 
 /// A count as the progress columns carry it. Saturating: a walk longer than the column can hold
@@ -884,8 +886,31 @@ impl JobContext {
             params,
             final_attempt,
             retry,
+            lease: None,
         };
         (ctx, cancel)
+    }
+
+    /// The same context, tied to the lease `worker_id` was granted, which [`Self::hold_lease`]
+    /// checks.
+    fn leased(mut self, worker_id: &str, lease_epoch: i64) -> Self {
+        self.lease = Some((worker_id.to_string(), lease_epoch));
+        self
+    }
+
+    /// Whether this run still holds its lease, share-locking its row in `txn` if so, so the reaper
+    /// cannot hand the job to another worker before `txn` ends. A run reaped out gets `false` and
+    /// commits nothing further; a context no worker claimed holds no lease to lose.
+    pub async fn hold_lease<C: ConnectionTrait>(&self, txn: &C) -> Result<bool, sea_orm::DbErr> {
+        let Some((worker_id, lease_epoch)) = &self.lease else {
+            return Ok(true);
+        };
+        Ok(super::models::job::Entity::find()
+            .filter(owned_by(self.job_id, worker_id, *lease_epoch))
+            .lock_shared()
+            .one(txn)
+            .await?
+            .is_some())
     }
 
     /// Whether this run failing fails the job, with no retry to follow.
@@ -1910,6 +1935,7 @@ async fn execute(
         final_attempt,
         claimed.retry_count > 0,
     );
+    let ctx = ctx.leased(worker_id, claimed.lease_epoch);
     // The two lines every run owes its timeline. A job body says what only it knows; that a run
     // started and how it ended is the worker's to say, so a silent job is impossible.
     let timeline = ctx.clone();

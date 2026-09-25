@@ -4346,6 +4346,7 @@ pub async fn create_plan(
 #[derive(
     Debug,
     Clone,
+    Default,
     PartialEq,
     Eq,
     Serialize,
@@ -4824,6 +4825,26 @@ pub(super) struct ApplyCounters {
     pub(super) curves_created: u32,
 }
 
+impl ApplyCounters {
+    /// What the apply reports, with the readings its backfill has attributed so far.
+    pub(super) fn result(&self, readings_backfilled: u64) -> ApplyResult {
+        ApplyResult {
+            projects_created: self.projects_created,
+            sites_created: self.sites_created,
+            parameters_created: self.params_created,
+            site_parameters_created: self.sp_created,
+            streams_paired: self.streams_paired,
+            streams_skipped: self.streams_skipped,
+            instruments_created: self.instruments_created,
+            curves_assigned: self.curves_assigned,
+            curves_created: self.curves_created,
+            groups_created: self.groups_created,
+            group_members_created: self.group_members_created,
+            readings_backfilled,
+        }
+    }
+}
+
 /// The streams whose instrument nobody has agreed to: a creation, or a lab row with nothing
 /// attached, which the apply would otherwise mint one for. A device feed drafted without one is its
 /// own channel instrument.
@@ -5019,27 +5040,62 @@ async fn step(
     }
 }
 
+/// Readings one batch of a plan's history backfill attributes, give or take those sharing its
+/// last instant. Each holds an advisory lock until its batch commits, in a lock table every
+/// connection shares.
+pub const BACKFILL_BATCH: u64 = 1_000;
+
+type Progress<'a> = Option<&'a crate::routes::private::reprocessing_jobs::service::JobContext>;
+
 /// Apply a pairing plan. `progress` is the job running it, which carries the timeline the steps
 /// are written to and the bus the attributed slots are announced on.
+///
+/// The pairing commits first and leaves the plan `applying`, which is the obligation to finish:
+/// the history is then attributed in batches that each commit, and the plan becomes `applied`
+/// only once the last of what attribution owes has committed with it. A plan found `applying`
+/// resumes from what its batches committed.
 pub async fn apply_plan(
     db: &sea_orm::DatabaseConnection,
     plan_id: Uuid,
-    progress: Option<&crate::routes::private::reprocessing_jobs::service::JobContext>,
+    progress: Progress<'_>,
 ) -> AppResult<ApplyResult> {
     let plan = pairing_plans::Entity::find_by_id(plan_id)
         .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
-
-    if plan.status != "draft" {
-        return Err(AppError::BadRequest(format!(
-            "Plan is '{}', can only apply 'draft' plans",
-            plan.status
-        )));
+    match plan.status.as_str() {
+        "draft" => pair_plan_streams(db, &plan, progress).await?,
+        "applying" => step(progress, "Resuming the history backfill from its last commit").await,
+        status => {
+            return Err(AppError::BadRequest(format!(
+                "Plan is '{status}', can only apply 'draft' plans"
+            )));
+        }
     }
+    backfill_plan_history(db, plan_id, progress).await?;
+    let result = finish_plan(db, plan_id, progress).await?;
+    tracing::info!(
+        plan_id = %plan_id,
+        streams_paired = result.streams_paired,
+        streams_skipped = result.streams_skipped,
+        sites_created = result.sites_created,
+        params_created = result.parameters_created,
+        readings_backfilled = result.readings_backfilled,
+        "Pairing plan applied"
+    );
+    Ok(result)
+}
 
+/// Create the plan's entities and pair its streams, and commit them with the plan `applying` and
+/// its counts recorded, so the history backfill that follows is owed and resumable.
+async fn pair_plan_streams(
+    db: &sea_orm::DatabaseConnection,
+    plan: &pairing_plans::Model,
+    progress: Progress<'_>,
+) -> AppResult<()> {
+    let plan_id = plan.id;
     let entries: Vec<PlanEntry> = plan.entries.0.clone();
-    let curve_intents = plan_curve_intents(&plan)?;
+    let curve_intents = plan_curve_intents(plan)?;
 
     refuse_unconfirmed_instruments(&entries)?;
     refuse_unchecked_entries(&entries)?;
@@ -5063,8 +5119,6 @@ pub async fn apply_plan(
             "Plan is no longer in draft status".to_string(),
         ));
     }
-
-    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
     let param_names: HashMap<Uuid, String> = parameters::Entity::find()
         .all(&txn)
@@ -5204,6 +5258,8 @@ pub async fn apply_plan(
         counters.streams_paired += 1;
     }
 
+    record_apply_result(&txn, plan_id, counters.result(0)).await?;
+    txn.commit().await?;
     step(
         progress,
         &format!(
@@ -5216,45 +5272,265 @@ pub async fn apply_plan(
         ),
     )
     .await;
+    Ok(())
+}
 
-    let backfilled = backfill_plan_readings(
-        &txn,
-        plan_id,
-        progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
-    )
-    .await?;
-    let readings_backfilled = backfilled.readings;
-    let changed = plan_slot_tally(&txn, plan_id).await?;
+/// Attribute the history of every stream the plan paired, one window of at most
+/// [`BACKFILL_BATCH`] readings per committed transaction, and return how many readings moved.
+/// What an earlier run committed is attributed already and is not selected again.
+async fn backfill_plan_history(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+    progress: Progress<'_>,
+) -> AppResult<u64> {
+    use crate::routes::private::data_streams::flows::{HistoryWindow, window_end};
+
+    let streams: Vec<(Uuid, Uuid, Uuid)> = plan_streams(plan_id).into_tuple().all(db).await?;
+    let mut committed = readings_backfilled(db, plan_id).await?;
     step(
         progress,
         &format!(
-            "Attributed {readings_backfilled} readings to the slots this plan paired, across {} visits",
-            backfilled.touched_events.len()
+            "Attributing the history of {} streams; {committed} readings already committed",
+            streams.len()
         ),
     )
     .await;
-    finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
-    queue_plan_attribution(
-        &txn,
-        plan_id,
-        progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
+    report_history(progress, plan_id, committed, 0, streams.len()).await;
+    let mut moved: u64 = 0;
+    for (done, (stream_id, site_id, parameter_id)) in streams.iter().copied().enumerate() {
+        let mut after = None;
+        while let Some(until) = window_end(db, stream_id, after, BACKFILL_BATCH).await? {
+            let window = HistoryWindow {
+                stream_id,
+                after,
+                until,
+            };
+            let Some((rows, recorded)) = backfill_plan_window(db, plan_id, window, progress).await?
+            else {
+                break;
+            };
+            moved += rows;
+            committed = recorded;
+            report_history(progress, plan_id, committed, done, streams.len()).await;
+            if let Some(ctx) = progress {
+                let mut changed = crate::common::SlotTally::default();
+                changed.add(
+                    Some(site_id),
+                    Some(parameter_id),
+                    usize::try_from(rows).unwrap_or(usize::MAX),
+                );
+                changed.announce(ctx.events());
+            }
+            after = Some(until);
+        }
+        report_history(progress, plan_id, committed, done + 1, streams.len()).await;
+    }
+    step(
+        progress,
+        &format!("Attributed {moved} readings of history to the slots this plan paired"),
     )
-    .await?;
-    // Attribution is what made these readings visit values; the calculations that read them at
-    // each manual visit run now (ADR 0007), queued with the apply so a retry finds a draft rather
-    // than an applied plan whose visits were never recomputed. The plan runs as a job, so the
-    // writer it records is the system rather than a person.
-    crate::routes::private::collection_events::flows::enqueue_for(
-        &txn,
-        &backfilled.touched_events,
-        "system",
-        crate::routes::private::collection_events::flows::Writer::Person,
+    .await;
+    Ok(moved)
+}
+
+/// The readings of history the plan's committed batches have attributed.
+async fn readings_backfilled<C: ConnectionTrait>(db: &C, plan_id: Uuid) -> AppResult<u64> {
+    Ok(pairing_plans::Entity::find_by_id(plan_id)
+        .one(db)
+        .await?
+        .and_then(|p| p.apply_result)
+        .map_or(0, |r| r.readings_backfilled))
+}
+
+/// Where the history backfill stands as committed, on the job's report and its bar: the readings
+/// attributed so far, and how many of the plan's streams have their whole history attributed.
+async fn report_history(
+    progress: Progress<'_>,
+    plan_id: Uuid,
+    committed: u64,
+    streams_done: usize,
+    streams: usize,
+) {
+    use crate::routes::private::reprocessing_jobs::service::JobReport;
+
+    let Some(ctx) = progress else {
+        return;
+    };
+    ctx.report(
+        JobReport::new()
+            .scope("plan_id", plan_id.to_string())
+            .scope("activity", "history_backfill")
+            .count("readings_backfilled", committed)
+            .count("streams_backfilled", streams_done)
+            .count("streams_to_backfill", streams),
     )
+    .await;
+    ctx.set_step(streams_done, streams).await;
+}
+
+/// The streams a plan paired, each with the slot it serves, in id order.
+fn plan_streams(plan_id: Uuid) -> sea_orm::Select<data_streams::models::Entity> {
+    data_streams::models::Entity::find()
+        .inner_join(site_parameters::models::Entity)
+        .select_only()
+        .column(data_streams::models::Column::Id)
+        .column(site_parameters::models::Column::SiteId)
+        .column(site_parameters::models::Column::ParameterId)
+        .filter(data_streams::models::Column::PairingPlanId.eq(plan_id))
+        .order_by_asc(data_streams::models::Column::Id)
+}
+
+/// Attribute one window of a stream's history and add it to the plan's count, in one transaction.
+/// Returns the readings the window attributed and the plan's count with them. `None` when the
+/// stream no longer serves the plan, whose remaining history is then not the plan's to attribute.
+async fn backfill_plan_window(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+    window: crate::routes::private::data_streams::flows::HistoryWindow,
+    progress: Progress<'_>,
+) -> AppResult<Option<(u64, u64)>> {
+    crate::common::bulk_write::guarded(db, async |txn| {
+        hold_applying_plan(txn, plan_id, progress).await?;
+        if !lock_plan_stream(txn, plan_id, window.stream_id).await? {
+            return Ok(None);
+        }
+        let rows = crate::routes::private::data_streams::flows::attribute(
+            txn,
+            crate::routes::private::data_streams::flows::Reach::Window(window),
+            None,
+            progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
+        )
+        .await?;
+        let recorded = add_readings_backfilled(txn, plan_id, rows).await?;
+        Ok(Some((rows, recorded)))
+    })
+    .await
+}
+
+/// Lock the plan for the caller's transaction, refusing unless it is still `applying` and the job
+/// running it still holds its lease. One writer at a time adds to the plan's count, and a worker
+/// the reaper replaced commits nothing more.
+async fn hold_applying_plan<C: ConnectionTrait>(
+    txn: &C,
+    plan_id: Uuid,
+    progress: Progress<'_>,
+) -> AppResult<pairing_plans::Model> {
+    if let Some(ctx) = progress
+        && !ctx.hold_lease(txn).await?
+    {
+        return Err(AppError::Conflict(
+            "The job lost its lease; another worker carries the apply on".to_string(),
+        ));
+    }
+    let plan = pairing_plans::Entity::find_by_id(plan_id)
+        .lock_exclusive()
+        .one(txn)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    if plan.status != "applying" {
+        return Err(AppError::Conflict(format!(
+            "Plan is '{}', no longer applying",
+            plan.status
+        )));
+    }
+    Ok(plan)
+}
+
+/// Share-lock one stream for the caller's transaction and say whether it still serves the plan.
+/// An unpair or retirement waits for the batch, and one that committed first is seen here.
+async fn lock_plan_stream<C: ConnectionTrait>(
+    txn: &C,
+    plan_id: Uuid,
+    stream_id: Uuid,
+) -> AppResult<bool> {
+    Ok(data_streams::models::Entity::find_by_id(stream_id)
+        .lock_shared()
+        .one(txn)
+        .await?
+        .is_some_and(|s| s.pairing_plan_id == Some(plan_id) && s.site_parameter_id.is_some()))
+}
+
+/// Store what the apply has done so far on the plan.
+async fn record_apply_result<C: ConnectionTrait>(
+    txn: &C,
+    plan_id: Uuid,
+    result: ApplyResult,
+) -> AppResult<()> {
+    pairing_plans::Entity::update_many()
+        .col_expr(
+            pairing_plans::Column::ApplyResult,
+            Expr::value(result),
+        )
+        .filter(pairing_plans::Column::Id.eq(plan_id))
+        .exec(txn)
+        .await?;
+    Ok(())
+}
+
+/// Add a batch's readings to the count the plan records, read under the plan's lock, and return
+/// the new count.
+async fn add_readings_backfilled<C: ConnectionTrait>(
+    txn: &C,
+    plan_id: Uuid,
+    rows: u64,
+) -> AppResult<u64> {
+    let plan = pairing_plans::Entity::find_by_id(plan_id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    let mut result = plan.apply_result.unwrap_or_default();
+    result.readings_backfilled += rows;
+    let recorded = result.readings_backfilled;
+    record_apply_result(txn, plan_id, result).await?;
+    Ok(recorded)
+}
+
+/// Settle what attribution owes across the plan's streams, mark the plan `applied` and queue the
+/// work an applied plan hands on, all in one transaction, then announce the slots it served.
+/// Settling reads the plan's readings as they stand, so a retry after a failure here repeats it
+/// whole and finds nothing done twice.
+async fn finish_plan(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+    progress: Progress<'_>,
+) -> AppResult<ApplyResult> {
+    let job_id = progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id);
+    let (result, changed, attribution) = crate::common::bulk_write::guarded(db, async |txn| {
+        hold_applying_plan(txn, plan_id, progress).await?;
+        let touched = crate::routes::private::data_streams::flows::settle_attributed(
+            txn,
+            HoldScope::Plan(plan_id),
+        )
+        .await?;
+        let changed = plan_slot_tally(txn, plan_id).await?;
+        let result = finalize_plan(txn, plan_id).await?;
+        let attribution = queue_plan_attribution(txn, plan_id, job_id).await?;
+        // Attribution is what made these readings visit values; the calculations that read them
+        // at each manual visit run now (ADR 0007), queued with the finish so a retry finds an
+        // applying plan rather than an applied one whose visits were never recomputed. The plan
+        // runs as a job, so the writer it records is the system rather than a person.
+        crate::routes::private::collection_events::flows::enqueue_for(
+            txn,
+            &touched,
+            "system",
+            crate::routes::private::collection_events::flows::Writer::Person,
+        )
+        .await?;
+        step(
+            progress,
+            &format!(
+                "Settled the samples, visits and holds of the plan's history across {} visits",
+                touched.len()
+            ),
+        )
+        .await;
+        Ok((result, changed, attribution))
+    })
     .await?;
-    txn.commit().await?;
 
     // The history the plan attributed is served at its sites from now on, and a site's cached
-    // responses go only when a write announces it (`common/cache.rs`).
+    // responses go only when a write announces it (`common/cache.rs`). A batch committed by an
+    // earlier run announced nothing that outlived it, so the whole plan is announced here.
     if let Some(ctx) = progress {
         changed.announce(ctx.events());
     }
@@ -5282,36 +5558,12 @@ pub async fn apply_plan(
     step(
         progress,
         &format!(
-            "Queued re-derivation of {} slots by deployment and calibration window",
-            slots.len()
+            "Queued re-derivation of {} slots by deployment and calibration window{}",
+            slots.len(),
+            attribution.map_or(String::new(), |id| format!(" as job {id}"))
         ),
     )
     .await;
-    let result = ApplyResult {
-        projects_created: counters.projects_created,
-        sites_created: counters.sites_created,
-        parameters_created: counters.params_created,
-        site_parameters_created: counters.sp_created,
-        streams_paired: counters.streams_paired,
-        streams_skipped: counters.streams_skipped,
-        instruments_created: counters.instruments_created,
-        curves_assigned: counters.curves_assigned,
-        curves_created: counters.curves_created,
-        groups_created: counters.groups_created,
-        group_members_created: counters.group_members_created,
-        readings_backfilled,
-    };
-
-    tracing::info!(
-        plan_id = %plan_id,
-        streams_paired = counters.streams_paired,
-        streams_skipped = counters.streams_skipped,
-        sites_created = counters.sites_created,
-        params_created = counters.params_created,
-        readings_backfilled,
-        "Pairing plan applied"
-    );
-
     Ok(result)
 }
 
@@ -6019,23 +6271,6 @@ async fn plan_touched_events<C: ConnectionTrait>(
     .await
 }
 
-/// Attribute everything the plan's newly paired streams already hold, through the helper every
-/// pairing path runs. Deployment attribution is left to the slot reprocess the caller enqueues:
-/// a plan pairs many streams, and each reading's deployment is the one covering its own time.
-pub(super) async fn backfill_plan_readings<C: ConnectionTrait>(
-    txn: &C,
-    plan_id: Uuid,
-    job_id: Option<Uuid>,
-) -> AppResult<crate::routes::private::data_streams::models::Backfilled> {
-    crate::routes::private::data_streams::flows::backfill(
-        txn,
-        HoldScope::Plan(plan_id),
-        None,
-        job_id,
-    )
-    .await
-}
-
 /// The readings the plan's streams serve, counted per (site, parameter) slot: what an apply has
 /// just attributed, or what a revert is about to take away, and so what either owes a
 /// `DataIngested` for (`common/cache.rs`).
@@ -6073,41 +6308,25 @@ async fn plan_slot_tally<C: ConnectionTrait>(
     Ok(tally)
 }
 
+/// Mark an `applying` plan `applied` and return the result its apply recorded.
 pub(super) async fn finalize_plan<C: ConnectionTrait>(
     txn: &C,
     plan_id: Uuid,
-    counters: &ApplyCounters,
-    readings_backfilled: u64,
-) -> AppResult<()> {
-    let result = ApplyResult {
-        projects_created: counters.projects_created,
-        sites_created: counters.sites_created,
-        parameters_created: counters.params_created,
-        site_parameters_created: counters.sp_created,
-        streams_paired: counters.streams_paired,
-        streams_skipped: counters.streams_skipped,
-        instruments_created: counters.instruments_created,
-        curves_assigned: counters.curves_assigned,
-        curves_created: counters.curves_created,
-        groups_created: counters.groups_created,
-        group_members_created: counters.group_members_created,
-        readings_backfilled,
-    };
-
-    let mut plan_active: pairing_plans::ActiveModel = pairing_plans::Entity::find_by_id(plan_id)
+) -> AppResult<ApplyResult> {
+    let plan = pairing_plans::Entity::find_by_id(plan_id)
         .one(txn)
         .await?
-        .ok_or_else(|| AppError::Internal("Plan disappeared during apply".to_string()))?
-        .into();
+        .ok_or_else(|| AppError::Internal("Plan disappeared during apply".to_string()))?;
+    let result = plan.apply_result.clone().unwrap_or_default();
+    let mut plan_active: pairing_plans::ActiveModel = plan.into();
     plan_active.status = Set("applied".to_string());
     plan_active.applied_at = Set(Some(Utc::now().into()));
-    plan_active.apply_result = Set(Some(result.clone()));
     plan_active.update(txn).await?;
-    Ok(())
+    Ok(result)
 }
 
 /// Queue the re-derivation a plan apply hands on: its paired readings, by the deployment and
-/// calibration windows of each slot. `backfill_plan_readings` stamps only site and parameter; the
+/// calibration windows of each slot. The history backfill stamps only site and parameter; the
 /// window-aware reprocess assigns instrument, deployment, calibration and calibrated value, and
 /// runs as its own job because it opens transactions and refreshes aggregates. Called on the
 /// apply's transaction, so an applied plan always has its attribution queued.
@@ -7184,6 +7403,28 @@ pub(super) async fn uncovered_stream_count(
         ))
         .await?;
     Ok(row.map(|r| r.try_get::<i64>("", "n")).transpose()?)
+}
+
+/// The readings an `applying` plan has committed, and whether an apply job for it is in flight.
+pub(super) async fn applying_standing(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+) -> AppResult<(u64, bool)> {
+    use crate::routes::private::reprocessing_jobs as jobs;
+    use crate::routes::private::reprocessing_jobs::service::IN_FLIGHT_STATES;
+    let committed = pairing_plans::Entity::find_by_id(plan_id)
+        .one(db)
+        .await?
+        .and_then(|plan| plan.apply_result)
+        .map_or(0, |result| result.readings_backfilled);
+    let in_flight = jobs::Entity::find()
+        .filter(jobs::Column::TriggerType.eq("plan_apply"))
+        .filter(jobs::Column::TriggerId.eq(plan_id))
+        .filter(jobs::Column::Status.is_in(IN_FLIGHT_STATES))
+        .one(db)
+        .await?
+        .is_some();
+    Ok((committed, in_flight))
 }
 
 /// Fold the review's curve assignments into the plan's list. An assignment must name a curve that

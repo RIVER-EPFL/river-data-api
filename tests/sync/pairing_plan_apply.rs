@@ -439,11 +439,11 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
 
 /// Scenario: the attribution a plan apply hands on cannot be queued.
 ///
-/// Expected behaviour: the apply is not committed without it: the plan stays a draft and its
-/// stream unpaired, so a retry applies it whole rather than finding it applied and stopping.
+/// Expected behaviour: the plan is not marked applied without it. It stays applying, so a retry
+/// finishes it and queues the attribution rather than finding it applied and stopping.
 #[tokio::test]
 #[serial]
-async fn an_apply_whose_attribution_cannot_be_queued_commits_nothing() {
+async fn an_apply_whose_attribution_cannot_be_queued_is_not_applied() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -460,20 +460,30 @@ async fn an_apply_whose_attribution_cannot_be_queued_commits_nothing() {
     assert_eq!(
         count(
             &db,
-            &format!("pairing_plans WHERE id = '{plan_id}' AND status = 'draft'")
+            &format!("pairing_plans WHERE id = '{plan_id}' AND status = 'applying'")
         )
         .await,
         1,
-        "the plan is still a draft"
+        "the plan is still owed its finish"
     );
-    assert_eq!(
+    assert_eq!(attribution_jobs(&db, plan_id).await, 0);
+    assert!(
         scalar_opt_uuid(
             &db,
             &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
         )
-        .await,
-        None,
-        "the stream is still unpaired"
+        .await
+        .is_some(),
+        "the pairing committed ahead of the finish"
+    );
+
+    river_db::routes::private::sync::service::apply_plan(&db, plan_id, None)
+        .await
+        .expect("the retry finishes the plan");
+    assert_eq!(
+        attribution_jobs(&db, plan_id).await,
+        1,
+        "the retry queues the attribution"
     );
 
     crate::common::cleanup_test_db(&db).await;
@@ -482,11 +492,11 @@ async fn an_apply_whose_attribution_cannot_be_queued_commits_nothing() {
 /// Scenario: the plan's stream holds a reading at a manual visit a calculation reads, and the
 /// visit's recompute cannot be queued.
 ///
-/// Expected behaviour: the apply commits nothing, so the retry the failed job gets applies the plan
-/// whole and queues the recompute, rather than finding it applied and queueing only the attribution.
+/// Expected behaviour: the plan is not marked applied, so the retry the failed job gets finishes it
+/// and queues the recompute, rather than finding it applied and queueing only the attribution.
 #[tokio::test]
 #[serial]
-async fn an_apply_whose_visit_recompute_cannot_be_queued_commits_nothing() {
+async fn an_apply_whose_visit_recompute_cannot_be_queued_is_not_applied() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -525,25 +535,25 @@ async fn an_apply_whose_visit_recompute_cannot_be_queued_commits_nothing() {
     assert_eq!(
         count(
             &db,
-            &format!("pairing_plans WHERE id = '{plan_id}' AND status = 'draft'")
+            &format!("pairing_plans WHERE id = '{plan_id}' AND status = 'applying'")
         )
         .await,
         1,
-        "the plan is still a draft"
+        "the plan is still owed its finish"
     );
-    assert_eq!(
+    assert!(
         scalar_opt_uuid(
             &db,
             &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
         )
-        .await,
-        None,
-        "the stream is still unpaired"
+        .await
+        .is_some(),
+        "the pairing committed ahead of the finish"
     );
 
     river_db::routes::private::sync::service::apply_plan(&db, plan_id, None)
         .await
-        .expect("the retry applies the plan");
+        .expect("the retry finishes the plan");
     assert_eq!(
         count(
             &db,

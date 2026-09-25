@@ -411,3 +411,57 @@ async fn handler_panic_fails_job_and_worker_survives() {
     );
     assert_eq!(job_row(&db, ok_id).await.status, "completed");
 }
+
+/// Scenario: while a run is going, the reaper hands its job to another worker (a new lease epoch).
+/// Expected behaviour: the run holds its lease until then, and loses it after, so a batch it would
+/// commit next is refused.
+#[tokio::test]
+#[serial]
+async fn test_hold_lease_is_lost_once_the_job_is_reclaimed() {
+    use crate::common::jobs::{ClosureJob, registry_of};
+    use sea_orm::TransactionTrait;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+
+    let held: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+    let seen = held.clone();
+    let job = ClosureJob::new("test_lease", move |ctx| {
+        let seen = seen.clone();
+        async move {
+            let hold = async |ctx: &JobContext| {
+                let txn = ctx.db().begin().await?;
+                let held = ctx.hold_lease(&txn).await?;
+                txn.commit().await?;
+                Ok::<bool, sea_orm::DbErr>(held)
+            };
+            let before = hold(&ctx).await?;
+            ctx.db()
+                .execute_raw(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!(
+                        "UPDATE reprocessing_jobs SET lease_epoch = lease_epoch + 1 \
+                         WHERE id = '{}'",
+                        ctx.job_id()
+                    ),
+                ))
+                .await?;
+            let after = hold(&ctx).await?;
+            seen.lock().unwrap().extend([before, after]);
+            Ok(0)
+        }
+    });
+    let registry = registry_of(job);
+    let events = tokio::sync::broadcast::channel::<AppEvent>(16).0;
+    jobs::enqueue(&db, "test_lease", None, None, &serde_json::json!({}), None)
+        .await
+        .unwrap();
+    assert!(
+        jobs::run_one(&db, &events, &registry, &jobs::worker_id())
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(*held.lock().unwrap(), vec![true, false]);
+    crate::common::cleanup_test_db(&db).await;
+}

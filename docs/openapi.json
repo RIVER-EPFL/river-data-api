@@ -12862,6 +12862,13 @@
               "null"
             ]
           },
+          "apply_in_flight": {
+            "description": "Whether an apply job for an `applying` plan is still queued or running. False means the job\ngave up and the plan waits to be resumed; null on any other status.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -12875,6 +12882,15 @@
           "id": {
             "format": "uuid",
             "type": "string"
+          },
+          "readings_backfilled": {
+            "description": "Readings an `applying` plan has attributed in committed batches; null on any other status.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "source_system": {
             "type": "string"
@@ -12892,6 +12908,11 @@
               "integer",
               "null"
             ]
+          },
+          "version": {
+            "description": "The version an apply or an edit names as the one it read.",
+            "format": "int32",
+            "type": "integer"
           }
         },
         "required": [
@@ -12899,7 +12920,8 @@
           "source_system",
           "status",
           "summary",
-          "created_at"
+          "created_at",
+          "version"
         ],
         "type": "object"
       },
@@ -48731,7 +48753,7 @@
             "description": "Plan already applied or reverted, or edited since the client read it"
           }
         },
-        "summary": "Apply a pairing plan: execute all its pairings and backfills atomically. Marks the\nplan as `applied`. Requires `write_metadata`.",
+        "summary": "Apply a pairing plan, or resume one left `applying`: pair its streams, attribute their history\nin committed batches, and mark the plan `applied`. Requires `write_metadata`.",
         "tags": [
           "sync"
         ]

@@ -809,6 +809,67 @@ async fn plan_listing_filters_by_source_and_status_without_entries() {
     crate::common::cleanup_test_db(&db).await;
 }
 
+/// Scenario: an apply job gave up mid-backfill, leaving its plan `applying`.
+/// Expected behaviour: the listing carries the readings the plan committed and whether an apply
+/// job for it is still in flight, which is what a Resume control is shown on.
+#[tokio::test]
+#[serial]
+async fn an_applying_plan_lists_its_committed_count_and_live_job() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let plan_id = Uuid::new_v4();
+    let apply_result = serde_json::json!({
+        "projects_created": 0, "sites_created": 0, "parameters_created": 0,
+        "site_parameters_created": 0, "streams_paired": 3, "readings_backfilled": 1234
+    });
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries, apply_result) \
+             VALUES ('{plan_id}', 'hardening', 'applying', '{{}}'::jsonb, '[]'::jsonb, '{apply_result}'::jsonb)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (trigger_type, trigger_id, status) \
+             VALUES ('plan_apply', '{plan_id}', 'failed')"
+        ),
+    )
+    .await;
+
+    async fn listed(app: &axum::Router, token: &str) -> serde_json::Value {
+        let (status, body) =
+            crate::common::get_json_with_token(app, "/api/sync/pairing-plans?status=applying", token)
+                .await;
+        assert_eq!(status, 200, "listing failed: {body}");
+        body[0].clone()
+    }
+
+    let row = listed(&app, &token).await;
+    assert_eq!(row["readings_backfilled"], 1234, "{row}");
+    assert_eq!(row["version"], 0, "the resume names the version it read: {row}");
+    assert_eq!(row["apply_in_flight"], false, "a failed job is not in flight: {row}");
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (trigger_type, trigger_id, status) \
+             VALUES ('plan_apply', '{plan_id}', 'queued')"
+        ),
+    )
+    .await;
+    let row = listed(&app, &token).await;
+    assert_eq!(row["apply_in_flight"], true, "a queued resume is in flight: {row}");
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
 /// Start over supersedes the draft it replaces, and a superseded draft can no longer be applied.
 #[tokio::test]
 #[serial]

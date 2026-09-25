@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use sea_orm::sea_query::{
     Alias, Expr, Func, InsertStatement, PostgresQueryBuilder, Query, UpdateStatement,
 };
+use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::{Condition, ConnectionTrait, DbErr, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
@@ -49,6 +50,53 @@ pub(crate) fn predicate(scope: HoldScope) -> Condition {
         HoldScope::Stream(id) => Expr::col((ds, data_streams::Column::Id)).eq(id),
         HoldScope::Plan(id) => Expr::col((ds, data_streams::Column::PairingPlanId)).eq(id),
     })
+}
+
+/// A stretch of one stream's history, `(after, until]`, which one batch of a plan's backfill
+/// attributes whole, so the readings sharing an instant are never split across two batches.
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryWindow {
+    pub stream_id: Uuid,
+    pub after: Option<DateTimeWithTimeZone>,
+    pub until: DateTimeWithTimeZone,
+}
+
+/// The readings an attribution statement reaches: a whole scope, or one window of one stream.
+#[derive(Clone, Copy, Debug)]
+pub enum Reach {
+    Scope(HoldScope),
+    Window(HistoryWindow),
+}
+
+impl From<HoldScope> for Reach {
+    fn from(scope: HoldScope) -> Self {
+        Self::Scope(scope)
+    }
+}
+
+impl Reach {
+    /// The reach over `readings` and `data_streams`, named as the tables themselves.
+    fn condition(self) -> Condition {
+        use sea_orm::sea_query::ExprTrait;
+
+        match self {
+            Self::Scope(scope) => Condition::all().add(scope_condition(scope)),
+            Self::Window(window) => {
+                let r = Alias::new("readings");
+                Condition::all()
+                    .add(
+                        Expr::col((Alias::new("data_streams"), data_streams::Column::Id))
+                            .eq(window.stream_id),
+                    )
+                    .add_option(
+                        window
+                            .after
+                            .map(|after| Expr::col((r.clone(), readings::Column::Time)).gt(after)),
+                    )
+                    .add(Expr::col((r, readings::Column::Time)).lte(window.until))
+            }
+        }
+    }
 }
 
 /// The same scope over the streams table itself, for the statements that name it rather than
@@ -108,9 +156,9 @@ fn attributed_values(deployment_id: Option<Uuid>) -> Vec<(readings::Column, Expr
     ]
 }
 
-/// The readings a pairing attributes: every unattributed reading on a stream in scope, joined to
-/// the slot the stream now serves. Statements over them name `data_streams` and `site_parameters`.
-fn unattributed_in_scope(scope: HoldScope) -> Condition {
+/// The readings a pairing attributes: every unattributed reading within reach, joined to the slot
+/// its stream now serves. Statements over them name `data_streams` and `site_parameters`.
+fn unattributed_in_scope(reach: Reach) -> Condition {
     use sea_orm::sea_query::ExprTrait;
 
     let r = Alias::new("readings");
@@ -125,12 +173,12 @@ fn unattributed_in_scope(scope: HoldScope) -> Condition {
                 .equals((ds, data_streams::Column::Id)),
         )
         .add(Expr::col((r, readings::Column::SiteId)).is_null())
-        .add(scope_condition(scope))
+        .add(reach.condition())
 }
 
 /// Attribute a newly paired stream's readings from the slot it now serves. A reading already
 /// attributed keeps what it has; the instrument and cadence fall back to the stream's own.
-fn attribute_readings(scope: HoldScope, deployment_id: Option<Uuid>) -> UpdateStatement {
+fn attribute_readings(reach: impl Into<Reach>, deployment_id: Option<Uuid>) -> UpdateStatement {
     let mut update = Query::update();
     update.table(readings::Entity);
     for (column, value) in attributed_values(deployment_id) {
@@ -139,14 +187,14 @@ fn attribute_readings(scope: HoldScope, deployment_id: Option<Uuid>) -> UpdateSt
     update
         .from(data_streams::Entity)
         .from(site_parameters::Entity)
-        .cond_where(unattributed_in_scope(scope))
+        .cond_where(unattributed_in_scope(reach.into()))
         .to_owned()
 }
 
 /// The ledger rows a pairing owes: one `attribution` decision per reading [`attribute_readings`] is
 /// about to attribute, naming each column it writes on both sides, inserted before the write.
 fn attribution_ledger(
-    scope: HoldScope,
+    reach: impl Into<Reach>,
     deployment_id: Option<Uuid>,
     job_id: Option<Uuid>,
 ) -> InsertStatement {
@@ -172,7 +220,7 @@ fn attribution_ledger(
         .from(readings::Entity)
         .from(data_streams::Entity)
         .from(site_parameters::Entity)
-        .cond_where(unattributed_in_scope(scope))
+        .cond_where(unattributed_in_scope(reach.into()))
         .to_owned();
     derivation_ledger(Kind::Attribution, moving, Some("paired"), job_id)
 }
@@ -241,14 +289,67 @@ pub async fn backfill<C: ConnectionTrait>(
     deployment_id: Option<Uuid>,
     job_id: Option<Uuid>,
 ) -> AppResult<Backfilled> {
-    let scoped = predicate(scope);
+    let readings = attribute(conn, scope, deployment_id, job_id).await?;
+    let touched_events = settle_attributed(conn, scope).await?;
+    Ok(Backfilled {
+        readings,
+        touched_events,
+    })
+}
 
+/// Attribute the unattributed readings within reach from their streams' slots, each with the
+/// ledger row saying so, and return how many moved. The advisory lock the ledger takes per
+/// reading is held to the end of the caller's transaction, so a caller bounds the reach.
+pub async fn attribute<C: ConnectionTrait>(
+    conn: &C,
+    reach: impl Into<Reach>,
+    deployment_id: Option<Uuid>,
+    job_id: Option<Uuid>,
+) -> AppResult<u64> {
+    let reach = reach.into();
     // The backfill reaches chunks the compression policy has already closed.
     bulk_write::lift_decompression_cap(conn).await?;
+    bulk_write::mutation_rows(conn, attribution_ledger(reach, deployment_id, job_id)).await?;
+    bulk_write::mutation_rows(conn, attribute_readings(reach, deployment_id)).await
+}
 
-    bulk_write::mutation_rows(conn, attribution_ledger(scope, deployment_id, job_id)).await?;
-    let readings =
-        bulk_write::mutation_rows(conn, attribute_readings(scope, deployment_id)).await?;
+/// The end of the next window of a stream's unattributed history after `after`: the instant of its
+/// `rows`-th unattributed reading, or of its last when fewer remain. `None` when none remain.
+pub async fn window_end<C: ConnectionTrait>(
+    conn: &C,
+    stream_id: Uuid,
+    after: Option<DateTimeWithTimeZone>,
+    rows: u64,
+) -> AppResult<Option<DateTimeWithTimeZone>> {
+    use sea_orm::{ColumnTrait, QueryFilter, QueryOrder, QuerySelect};
+
+    let mut next = readings::Entity::find()
+        .select_only()
+        .column(readings::Column::Time)
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .filter(readings::Column::SiteId.is_null());
+    if let Some(after) = after {
+        next = next.filter(readings::Column::Time.gt(after));
+    }
+    let times: Vec<DateTimeWithTimeZone> = next
+        .order_by_asc(readings::Column::Time)
+        .limit(rows)
+        .into_tuple()
+        .all(conn)
+        .await?;
+    Ok(times.last().copied())
+}
+
+/// What attribution owes once a scope's readings carry their slot: replicate groups become samples,
+/// spot instants become visits, status events are attributed, holds join the review queue, and the
+/// streams' digests are dropped. Every step reads the scope as it stands, so running it again
+/// finds nothing left to do. Returns the visits the scope's readings sit at.
+pub async fn settle_attributed<C: ConnectionTrait>(
+    conn: &C,
+    scope: HoldScope,
+) -> AppResult<Vec<crate::routes::private::collection_events::flows::TouchedEvent>> {
+    let scoped = predicate(scope);
+    bulk_write::lift_decompression_cap(conn).await?;
 
     // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
     // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
@@ -278,11 +379,7 @@ pub async fn backfill<C: ConnectionTrait>(
         values,
     ))
     .await?;
-
-    Ok(Backfilled {
-        readings,
-        touched_events: touched,
-    })
+    Ok(touched)
 }
 
 /// Pair an unpaired entry channel to the slot it was opened for, now that the slot exists, with

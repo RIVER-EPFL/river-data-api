@@ -1491,6 +1491,7 @@ pub async fn list_pairing_plans(
             Column::Summary,
             Column::CreatedAt,
             Column::AppliedAt,
+            Column::Version,
         ])
         .order_by_desc(Column::CreatedAt)
         .into_tuple::<(
@@ -1501,14 +1502,20 @@ pub async fn list_pairing_plans(
             serde_json::Value,
             chrono::DateTime<chrono::FixedOffset>,
             Option<chrono::DateTime<chrono::FixedOffset>>,
+            i32,
         )>()
         .all(&state.db)
         .await?;
 
     let mut listing = Vec::with_capacity(rows.len());
-    for (id, source_system, status, created_by, summary, created_at, applied_at) in rows {
+    for (id, source_system, status, created_by, summary, created_at, applied_at, version) in rows {
         let uncovered = if status == "draft" {
             uncovered_stream_count(&state.db, id, &source_system).await?
+        } else {
+            None
+        };
+        let applying = if status == "applying" {
+            Some(applying_standing(&state.db, id).await?)
         } else {
             None
         };
@@ -1520,7 +1527,10 @@ pub async fn list_pairing_plans(
             summary,
             created_at,
             applied_at,
+            version,
             uncovered_streams: uncovered,
+            readings_backfilled: applying.map(|(committed, _)| committed),
+            apply_in_flight: applying.map(|(_, in_flight)| in_flight),
         });
     }
 
@@ -1771,8 +1781,8 @@ pub async fn update_pairing_plan(
     Ok(Json(updated.into()))
 }
 
-/// Apply a pairing plan: execute all its pairings and backfills atomically. Marks the
-/// plan as `applied`. Requires `write_metadata`.
+/// Apply a pairing plan, or resume one left `applying`: pair its streams, attribute their history
+/// in committed batches, and mark the plan `applied`. Requires `write_metadata`.
 #[utoipa::path(
     post,
     path = "/api/sync/pairing-plans/{id}/apply",
@@ -1793,8 +1803,10 @@ pub async fn apply_pairing_plan(
     // Validate synchronously for immediate feedback, then background the heavy entity-resolution +
     // readings backfill as a tracked job so the request doesn't block. The job's `detail` carries
     // the execution counts.
+    // An `applying` plan committed its pairing and part of its history; applying it again resumes
+    // the backfill from there.
     let status = plan_status(&state.db, id).await?;
-    if status != "draft" {
+    if !matches!(status.as_str(), "draft" | "applying") {
         return Err(AppError::Conflict(format!(
             "Plan is '{status}', can only apply 'draft' plans"
         )));
