@@ -1007,6 +1007,97 @@ async fn apply_creates_the_group_the_source_registry_names() {
     assert_eq!(groups, 1, "the group is created once, not once per column");
 }
 
+/// Scenario: a category holding a column entered once and a replicate family entered at A and B.
+///
+/// Expected behaviour: the family's parameter lands in the group declared replicated, so a
+/// calculation of that group reads the family rather than its mean; the single column does not.
+#[tokio::test]
+#[serial]
+async fn apply_declares_a_replicate_family_replicated_in_its_group() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    for (key, column, ordinal, replicates) in [
+        ("pco2-temp", "lab_co2_lab_temp", 1, serde_json::Value::Null),
+        (
+            "pco2-co2ppm",
+            "lab_co2_co2ppm",
+            2,
+            serde_json::json!({ "source_columns": ["lab_co2_co2ppm_A", "lab_co2_co2ppm_B"] }),
+        ),
+    ] {
+        let mut metadata = serde_json::json!({
+            "hierarchy": { "project": "Test Project", "site": "Site 1", "parameter": column },
+            "units": "-",
+            "parameter": { "column_name": column, "category": "pCO2", "category_ordinal": ordinal },
+        });
+        if !replicates.is_null() {
+            metadata["replicates"] = replicates;
+        }
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO data_streams (id, source_system, source_key, source_name, metadata, is_active) \
+                 VALUES ('{}', 'famsrc', '{key}', 'Site 1 - {column}', '{}'::jsonb, true)",
+                Uuid::new_v4(),
+                metadata.to_string().replace('\'', "''")
+            ),
+        )
+        .await;
+    }
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "famsrc" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan: {plan}");
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id).await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
+    assert!((200..300).contains(&status), "apply ({status}): {text}");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
+
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.code AS code, m.replicates AS replicates \
+             FROM parameter_group_members m \
+             JOIN parameter_groups g ON g.id = m.group_id \
+             JOIN parameters p ON p.id = m.parameter_id \
+             WHERE g.code = 'pco2' ORDER BY m.ordinal"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let placed: Vec<(String, Option<serde_json::Value>)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "code").unwrap(),
+                row.try_get::<Option<serde_json::Value>>("", "replicates")
+                    .unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        placed,
+        vec![
+            ("lab_co2_lab_temp".into(), None),
+            ("lab_co2_co2ppm".into(), Some(serde_json::json!({}))),
+        ],
+    );
+}
+
 /// Scenario: a portal's own instrument register, offered by the connector and admitted by a plan.
 ///
 /// Expected behaviour: nothing exists until the apply runs, the plan carries every offered row, a

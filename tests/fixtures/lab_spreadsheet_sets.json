@@ -1279,12 +1279,12 @@
           ]
         },
         "codes": {
-          "CO2_HS_Um": "CO2_HS_Um_avg",
-          "pCO2_HS_uatm": "pCO2_HS_uatm_avg",
-          "pCO2_HS_P1_uatm": "pCO2_HS_P1_uatm_avg",
-          "pCO2_HS_P2_uatm": "pCO2_HS_P2_uatm_avg",
+          "CO2_HS_Um": "CO2_HS_Um",
+          "pCO2_HS_uatm": "pCO2_HS_uatm",
+          "pCO2_HS_P1_uatm": "pCO2_HS_P1_uatm",
+          "pCO2_HS_P2_uatm": "pCO2_HS_P2_uatm",
           "ch4_dry_ppm": "lab_co2_ch4_dry",
-          "CH4_umol_L": "CH4_umol_L_avg"
+          "CH4_umol_L": "CH4_umol_L"
         }
       },
       "sheet": {
@@ -1374,12 +1374,12 @@
           ]
         },
         "codes": {
-          "CO2_HS_Um": "CO2_HS_Um_avg",
-          "pCO2_HS_uatm": "pCO2_HS_uatm_avg",
-          "pCO2_HS_P1_uatm": "pCO2_HS_P1_uatm_avg",
-          "pCO2_HS_P2_uatm": "pCO2_HS_P2_uatm_avg",
+          "CO2_HS_Um": "CO2_HS_Um",
+          "pCO2_HS_uatm": "pCO2_HS_uatm",
+          "pCO2_HS_P1_uatm": "pCO2_HS_P1_uatm",
+          "pCO2_HS_P2_uatm": "pCO2_HS_P2_uatm",
           "ch4_dry_ppm": "lab_co2_ch4_dry",
-          "CH4_umol_L": "CH4_umol_L_avg"
+          "CH4_umol_L": "CH4_umol_L"
         }
       },
       "sheet": {
@@ -1468,8 +1468,8 @@
           ]
         },
         "codes": {
-          "DIC": "DIC_avg",
-          "d13C_DIC": "d13C_DIC_avg"
+          "DIC": "DIC",
+          "d13C_DIC": "d13C_DIC"
         }
       },
       "sheet": {

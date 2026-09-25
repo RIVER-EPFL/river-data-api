@@ -81,8 +81,8 @@
       "label": "DOM indices",
       "group": "DOM",
       "formulas": [
-        {"code": "SUVA", "label": "SUVA", "units": "L/mg/m", "formula": "a254 * 1000 / DOC_avg_ppb", "description": "calcSUVA",
-         "ordinal": 1, "output_parameter_code": "SUVA", "sources": [["a254", "a254"], ["DOC_avg_ppb", "DOC_avg_ppb"]], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": false},
+        {"code": "SUVA", "label": "SUVA", "units": "L/mg/m", "formula": "a254 * 1000 / DOC_ppb", "description": "calcSUVA",
+         "ordinal": 1, "output_parameter_code": "SUVA", "sources": [["a254", "a254"], ["DOC_ppb", "DOC_ppb"]], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": false},
         {"code": "A_T", "label": "A/T", "units": "", "formula": "if(eq(T, 0), na, A / T)", "description": "calcRatio, a zero divisor is NA",
          "ordinal": 2, "output_parameter_code": "A_T", "sources": [["A", "A"], ["T", "T"]], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": false},
         {"code": "C_A", "label": "C/A", "units": "", "formula": "if(eq(A, 0), na, C / A)", "description": "calcRatio",
@@ -95,7 +95,7 @@
       "cases": [
         {
           "name": "VAD 2017-05-17 (row 2)",
-          "inputs": {"a254": 3.42731, "DOC_avg_ppb": 448.41, "A": 0.057759, "T": 0.019727, "C": 0.033822, "M": 0.038795},
+          "inputs": {"a254": 3.42731, "DOC_ppb": 448.41, "A": 0.057759, "T": 0.019727, "C": 0.033822, "M": 0.038795},
           "expected": {"SUVA": 7.64325, "A_T": 2.92784, "C_A": 0.585578, "C_M": 0.871809, "C_T": 1.71448},
           "tolerance": 1e-4
         }
@@ -118,11 +118,11 @@
       "label": "Nutrients",
       "group": "Nutrients",
       "formulas": [
-        {"code": "NUT_NO3_avg", "label": "NO3", "units": "ug/L", "formula": "NUT_NOx_avg - NUT_NO2_avg", "description": "calcMinus per replicate: NOx minus NO2 at the same letter",
-         "ordinal": 1, "output_parameter_code": "NUT_NO3_avg", "sources": [["NUT_NO2_avg", "NUT_NO2_avg"], ["NUT_NOx_avg", "NUT_NOx_avg"]], "site_sources": [], "curve_slot": null, "per_replicate": "NUT_NOx_avg", "intermediate": false}
+        {"code": "NUT_NO3", "label": "NO3", "units": "ug/L", "formula": "NUT_NOx - NUT_NO2", "description": "calcMinus per replicate: NOx minus NO2 at the same letter",
+         "ordinal": 1, "output_parameter_code": "NUT_NO3", "sources": [["NUT_NO2", "NUT_NO2"], ["NUT_NOx", "NUT_NOx"]], "site_sources": [], "curve_slot": null, "per_replicate": "NUT_NOx", "intermediate": false}
       ],
       "cases": [
-        {"name": "VAD 2022-04-27 (row 33)", "replicates": {"NUT_NOx_avg": [554.995, 598.058], "NUT_NO2_avg": [2.74, 0.9]}, "expected": {"NUT_NO3_avg": [552.255, 597.158]}, "tolerance": 1e-9}
+        {"name": "VAD 2022-04-27 (row 33)", "replicates": {"NUT_NOx": [554.995, 598.058], "NUT_NO2": [2.74, 0.9]}, "expected": {"NUT_NO3": [552.255, 597.158]}, "tolerance": 1e-9}
       ]
     },
     {
@@ -134,26 +134,26 @@
          "ordinal": 1, "output_parameter_code": null, "sources": [["lab_co2_lab_temp", "lab_co2_lab_temp"]], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": true},
         {"code": "lab_pa", "label": "Lab pressure", "units": "atm", "formula": "coalesce(lab_co2_lab_press / 1013.25, lab_press_avg_atm)", "description": "calcCO2, labPa default: the visit's lab pressure in hPa converted to atm, the constant when the visit holds none",
          "ordinal": 2, "output_parameter_code": null, "sources": [["lab_co2_lab_press", "lab_co2_lab_press"]], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": true},
-        {"code": "CO2_HS_Um_avg", "label": "CO2 headspace", "units": "uM", "formula": "lab_co2_co2ppm * lab_pa * (vol_sa + 0.034 * exp(c_const * (1 / lab_temp_k - 1 / 298.15)) * vol_water * gas_const_r_atm * lab_temp_k) / (gas_const_r_atm * vol_water * lab_temp_k)", "description": "calcCO2 per replicate letter",
-         "ordinal": 3, "output_parameter_code": "CO2_HS_Um_avg", "sources": [["lab_co2_co2ppm", "lab_co2_co2ppm"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_co2_co2ppm", "intermediate": false},
+        {"code": "CO2_HS_Um", "label": "CO2 headspace", "units": "uM", "formula": "lab_co2_co2ppm * lab_pa * (vol_sa + 0.034 * exp(c_const * (1 / lab_temp_k - 1 / 298.15)) * vol_water * gas_const_r_atm * lab_temp_k) / (gas_const_r_atm * vol_water * lab_temp_k)", "description": "calcCO2 per replicate letter",
+         "ordinal": 3, "output_parameter_code": "CO2_HS_Um", "sources": [["lab_co2_co2ppm", "lab_co2_co2ppm"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_co2_co2ppm", "intermediate": false},
         {"code": "water_k", "label": "Water temperature", "units": "K", "formula": "WTW_Temp_degC_1 + 273.15", "description": "calcpCO2",
          "ordinal": 4, "output_parameter_code": null, "sources": [["WTW_Temp_degC_1", "WTW_Temp_degC_1"]], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": true},
         {"code": "kh", "label": "Henry term", "units": "", "formula": "0.034 * exp(c_const * (1 / water_k - 1 / 298.15))", "description": "calcpCO2 divisor",
          "ordinal": 5, "output_parameter_code": null, "sources": [], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": true},
-        {"code": "pCO2_HS_uatm_avg", "label": "pCO2 headspace", "units": "uatm", "formula": "CO2_HS_Um_avg / kh", "description": "calcpCO2 per replicate letter",
-         "ordinal": 6, "output_parameter_code": "pCO2_HS_uatm_avg", "sources": [["CO2_HS_Um_avg", "CO2_HS_Um_avg"]], "site_sources": [], "curve_slot": null, "per_replicate": "CO2_HS_Um_avg", "intermediate": false},
+        {"code": "pCO2_HS_uatm", "label": "pCO2 headspace", "units": "uatm", "formula": "CO2_HS_Um / kh", "description": "calcpCO2 per replicate letter",
+         "ordinal": 6, "output_parameter_code": "pCO2_HS_uatm", "sources": [["CO2_HS_Um", "CO2_HS_Um"]], "site_sources": [], "curve_slot": null, "per_replicate": "CO2_HS_Um", "intermediate": false},
         {"code": "bp", "label": "Pressure used", "units": "hPa", "formula": "if(and(ge(Field_BP, 700), le(Field_BP, 1050)), Field_BP, Field_BP_altitude)", "description": "calcpCO2P1, calcpCO2P2 and calcCH4: the field pressure when present and within 700 to 1050 hPa, else the pressure from altitude",
          "ordinal": 7, "output_parameter_code": null, "sources": [["Field_BP", "Field_BP"], ["Field_BP_altitude", "Field_BP_altitude"]], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": true},
-        {"code": "pCO2_HS_P1_uatm_avg", "label": "pCO2 headspace P1", "units": "uatm", "formula": "CO2_HS_Um_avg * bp / (kh * 1013.25)", "description": "calcpCO2P1 per replicate letter",
-         "ordinal": 8, "output_parameter_code": "pCO2_HS_P1_uatm_avg", "sources": [["CO2_HS_Um_avg", "CO2_HS_Um_avg"]], "site_sources": [], "curve_slot": null, "per_replicate": "CO2_HS_Um_avg", "intermediate": false},
-        {"code": "pCO2_HS_P2_uatm_avg", "label": "pCO2 headspace P2", "units": "uatm", "formula": "CO2_HS_Um_avg * 1013.25 / (kh * bp)", "description": "calcpCO2P2 per replicate letter",
-         "ordinal": 9, "output_parameter_code": "pCO2_HS_P2_uatm_avg", "sources": [["CO2_HS_Um_avg", "CO2_HS_Um_avg"]], "site_sources": [], "curve_slot": null, "per_replicate": "CO2_HS_Um_avg", "intermediate": false},
+        {"code": "pCO2_HS_P1_uatm", "label": "pCO2 headspace P1", "units": "uatm", "formula": "CO2_HS_Um * bp / (kh * 1013.25)", "description": "calcpCO2P1 per replicate letter",
+         "ordinal": 8, "output_parameter_code": "pCO2_HS_P1_uatm", "sources": [["CO2_HS_Um", "CO2_HS_Um"]], "site_sources": [], "curve_slot": null, "per_replicate": "CO2_HS_Um", "intermediate": false},
+        {"code": "pCO2_HS_P2_uatm", "label": "pCO2 headspace P2", "units": "uatm", "formula": "CO2_HS_Um * 1013.25 / (kh * bp)", "description": "calcpCO2P2 per replicate letter",
+         "ordinal": 9, "output_parameter_code": "pCO2_HS_P2_uatm", "sources": [["CO2_HS_Um", "CO2_HS_Um"]], "site_sources": [], "curve_slot": null, "per_replicate": "CO2_HS_Um", "intermediate": false},
         {"code": "lab_co2_ch4_dry", "label": "CH4 dry", "units": "ppm", "formula": "(lab_co2_h2o * 1.2347 - 0.0016) * lab_co2_ch4 / 100 + lab_co2_ch4", "description": "calcCH4dry per replicate letter",
          "ordinal": 10, "output_parameter_code": "lab_co2_ch4_dry", "sources": [["lab_co2_ch4", "lab_co2_ch4"], ["lab_co2_h2o", "lab_co2_h2o"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_co2_h2o", "intermediate": false},
         {"code": "h_ch4_t", "label": "Henry constant for CH4 at lab temperature", "units": "", "formula": "h_ch4_29815k * exp(1750 * (1 / lab_temp_k - 1 / 298.15))", "description": "calcCH4 h_ch4_t_eq",
          "ordinal": 11, "output_parameter_code": null, "sources": [], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": true},
-        {"code": "CH4_umol_L_avg", "label": "CH4", "units": "umol/L", "formula": "(lab_co2_ch4_dry * (0.957237 * 1013.25) * 101.325 * water_k - bp * (ch4_in_sa * lab_temp_k * 10^3)) * (h_ch4_t * gas_const_r_mol * 10 * water_k + bp) / (lab_temp_k * bp * gas_const_r_mol * water_k)", "description": "calcCH4 per replicate letter, verbatim: the lab pressure in A is the literal 0.957237 atm the function carries, not the visit's lab_co2_lab_press (Q148)",
-         "ordinal": 12, "output_parameter_code": "CH4_umol_L_avg", "sources": [["lab_co2_ch4_dry", "lab_co2_ch4_dry"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_co2_ch4_dry", "intermediate": false}
+        {"code": "CH4_umol_L", "label": "CH4", "units": "umol/L", "formula": "(lab_co2_ch4_dry * (0.957237 * 1013.25) * 101.325 * water_k - bp * (ch4_in_sa * lab_temp_k * 10^3)) * (h_ch4_t * gas_const_r_mol * 10 * water_k + bp) / (lab_temp_k * bp * gas_const_r_mol * water_k)", "description": "calcCH4 per replicate letter, verbatim: the lab pressure in A is the literal 0.957237 atm the function carries, not the visit's lab_co2_lab_press (Q148)",
+         "ordinal": 12, "output_parameter_code": "CH4_umol_L", "sources": [["lab_co2_ch4_dry", "lab_co2_ch4_dry"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_co2_ch4_dry", "intermediate": false}
       ],
       "cases": [
         {
@@ -161,19 +161,19 @@
           "inputs": {"WTW_Temp_degC_1": 8.7, "Field_BP": 863, "Field_BP_altitude": 801, "lab_co2_lab_temp": 22.8, "lab_co2_lab_press": 972},
           "replicates": {"lab_co2_co2ppm": [242.5, 241.7], "lab_co2_h2o": [1.811, 1.539], "lab_co2_ch4": [0.132, 0.176]},
           "expected": {
-            "CO2_HS_Um_avg": [17.9762, 17.9169],
-            "pCO2_HS_uatm_avg": [331.927, 330.832],
-            "pCO2_HS_P1_uatm_avg": [282.707, 281.774],
-            "pCO2_HS_P2_uatm_avg": [389.716, 388.43],
+            "CO2_HS_Um": [17.9762, 17.9169],
+            "pCO2_HS_uatm": [331.927, 330.832],
+            "pCO2_HS_P1_uatm": [282.707, 281.774],
+            "pCO2_HS_P2_uatm": [389.716, 388.43],
             "lab_co2_ch4_dry": [0.134949, 0.179342],
-            "CH4_umol_L_avg": [5.71465, 7.59476]
+            "CH4_umol_L": [5.71465, 7.59476]
           }
         },
         {
           "name": "VAD 2022-09-22 (row 38), no lab temperature and no lab pressure recorded, so both fall back to the constant",
           "inputs": {"WTW_Temp_degC_1": 5.3, "Field_BP": 808, "Field_BP_altitude": 799},
           "replicates": {"lab_co2_co2ppm": [346, 352], "lab_co2_h2o": [1.308, 1.647], "lab_co2_ch4": [0.189, 0.18]},
-          "expected": {"CO2_HS_Um_avg": [25.7062, 26.152], "pCO2_HS_uatm_avg": [427.787, 435.206], "pCO2_HS_P1_uatm_avg": [341.132, 347.048], "pCO2_HS_P2_uatm_avg": [536.455, 545.758], "lab_co2_ch4_dry": [0.192049, 0.183658]}
+          "expected": {"CO2_HS_Um": [25.7062, 26.152], "pCO2_HS_uatm": [427.787, 435.206], "pCO2_HS_P1_uatm": [341.132, 347.048], "pCO2_HS_P2_uatm": [536.455, 545.758], "lab_co2_ch4_dry": [0.192049, 0.183658]}
         }
       ]
     },
@@ -190,10 +190,10 @@
          "ordinal": 3, "output_parameter_code": null, "sources": [["lab_dic_vol_overpressure", "lab_dic_vol_overpressure"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_dic_vol_overpressure", "intermediate": true},
         {"code": "henry_t", "label": "Henry term at lab temperature", "units": "", "formula": "h_co2_29815k * exp(2392.86 * (1 / dic_lab_temp_k - 1 / 298.15))", "description": "calcDIC h_co2_29815k * exponent",
          "ordinal": 4, "output_parameter_code": null, "sources": [], "site_sources": [], "curve_slot": null, "per_replicate": null, "intermediate": true},
-        {"code": "DIC_avg", "label": "DIC", "units": "mM", "formula": "lab_dic_co2_dry * (lab_dic_SA_added + hs_v) * (henry_t * sample_v * gas_const_r_mol * dic_lab_temp_k + 101.325 * hs_v) / (10^3 * gas_const_r_mol * dic_lab_temp_k * hs_v * sample_v)", "description": "calcDIC per replicate letter",
-         "ordinal": 5, "output_parameter_code": "DIC_avg", "sources": [["lab_dic_SA_added", "lab_dic_SA_added"], ["lab_dic_co2_dry", "lab_dic_co2_dry"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_dic_co2_dry", "intermediate": false},
-        {"code": "d13C_DIC_avg", "label": "d13C-DIC", "units": "permil", "formula": "(lab_dic_delta_13co2 * 101.325 * hs_v + (dic_lab_temp_k * (lab_dic_delta_13co2 + 0.19) - 373) * henry_t * sample_v * gas_const_r_mol) / (101.325 * hs_v + henry_t * sample_v * gas_const_r_mol * dic_lab_temp_k)", "description": "calcd13DIC per replicate letter",
-         "ordinal": 6, "output_parameter_code": "d13C_DIC_avg", "sources": [["lab_dic_delta_13co2", "lab_dic_delta_13co2"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_dic_delta_13co2", "intermediate": false}
+        {"code": "DIC", "label": "DIC", "units": "mM", "formula": "lab_dic_co2_dry * (lab_dic_SA_added + hs_v) * (henry_t * sample_v * gas_const_r_mol * dic_lab_temp_k + 101.325 * hs_v) / (10^3 * gas_const_r_mol * dic_lab_temp_k * hs_v * sample_v)", "description": "calcDIC per replicate letter",
+         "ordinal": 5, "output_parameter_code": "DIC", "sources": [["lab_dic_SA_added", "lab_dic_SA_added"], ["lab_dic_co2_dry", "lab_dic_co2_dry"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_dic_co2_dry", "intermediate": false},
+        {"code": "d13C_DIC", "label": "d13C-DIC", "units": "permil", "formula": "(lab_dic_delta_13co2 * 101.325 * hs_v + (dic_lab_temp_k * (lab_dic_delta_13co2 + 0.19) - 373) * henry_t * sample_v * gas_const_r_mol) / (101.325 * hs_v + henry_t * sample_v * gas_const_r_mol * dic_lab_temp_k)", "description": "calcd13DIC per replicate letter",
+         "ordinal": 6, "output_parameter_code": "d13C_DIC", "sources": [["lab_dic_delta_13co2", "lab_dic_delta_13co2"]], "site_sources": [], "curve_slot": null, "per_replicate": "lab_dic_delta_13co2", "intermediate": false}
       ],
       "cases": [
         {
@@ -203,13 +203,13 @@
             "lab_dic_acid_wght": [13.57, 13.29], "lab_dic_acid_sample_wght": [16.05, 16.14], "lab_dic_vol_overpressure": [3, 4],
             "lab_dic_SA_added": [46, 45], "lab_dic_co2_dry": [559.4, 785.5], "lab_dic_delta_13co2": [-4.987, -5.416]
           },
-          "expected": {"DIC_avg": [0.644071, 0.793345], "d13C_DIC_avg": [-5.1537, -5.59569]}
+          "expected": {"DIC": [0.644071, 0.793345], "d13C_DIC": [-5.1537, -5.59569]}
         },
         {
           "name": "VAD 2021-08-11 (row 30), no lab air temperature recorded, so the constant stands in",
           "inputs": {},
           "replicates": {"lab_dic_acid_wght": [13.54, 13.33], "lab_dic_acid_sample_wght": [16.6, 16.19], "lab_dic_vol_overpressure": [3, 3], "lab_dic_SA_added": [46, 46], "lab_dic_co2_dry": [665, 562], "lab_dic_delta_13co2": [-5.847, -5.768]},
-          "expected": {"DIC_avg": [0.638854, 0.570772], "d13C_DIC_avg": [-6.05, -5.95747]}
+          "expected": {"DIC": [0.638854, 0.570772], "d13C_DIC": [-6.05, -5.95747]}
         }
       ]
     }

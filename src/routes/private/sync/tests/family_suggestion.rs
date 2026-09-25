@@ -61,3 +61,32 @@ fn two_stations_are_not_one_because_a_digit_differs() {
     // A name with nothing to canonicalise cannot collide with everything else that has none.
     assert_eq!(super::near_duplicate_of("---", ["***"]), None);
 }
+
+#[test]
+fn test_family_suggestion_keeps_every_replicated_code_of_the_cnet_sets() {
+    // A per-replicate output lands as replicate readings on its own code, and the sync pairs the
+    // portal's family under the suggestion, so both must name one catalog parameter.
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../tests/fixtures/cnet_formula_sets.json"
+    ))
+    .expect("the fixture parses");
+    for calculation in fixture["calculations"].as_array().expect("calculations") {
+        for formula in calculation["formulas"].as_array().expect("formulas") {
+            let Some(read) = formula["per_replicate"].as_str() else {
+                continue;
+            };
+            let code = formula["output_parameter_code"]
+                .as_str()
+                .or(formula["code"].as_str())
+                .expect("a code");
+            for replicated in [code, read] {
+                assert_eq!(
+                    family_parameter_suggestion(replicated),
+                    replicated,
+                    "{}: the sync pairs {replicated} elsewhere",
+                    calculation["name"]
+                );
+            }
+        }
+    }
+}

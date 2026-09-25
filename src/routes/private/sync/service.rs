@@ -5362,7 +5362,7 @@ pub(super) async fn resolve_plan_entry<C: ConnectionTrait>(
             txn,
             parameter_id,
             group,
-            entry.parameter.calculation.as_ref(),
+            entry,
             &mut caches.groups,
             &mut counters.groups_created,
             &mut counters.group_members_created,
@@ -5386,12 +5386,13 @@ pub(super) async fn resolve_plan_entry<C: ConnectionTrait>(
 /// A parameter belongs to at most one group (`parameter_group_members.parameter_id` is UNIQUE), so
 /// a parameter someone has already placed keeps the placement it has: the apply fills a gap, it
 /// does not move what an operator decided. The group's own ordinal is its first member's, which is
-/// the order the registry lists the categories in.
+/// the order the registry lists the categories in. A replicate family's member is declared
+/// replicated, so a calculation of the group reads its replicates rather than their mean.
 pub(super) async fn place_in_group<C: ConnectionTrait>(
     txn: &C,
     parameter_id: Uuid,
     group: &PlanGroupRef,
-    calculation: Option<&PlanCalculationRef>,
+    entry: &PlanEntry,
     cache: &mut HashMap<String, Uuid>,
     groups_created: &mut u32,
     members_created: &mut u32,
@@ -5437,7 +5438,10 @@ pub(super) async fn place_in_group<C: ConnectionTrait>(
             resolved
         }
     };
-    let source_calculation = calculation
+    let source_calculation = entry
+        .parameter
+        .calculation
+        .as_ref()
         .map(serde_json::to_value)
         .transpose()
         .map_err(|e| AppError::Internal(format!("source calculation is not serialisable: {e}")))?;
@@ -5447,6 +5451,7 @@ pub(super) async fn place_in_group<C: ConnectionTrait>(
         parameter_id: Set(parameter_id),
         ordinal: Set(group.ordinal),
         description: Set(group.description.clone()),
+        replicates: Set(entry.replicates.is_some().then(|| serde_json::json!({}))),
         source_calculation: Set(source_calculation),
         ..Default::default()
     })
