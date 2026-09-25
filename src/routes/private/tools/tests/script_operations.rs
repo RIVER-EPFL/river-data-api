@@ -193,7 +193,9 @@ fn test_decommissioned_name_frees_the_name_and_counts_on_when_taken() {
     );
 }
 
-use super::{FormulaWrite, codes_held_elsewhere, plan_formula_set, steps_taken_back};
+use super::{
+    FormulaWrite, codes_held_elsewhere, in_reading_order, plan_formula_set, steps_taken_back,
+};
 
 fn id(n: u128) -> uuid::Uuid {
     uuid::Uuid::from_u128(n)
@@ -424,4 +426,46 @@ fn test_reads_of_former_names_a_reader_of_a_formula_the_set_dropped() {
 fn test_reads_of_former_is_empty_when_nothing_was_dropped() {
     let readers = [("pCO2", "CO2_HS_Um / kh", None)];
     assert!(reads_of_former(&readers, &[]).is_empty());
+}
+
+#[test]
+fn test_in_reading_order_writes_a_step_before_the_formula_that_reads_it() {
+    let readers = [("out", "x_step + 1", None), ("x_step", "2", None)];
+    let writes = plan_formula_set(&[], &[fresh("out"), fresh("x_step")]).expect("planned");
+    assert_eq!(
+        in_reading_order(writes, &readers),
+        vec![FormulaWrite::Create(1), FormulaWrite::Create(0)]
+    );
+}
+
+#[test]
+fn test_in_reading_order_counts_per_replicate_as_a_read_and_keeps_deletes_first() {
+    let stored = [row(1, "gone"), row(2, "out")];
+    let readers = [
+        ("out", "lab_ch4 * 2", Some("lab_ch4")),
+        ("lab_ch4", "raw", None),
+    ];
+    let writes = plan_formula_set(&stored, &[kept(2, "out"), fresh("lab_ch4")]).expect("planned");
+    assert_eq!(
+        in_reading_order(writes, &readers),
+        vec![
+            FormulaWrite::Delete(id(1)),
+            FormulaWrite::Create(1),
+            FormulaWrite::Update(id(2), 0),
+        ]
+    );
+}
+
+#[test]
+fn test_in_reading_order_keeps_payload_order_for_a_cycle() {
+    let readers = [("a", "b + 1", None), ("b", "a + 1", None), ("c", "1", None)];
+    let writes = plan_formula_set(&[], &[fresh("a"), fresh("b"), fresh("c")]).expect("planned");
+    assert_eq!(
+        in_reading_order(writes, &readers),
+        vec![
+            FormulaWrite::Create(2),
+            FormulaWrite::Create(0),
+            FormulaWrite::Create(1),
+        ]
+    );
 }

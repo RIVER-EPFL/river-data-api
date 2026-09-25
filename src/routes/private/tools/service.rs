@@ -3026,11 +3026,12 @@ pub async fn replicated_for<C: ConnectionTrait>(db: &C) -> AppResult<Vec<String>
 /// store, so declaring it would make a first run refuse for want of a reading nothing has written
 /// yet.
 ///
-/// `replicated` names the catalog codes the calculation's parameter group holds several values of
-/// per visit. A source of one of those, read by a formula that walks the replicates, is the family
-/// rather than a number: the portal's own sets read a second family at the same letter, and the
-/// engine binds every family at each index. A family only ever read by a scalar formula stays a
-/// number and resolves to the group's served value, which is its mean (Q155).
+/// Every source a per-replicate formula reads is a family: the engine binds every family at each
+/// index, and whether the visit holds a list or one value is its data, bound as one value when it
+/// holds one. `replicated` names the catalog codes the calculation's parameter group holds several
+/// values of per visit; a source read through a reducer is the family only when it is one of
+/// those. A source only ever read by a scalar formula stays a number and resolves to the group's
+/// served value, which is its mean (Q155).
 pub fn manifest_json(
     label: &str,
     description: Option<&str>,
@@ -3071,8 +3072,8 @@ pub fn manifest_json(
             }
             seen.push(variable.clone());
             if driven.contains(variable)
-                || ((walked.contains(&variable) || reduced.contains(variable))
-                    && is_replicated(parameter_code))
+                || walked.contains(&variable)
+                || (reduced.contains(variable) && is_replicated(parameter_code))
             {
                 // A variable a formula evaluates over is the family, not one number: the body
                 // carries the whole list, and the param names the parameter those readings are
@@ -3310,8 +3311,9 @@ struct SetState {
 }
 
 /// The value a variable holds at one cell: the family's value at this index where the visit
-/// entered a family, the scalar otherwise. A repeat that was not measured is absent, which skips
-/// the formulas reading it rather than falling back to the group's summary.
+/// entered a family, the scalar otherwise. A family of one is the one value the visit holds and
+/// reads the same at every index. A repeat that was not measured is absent, which skips the
+/// formulas reading it rather than falling back to the group's summary.
 fn entered(
     variable: &str,
     index: usize,
@@ -3319,6 +3321,7 @@ fn entered(
     replicates: &HashMap<String, Vec<Option<f64>>>,
 ) -> Option<f64> {
     match replicates.get(variable) {
+        Some(values) if values.len() == 1 => values[0],
         Some(values) => values.get(index).copied().flatten(),
         None => inputs.get(variable).copied(),
     }
@@ -5245,6 +5248,51 @@ pub fn plan_formula_set(
         }
     }));
     Ok(writes)
+}
+
+/// The writes of a set save with each formula after the formulas of the set it reads, given as
+/// `(code, formula, per_replicate)` per payload position, so the names a write resolves are
+/// already stored. Deletes stay first; formulas in a cycle keep their payload order.
+#[must_use]
+pub fn in_reading_order(
+    writes: Vec<FormulaWrite>,
+    readers: &[(&str, &str, Option<&str>)],
+) -> Vec<FormulaWrite> {
+    let reads: Vec<Vec<usize>> = readers
+        .iter()
+        .enumerate()
+        .map(|(i, (_, formula, per_replicate))| {
+            let names: Vec<String> = free_identifiers(formula)
+                .into_iter()
+                .chain(per_replicate.map(str::to_string))
+                .collect();
+            (0..readers.len())
+                .filter(|&j| j != i && names.iter().any(|n| n == readers[j].0))
+                .collect()
+        })
+        .collect();
+    let mut order: Vec<usize> = Vec::with_capacity(readers.len());
+    while order.len() < readers.len() {
+        let ready = (0..readers.len())
+            .find(|i| !order.contains(i) && reads[*i].iter().all(|j| order.contains(j)));
+        match ready {
+            Some(i) => order.push(i),
+            None => order.extend(
+                (0..readers.len())
+                    .filter(|i| !order.contains(i))
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+    let rank = |write: &FormulaWrite| match write {
+        FormulaWrite::Delete(_) => (0, 0),
+        FormulaWrite::Create(i) | FormulaWrite::Update(_, i) => {
+            (1, order.iter().position(|o| o == i).unwrap_or(*i))
+        }
+    };
+    let mut writes = writes;
+    writes.sort_by_key(rank);
+    writes
 }
 
 /// The shared steps a set save takes back as its own: each formula the payload names by id that

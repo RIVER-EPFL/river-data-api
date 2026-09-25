@@ -187,19 +187,21 @@ fn test_two_steps_reading_each_other_are_a_cycle() {
 /// Scenario: nutrients, `NUT_NO3_avg = NUT_NOx_avg - NUT_NO2_avg`, walked at the same letter.
 /// Expected behaviour: the group's declaration is what makes the second source the family. Without
 /// it the source is a number, which resolves to the mean and averages the family away.
+/// Scenario: pCO2's dry CH4 step names `lab_co2_ch4` as its replicate list and also reads
+/// `lab_co2_h2o`, which no parameter group declares replicated.
+///
+/// Expected behaviour: both are families, so the visit's vials bind at each index; whether one
+/// holds a list is the visit's data, not a declaration.
 #[test]
-fn test_a_second_family_is_the_family_only_where_the_group_declares_it() {
-    let nutrients = vec![per_replicate(
-        "NUT_NO3_avg",
+fn test_every_source_a_per_replicate_formula_reads_is_a_family() {
+    let dry = per_replicate(
+        "lab_co2_ch4_dry",
         0,
-        "NUT_NOx_avg - NUT_NO2_avg",
-        Some("NUT_NO3_avg"),
-        &[
-            ("NUT_NOx_avg", "NUT_NOx_avg"),
-            ("NUT_NO2_avg", "NUT_NO2_avg"),
-        ],
-        "NUT_NOx_avg",
-    )];
+        "(lab_co2_h2o * 1.2347 - 0.0016) * lab_co2_ch4 / 100 + lab_co2_ch4",
+        None,
+        &[("lab_co2_h2o", "lab_co2_h2o"), ("lab_co2_ch4", "lab_co2_ch4")],
+        "lab_co2_ch4",
+    );
     let kind_of = |manifest: &serde_json::Value, name: &str| {
         manifest["params"]
             .as_array()
@@ -212,23 +214,13 @@ fn test_a_second_family_is_the_family_only_where_the_group_declares_it() {
             .to_string()
     };
 
-    let declared = manifest_json(
-        "Nutrients",
-        None,
-        &nutrients,
-        &["NUT_NOx_avg".to_string(), "NUT_NO2_avg".to_string()],
-    )
-    .expect("the set has an order");
-    assert_eq!(kind_of(&declared, "NUT_NOx_avg"), "replicates");
-    assert_eq!(kind_of(&declared, "NUT_NO2_avg"), "replicates");
+    let manifest = manifest_json("pCO2", None, &[dry], &[]).expect("the set has an order");
+    assert_eq!(kind_of(&manifest, "lab_co2_ch4"), "replicates");
+    assert_eq!(kind_of(&manifest, "lab_co2_h2o"), "replicates");
     assert!(
-        declared["event_inputs"].as_array().unwrap().is_empty(),
-        "a family is not an event input as well: {declared:?}"
+        manifest["event_inputs"].as_array().unwrap().is_empty(),
+        "a family is not an event input as well: {manifest:?}"
     );
-
-    let undeclared = manifest_json("Nutrients", None, &nutrients, &["NUT_NOx_avg".to_string()])
-        .expect("the set has an order");
-    assert_eq!(kind_of(&undeclared, "NUT_NO2_avg"), "number");
 }
 
 #[test]
@@ -1620,4 +1612,37 @@ fn test_received_steps_takes_a_step_once_by_two_paths() {
 fn test_received_steps_with_nothing_declared_is_empty() {
     let steps = shared(&[("a", "Dissolved_O2")]);
     assert!(received_steps(&[], &steps).is_empty());
+}
+
+/// Scenario: the dry CH4 step walks two vials of `lab_co2_ch4` while the visit holds one value of
+/// `lab_co2_h2o`.
+/// Expected behaviour: the one value is read at both indexes, and a second vial of `lab_co2_h2o`
+/// would be read at its own index.
+#[test]
+fn test_a_family_of_one_reads_the_same_at_every_index() {
+    let dry = vec![per_replicate(
+        "ch4_dry",
+        0,
+        "lab_co2_h2o + lab_co2_ch4",
+        Some("ch4_dry"),
+        &[("lab_co2_h2o", "lab_co2_h2o"), ("lab_co2_ch4", "lab_co2_ch4")],
+        "lab_co2_ch4",
+    )];
+    let values = |families: &HashMap<String, Vec<Option<f64>>>| {
+        let (_, cells) = evaluate_cells(&dry, &inputs(&[]), families, &constants(&[]), &curves(&[]))
+            .expect("the set evaluates");
+        cells[0].iter().map(|c| c.value).collect::<Vec<_>>()
+    };
+
+    let one = replicates(&[
+        ("lab_co2_ch4", &[Some(6.0), Some(8.0)]),
+        ("lab_co2_h2o", &[Some(1.5)]),
+    ]);
+    assert_eq!(values(&one), vec![Some(7.5), Some(9.5)]);
+
+    let two = replicates(&[
+        ("lab_co2_ch4", &[Some(6.0), Some(8.0)]),
+        ("lab_co2_h2o", &[Some(1.5), Some(2.5)]),
+    ]);
+    assert_eq!(values(&two), vec![Some(7.5), Some(10.5)]);
 }

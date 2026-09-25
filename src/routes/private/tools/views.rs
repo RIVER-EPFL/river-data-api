@@ -33,7 +33,7 @@ use super::service::{
     calculations_fed_by_subject, canonical_hash, carry_renames, check_engine,
     check_manifest_against_catalog, check_manifest_codes_resolve, closure_subject,
     codes_held_elsewhere, coverage_for, decommission_reason, find_active_tool, find_run_in_scope,
-    formula_codes_held_elsewhere, insert_version, lint_script, list_active_tools,
+    formula_codes_held_elsewhere, in_reading_order, insert_version, lint_script, list_active_tools,
     load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
     mint_formula_version, normalise_name, normalised_json, plan_formula_set, reads_of_former,
     renames_of, render, replicated_for, require_context_in_scope, run_stored_cases, run_tool_body,
@@ -1191,7 +1191,21 @@ pub async fn save_formula_set(
         .iter()
         .map(|f| (f.id, f.code.clone()))
         .collect();
-    let writes = plan_formula_set(&stored, &named).map_err(AppError::BadRequest)?;
+    let readers: Vec<(&str, &str, Option<&str>)> = payload
+        .formulas
+        .iter()
+        .map(|f| {
+            (
+                f.code.as_str(),
+                f.formula.as_str(),
+                f.per_replicate.as_deref(),
+            )
+        })
+        .collect();
+    let writes = in_reading_order(
+        plan_formula_set(&stored, &named).map_err(AppError::BadRequest)?,
+        &readers,
+    );
     let takeovers =
         super::service::plan_takeovers(&txn, id, &payload.formulas, &payload.take_over).await?;
     super::service::release_taken_over(&txn, &takeovers).await?;
