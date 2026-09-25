@@ -259,6 +259,17 @@ fn a_declaration_fills_the_defaults_its_layout_implies() {
 }
 
 #[test]
+fn a_stored_row_labels_key_still_loads_and_is_not_served() {
+    let manifest = grid(serde_json::json!({
+        "row_labels": "letters",
+        "fields": [{ "name": "vol_ml", "label": "Vol" }]
+    }))
+    .unwrap();
+    let served = serde_json::to_value(manifest.params[0].structure.as_ref().unwrap()).unwrap();
+    assert!(served.get("row_labels").is_none(), "{served}");
+}
+
+#[test]
 fn a_declaration_that_contradicts_its_param_is_refused() {
     for (param, expected) in [
         (

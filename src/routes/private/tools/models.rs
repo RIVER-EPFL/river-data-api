@@ -415,15 +415,6 @@ pub enum StructLayout {
     Lists,
 }
 
-/// How the rows of a `rows` layout are labelled in the entry form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RowLabels {
-    #[default]
-    Letters,
-    Numbers,
-}
-
 /// A field whose value is the difference of two other fields of the same row.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -477,7 +468,6 @@ pub struct ManifestStructure {
     pub rows: u32,
     #[schema(required)]
     pub max_rows: Option<u32>,
-    pub row_labels: RowLabels,
     /// `lists` layout: values per field.
     pub values: u32,
     pub value_labels: Vec<String>,
@@ -496,8 +486,10 @@ pub(super) struct ManifestStructureRaw {
     rows: Option<u32>,
     #[serde(default)]
     max_rows: Option<u32>,
-    #[serde(default)]
-    row_labels: Option<RowLabels>,
+    /// Accepted and ignored, so a stored manifest carrying it still loads: rows are headed by
+    /// their index.
+    #[serde(default, rename = "row_labels")]
+    _row_labels: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     values: Option<u32>,
     #[serde(default)]
@@ -591,9 +583,9 @@ impl ManifestStructure {
         }
 
         if layout != StructLayout::Rows
-            && (raw.rows.is_some() || raw.max_rows.is_some() || raw.row_labels.is_some())
+            && (raw.rows.is_some() || raw.max_rows.is_some())
         {
-            return Err("rows, max_rows and row_labels belong to a rows layout".to_string());
+            return Err("rows and max_rows belong to a rows layout".to_string());
         }
         if layout != StructLayout::Lists && (raw.values.is_some() || !raw.value_labels.is_empty()) {
             return Err("values and value_labels belong to a lists layout".to_string());
@@ -629,7 +621,6 @@ impl ManifestStructure {
             fields,
             rows,
             max_rows: raw.max_rows,
-            row_labels: raw.row_labels.unwrap_or_default(),
             values,
             value_labels: raw.value_labels,
             additional_fields: raw.additional_fields,

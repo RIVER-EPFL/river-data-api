@@ -10739,9 +10739,6 @@
               "null"
             ]
           },
-          "row_labels": {
-            "$ref": "#/components/schemas/RowLabels"
-          },
           "rows": {
             "description": "`rows` layout: rows offered before anything is entered.",
             "format": "int32",
@@ -10766,7 +10763,6 @@
           "fields",
           "rows",
           "max_rows",
-          "row_labels",
           "values",
           "value_labels",
           "additional_fields"
@@ -19858,14 +19854,6 @@
           "message"
         ],
         "type": "object"
-      },
-      "RowLabels": {
-        "description": "How the rows of a `rows` layout are labelled in the entry form.",
-        "enum": [
-          "letters",
-          "numbers"
-        ],
-        "type": "string"
       },
       "RowProvenance": {
         "description": "What one row's record says, reduced to what the routing turns on.",

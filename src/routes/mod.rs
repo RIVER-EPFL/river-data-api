@@ -539,7 +539,6 @@ pub fn validate_optional_time_range(
             private::tools::models::ManifestField,
             private::tools::models::FieldFormula,
             private::tools::models::StructLayout,
-            private::tools::models::RowLabels,
             private::tools::models::ManifestOutput,
             private::tools::models::ManifestCurve,
             private::tools::models::ToolOutput,
