@@ -33,7 +33,7 @@ use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
 use crate::routes::private::sensor_calibrations::service::site_property_values;
 use crate::routes::private::site_parameters::models as site_parameters;
-use crate::routes::private::tools::models::{DraftFormula, MissingConstant};
+use crate::routes::private::tools::models::{DraftFormula, Unresolved};
 use crate::routes::private::tools::service::{
     constants_of, evaluate_cells, in_order, numbers_by_name, pin_draft_formulas, resolve_constants,
 };
@@ -336,7 +336,7 @@ pub async fn preview_derived(
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     let (constant_values, _) =
-        resolve_constants(db, &constants_of(&ordered), MissingConstant::Omit).await?;
+        resolve_constants(db, &constants_of(&ordered), Unresolved::Omit).await?;
     let constants = numbers_by_name(&constant_values);
 
     // Fetch readings for all resolved parameters within time range

@@ -582,9 +582,7 @@ impl ManifestStructure {
             });
         }
 
-        if layout != StructLayout::Rows
-            && (raw.rows.is_some() || raw.max_rows.is_some())
-        {
+        if layout != StructLayout::Rows && (raw.rows.is_some() || raw.max_rows.is_some()) {
             return Err("rows and max_rows belong to a rows layout".to_string());
         }
         if layout != StructLayout::Lists && (raw.values.is_some() || !raw.value_labels.is_empty()) {
@@ -1503,14 +1501,16 @@ pub struct ComputedCurve {
     pub intercept: f64,
 }
 
-/// What a declared constant the `constants` table does not hold means for the run that declares it.
+/// What a name the run cannot resolve means: a declared constant the `constants` table does not
+/// hold, or a site property with no site to read it from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissingConstant {
+pub enum Unresolved {
     /// A stored version cannot be saved declaring a name the table does not hold, so an absence at
-    /// call time is the catalog having lost a row.
+    /// call time is the catalog having lost a row; a stored run at no site cannot read the site.
     Refuse,
-    /// Editor content: the name is as likely half-typed as deleted, and refusing the run would
-    /// withhold both the numbers and the finding the author is writing against.
+    /// Editor content: the name is as likely half-typed as deleted, and a site is chosen only to
+    /// fill example values, so refusing the run would withhold both the numbers and the finding
+    /// the author is writing against.
     Omit,
 }
 
@@ -2401,6 +2401,41 @@ pub struct FormulaDraftRunResponse {
     pub failure: Option<DraftRunFailure>,
     /// The manifest the formula set implies: its params, outputs, constants, curve slots and the
     /// site and event inputs, in the shape `GET /tools` serves.
+    #[schema(value_type = Object)]
+    pub manifest: serde_json::Value,
+}
+
+/// The most visits one batched draft run reads.
+pub const MAX_DRAFT_RUNS: usize = 500;
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FormulaDraftRunsRequest {
+    pub formulas: Vec<DraftFormula>,
+    /// One calculate request body per run, each as `FormulaDraftRunRequest.inputs` takes it.
+    #[schema(value_type = Vec<std::collections::HashMap<String, serde_json::Value>>)]
+    pub inputs: Vec<serde_json::Value>,
+    /// Constant values in place of the catalog, for every run; omit to read the catalog.
+    #[serde(default)]
+    #[schema(value_type = Option<std::collections::HashMap<String, f64>>)]
+    pub constants: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// One run of a batched draft: its results, or why it ended.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FormulaDraftRun {
+    pub ran: bool,
+    #[serde(flatten)]
+    #[schema(required)]
+    pub run: Option<FormulaDraftRunResults>,
+    #[schema(required)]
+    pub failure: Option<DraftRunFailure>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FormulaDraftRunsResponse {
+    /// One per entry of the request's `inputs`, in its order.
+    pub runs: Vec<FormulaDraftRun>,
+    /// The manifest the formula set implies, as `FormulaDraftRunResponse.manifest`.
     #[schema(value_type = Object)]
     pub manifest: serde_json::Value,
 }

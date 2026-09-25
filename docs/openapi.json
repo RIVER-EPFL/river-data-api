@@ -7531,6 +7531,43 @@
         ],
         "type": "object"
       },
+      "FormulaDraftRun": {
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FormulaDraftRunResults"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "failure": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DraftRunFailure"
+                  }
+                ]
+              },
+              "ran": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ran",
+              "failure"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "One run of a batched draft: its results, or why it ended."
+      },
       "FormulaDraftRunRequest": {
         "description": "Run a formula calculation's unsaved formula set at a visit. The formulas replace the stored\nset for this run only; nothing is written.",
         "properties": {
@@ -7681,6 +7718,66 @@
           "site_inputs",
           "event_inputs",
           "trace"
+        ],
+        "type": "object"
+      },
+      "FormulaDraftRunsRequest": {
+        "properties": {
+          "constants": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "Constant values in place of the catalog, for every run; omit to read the catalog.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "formulas": {
+            "items": {
+              "$ref": "#/components/schemas/DraftFormula"
+            },
+            "type": "array"
+          },
+          "inputs": {
+            "description": "One calculate request body per run, each as `FormulaDraftRunRequest.inputs` takes it.",
+            "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "formulas",
+          "inputs"
+        ],
+        "type": "object"
+      },
+      "FormulaDraftRunsResponse": {
+        "properties": {
+          "manifest": {
+            "description": "The manifest the formula set implies, as `FormulaDraftRunResponse.manifest`.",
+            "type": "object"
+          },
+          "runs": {
+            "description": "One per entry of the request's `inputs`, in its order.",
+            "items": {
+              "$ref": "#/components/schemas/FormulaDraftRun"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs",
+          "manifest"
         ],
         "type": "object"
       },
@@ -52509,6 +52606,55 @@
           }
         },
         "summary": "Run an unsaved formula set at a visit, in place of the calculation's stored formulas.",
+        "tags": [
+          "tool_scripts"
+        ]
+      }
+    },
+    "/api/tool_scripts/{id}/formulas/draft_runs": {
+      "post": {
+        "operationId": "draft_run_formulas_batch",
+        "parameters": [
+          {
+            "description": "The formula calculation",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FormulaDraftRunsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormulaDraftRunsResponse"
+                }
+              }
+            },
+            "description": "One run per entry of inputs, and the manifest the set implies"
+          },
+          "400": {
+            "description": "A formula the set refuses, a calculation that is not formula-engined, or more runs than one request takes"
+          },
+          "404": {
+            "description": "No such calculation"
+          }
+        },
+        "summary": "Run an unsaved formula set at several visits in one request, as `formulas/draft_run` runs it\nat one. The set is resolved once; each entry of `inputs` is one run, answered in its order.\nNothing is stored.",
         "tags": [
           "tool_scripts"
         ]

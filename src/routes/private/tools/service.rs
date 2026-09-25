@@ -28,10 +28,10 @@ use super::models::{
     ActiveTool, CalculationHealth, CalculationImpact, CalculationRepair, CaseResult,
     CatalogFindings, ClosureQuery, ComputedCurve, Curve, CurveSnapshot, Engine, Evaluated,
     ImpactParameter, JanitorFill, LintFinding, Manifest, ManifestCurve, ManifestEventInput,
-    ManifestOutput, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck, ParseError,
-    PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
-    RunnerRuntime, ScannedName, ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent,
-    Subject, ToolScriptOperations, TraceCell, TraceReduction, TraceStep, ValidateResponse,
+    ManifestOutput, ManifestSiteInput, ParamWhen, ParseCheck, ParseError, PinnedFormula, Produced,
+    ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome, RunnerRuntime, ScannedName,
+    ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent, Subject,
+    ToolScriptOperations, TraceCell, TraceReduction, TraceStep, Unresolved, ValidateResponse,
     kind_accepts, parse_manifest,
 };
 use super::staged::StagedVisit;
@@ -212,7 +212,7 @@ pub async fn check_manifest_against_catalog(
     db: &DatabaseConnection,
     manifest: &mut Manifest,
     mut raw: Option<&mut serde_json::Value>,
-    missing_constant: MissingConstant,
+    unresolved: Unresolved,
 ) -> AppResult<CatalogFindings> {
     let mut findings = CatalogFindings::default();
     let catalog = load_parameter_catalog(db, std::iter::once(&*manifest)).await?;
@@ -280,11 +280,11 @@ pub async fn check_manifest_against_catalog(
         missing_constants(db, &manifest.constants)
             .await?
             .into_iter()
-            .map(|name| match missing_constant {
-                MissingConstant::Refuse => {
+            .map(|name| match unresolved {
+                Unresolved::Refuse => {
                     format!("constant '{name}' is not in the constants table")
                 }
-                MissingConstant::Omit => format!(
+                Unresolved::Omit => format!(
                     "constant '{name}' is not in the constants table, so it did not reach the \
                      script; check the spelling or create the constant"
                 ),
@@ -1015,7 +1015,7 @@ pub(super) async fn resolve_curve(
 pub(crate) async fn resolve_constants(
     db: &DatabaseConnection,
     names: &[String],
-    missing: MissingConstant,
+    missing: Unresolved,
 ) -> AppResult<(
     serde_json::Map<String, serde_json::Value>,
     Vec<ConsumedInput>,
@@ -1044,7 +1044,7 @@ pub(crate) async fn resolve_constants(
         });
         out.insert(constant.name, serde_json::json!(constant.value));
     }
-    if missing == MissingConstant::Refuse {
+    if missing == Unresolved::Refuse {
         // A version cannot be saved declaring a constant that does not exist, so reaching here
         // means the row was deleted after the fact: the state of the catalog, not the request.
         for name in names {
@@ -1107,6 +1107,27 @@ pub async fn require_context_in_scope(
     crate::common::scope::require_sites_in_scope(db, scope, &[site_id]).await
 }
 
+/// Site properties the run reads with no site chosen to read them from. A stored run refuses a
+/// required one; editor content leaves each to await a value, as any input with none does.
+pub(super) fn without_site(
+    tool_name: &str,
+    pending: &[&ManifestSiteInput],
+    unresolved: Unresolved,
+) -> AppResult<()> {
+    if unresolved == Unresolved::Omit {
+        return Ok(());
+    }
+    let Some(required) = pending.iter().find(|s| s.required) else {
+        return Ok(());
+    };
+    Err(AppError::BadRequest(format!(
+        "tool '{tool_name}' reads site property '{}'; pass site_id so it can be resolved, or \
+         supply '{}' directly",
+        required.property,
+        required.target()
+    )))
+}
+
 /// Fill the params the manifest's `site_inputs` declare from the `sites` row, where the request
 /// did not carry them. Any column of the row is resolvable (D13); a required property the site
 /// does not hold refuses the run naming it.
@@ -1117,6 +1138,7 @@ pub async fn resolve_site_inputs(
     site_id: Option<Uuid>,
     body: &mut serde_json::Map<String, serde_json::Value>,
     consumed: &mut Vec<ConsumedInput>,
+    unresolved: Unresolved,
 ) -> AppResult<Vec<serde_json::Value>> {
     let pending: Vec<&ManifestSiteInput> = manifest
         .site_inputs
@@ -1127,14 +1149,7 @@ pub async fn resolve_site_inputs(
         return Ok(Vec::new());
     }
     let Some(site_id) = site_id else {
-        if let Some(required) = pending.iter().find(|s| s.required) {
-            return Err(AppError::BadRequest(format!(
-                "tool '{tool_name}' reads site property '{}'; pass site_id so it can be \
-                 resolved, or supply '{}' directly",
-                required.property,
-                required.target()
-            )));
-        }
+        without_site(tool_name, &pending, unresolved)?;
         return Ok(Vec::new());
     };
     let row = sites::Entity::find_by_id(site_id)
@@ -1596,7 +1611,7 @@ pub async fn run_active_tool(
     tool: &ActiveTool,
     body: &[u8],
 ) -> AppResult<RunOutcome> {
-    run_tool_body(state, tool, body, None, MissingConstant::Refuse).await
+    run_tool_body(state, tool, body, None, Unresolved::Refuse).await
 }
 
 /// The same path as [`run_active_tool`], with the option of taking constant values from the
@@ -1608,17 +1623,9 @@ pub async fn run_tool_body(
     tool: &ActiveTool,
     body: &[u8],
     constants_override: Option<&serde_json::Map<String, serde_json::Value>>,
-    missing_constant: MissingConstant,
+    unresolved: Unresolved,
 ) -> AppResult<RunOutcome> {
-    let resolved = resolve_run(
-        state,
-        tool,
-        body,
-        constants_override,
-        missing_constant,
-        None,
-    )
-    .await?;
+    let resolved = resolve_run(state, tool, body, constants_override, unresolved, None).await?;
     execute_resolved(state, tool, resolved).await
 }
 
@@ -1721,7 +1728,7 @@ pub async fn resolve_run(
     tool: &ActiveTool,
     body: &[u8],
     constants_override: Option<&serde_json::Map<String, serde_json::Value>>,
-    missing_constant: MissingConstant,
+    unresolved: Unresolved,
     staged: Option<&StagedVisit>,
 ) -> AppResult<ResolvedRun> {
     let body: serde_json::Value = serde_json::from_slice(body)
@@ -1750,6 +1757,7 @@ pub async fn resolve_run(
         site_id,
         &mut body,
         &mut consumed,
+        unresolved,
     )
     .await?;
     let visit = VisitContext {
@@ -1863,8 +1871,7 @@ pub async fn resolve_run(
             out
         }
         None => {
-            let (out, read) =
-                resolve_constants(&state.db, &manifest.constants, missing_constant).await?;
+            let (out, read) = resolve_constants(&state.db, &manifest.constants, unresolved).await?;
             consumed.extend(read);
             out
         }
@@ -6861,7 +6868,7 @@ pub(super) async fn run_stored_cases(
         // calculate path reads.
         let constants = case.get("constants").and_then(|v| v.as_object());
         let body = serde_json::to_vec(&case_body(case)).unwrap_or_default();
-        let outcome = run_tool_body(state, &tool, &body, constants, MissingConstant::Refuse).await;
+        let outcome = run_tool_body(state, &tool, &body, constants, Unresolved::Refuse).await;
 
         let mut failures = Vec::new();
         let mut error = None;

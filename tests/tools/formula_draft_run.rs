@@ -245,3 +245,69 @@ async fn no_api_token_reaches_the_formula_draft_run() {
         "an admin-only route: {status}"
     );
 }
+
+/// Scenario: the operator opens the visit plot of an unsaved set at a site with two visits.
+/// Expected behaviour: one request runs the set at each visit in the order asked, reading each
+/// visit's own values, and writes nothing.
+#[tokio::test]
+#[serial]
+async fn an_unsaved_formula_set_runs_at_each_visit_in_one_request() {
+    let (db, app, token, admin) = setup().await;
+    let (script_id, _) = seed_calculation(&db).await;
+    let later = "2025-07-10T09:00:00Z";
+    for (value, time) in [(8.0, AT), (9.5, later)] {
+        let (status, body) = crate::common::post_checked_grab(
+            &app,
+            &json!({
+                "site_id": SITE1_ID,
+                "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": value, "time": time }],
+            }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let before = (count(&db, "tool_runs").await, count(&db, "readings").await);
+
+    let payload = json!({
+        "formulas": [{ "code": "Twice_DO", "formula": "Dissolved_O2 * 2", "ordinal": 1 }],
+        "inputs": [
+            { "site_id": SITE1_ID, "collected_at": later },
+            { "site_id": SITE1_ID, "collected_at": AT },
+        ],
+    });
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/tool_scripts/{script_id}/formulas/draft_runs"),
+        &payload,
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let runs = body["runs"].as_array().expect("runs");
+    assert_eq!(runs.len(), 2, "{body}");
+    assert_eq!(runs[0]["results"]["Twice_DO"], json!(19.0), "{body}");
+    assert_eq!(runs[1]["results"]["Twice_DO"], json!(16.0), "{body}");
+    assert_eq!(
+        body["manifest"]["outputs"][0]["key"],
+        json!("Twice_DO"),
+        "{body}"
+    );
+    assert_eq!(
+        before,
+        (count(&db, "tool_runs").await, count(&db, "readings").await),
+        "a draft run writes nothing"
+    );
+
+    let (status, _) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/tool_scripts/{script_id}/formulas/draft_runs"),
+        &payload,
+        &token,
+    )
+    .await;
+    assert!(
+        status == 401 || status == 403,
+        "an admin-only route: {status}"
+    );
+}

@@ -20,12 +20,13 @@ use super::models::version::ToolScriptVersion;
 use super::models::{
     ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth, CalculationSites,
     ClosureQuery, ClosureResponse, CommissionRecord, CreateScriptRequest, CreateVersionRequest,
-    CreateVersionResponse, DecommissionRequest, DraftRunFailure, DraftRunFailureKind,
-    DraftRunRequest, DraftRunResponse, DraftRunResults, Engine, FormulaDraftRunRequest,
-    FormulaDraftRunResponse, FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse,
-    LintFinding, MissingConstant, RecommissionRequest, RecommissionResponse, RunTrace,
+    CreateVersionResponse, DecommissionRequest, DraftFormula, DraftRunFailure, DraftRunFailureKind,
+    DraftRunRequest, DraftRunResponse, DraftRunResults, Engine, FormulaDraftRun,
+    FormulaDraftRunRequest, FormulaDraftRunResponse, FormulaDraftRunResults,
+    FormulaDraftRunsRequest, FormulaDraftRunsResponse, InspectScriptRequest, InspectScriptResponse,
+    LintFinding, MAX_DRAFT_RUNS, RecommissionRequest, RecommissionResponse, RunTrace,
     SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula, SavedSharedStep, TakeoverConflict,
-    ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse,
+    ToolCalculation, ToolDescriptor, ToolResult, Unresolved, UpdateScriptRequest, ValidateResponse,
     VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
 };
 use super::service::{
@@ -449,7 +450,7 @@ pub async fn create_version(
         &state.db,
         &mut manifest,
         Some(&mut stored_manifest),
-        MissingConstant::Refuse,
+        Unresolved::Refuse,
     )
     .await?;
     if !catalog.errors.is_empty() {
@@ -580,7 +581,7 @@ pub async fn draft_run(
         &state.db,
         &mut manifest,
         Some(&mut draft_manifest),
-        MissingConstant::Omit,
+        Unresolved::Omit,
     )
     .await?;
     lint.extend(
@@ -611,7 +612,7 @@ pub async fn draft_run(
         &tool,
         &body,
         payload.constants.as_ref(),
-        MissingConstant::Omit,
+        Unresolved::Omit,
     )
     .await;
     let (run, failure) = match outcome {
@@ -658,14 +659,62 @@ pub async fn draft_run_formulas(
     Path(id): Path<Uuid>,
     Json(payload): Json<FormulaDraftRunRequest>,
 ) -> AppResult<Json<FormulaDraftRunResponse>> {
-    let script = load_script(&state, id).await?;
+    let (tool, manifest) = draft_formula_tool(&state, id, &payload.formulas).await?;
+    let inputs = payload.inputs.unwrap_or_else(|| serde_json::json!({}));
+    let run = run_formula_draft(&state, &tool, &inputs, payload.constants.as_ref()).await?;
+    Ok(Json(FormulaDraftRunResponse {
+        ran: run.ran,
+        run: run.run,
+        failure: run.failure,
+        manifest,
+    }))
+}
+
+/// Run an unsaved formula set at several visits in one request, as `formulas/draft_run` runs it
+/// at one. The set is resolved once; each entry of `inputs` is one run, answered in its order.
+/// Nothing is stored.
+#[utoipa::path(post, path = "/api/tool_scripts/{id}/formulas/draft_runs",
+    params(("id" = Uuid, Path, description = "The formula calculation")),
+    request_body = FormulaDraftRunsRequest,
+    responses((status = 200, body = FormulaDraftRunsResponse,
+               description = "One run per entry of inputs, and the manifest the set implies"),
+              (status = 400, description = "A formula the set refuses, a calculation that is not formula-engined, or more runs than one request takes"),
+              (status = 404, description = "No such calculation")),
+    tag = "tool_scripts")]
+pub async fn draft_run_formulas_batch(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<FormulaDraftRunsRequest>,
+) -> AppResult<Json<FormulaDraftRunsResponse>> {
+    if payload.inputs.len() > MAX_DRAFT_RUNS {
+        return Err(AppError::BadRequest(format!(
+            "{} runs asked; one request takes at most {MAX_DRAFT_RUNS}",
+            payload.inputs.len()
+        )));
+    }
+    let (tool, manifest) = draft_formula_tool(&state, id, &payload.formulas).await?;
+    let mut runs = Vec::with_capacity(payload.inputs.len());
+    for inputs in &payload.inputs {
+        runs.push(run_formula_draft(&state, &tool, inputs, payload.constants.as_ref()).await?);
+    }
+    Ok(Json(FormulaDraftRunsResponse { runs, manifest }))
+}
+
+/// An unsaved formula set as the tool a run executes, with the manifest it implies. Refused when
+/// the calculation is not formula-engined or a formula does not resolve.
+async fn draft_formula_tool(
+    state: &AppState,
+    id: Uuid,
+    formulas: &[DraftFormula],
+) -> AppResult<(ActiveTool, serde_json::Value)> {
+    let script = load_script(state, id).await?;
     if Engine::parse(&script.engine) != Some(Engine::Formula) {
         return Err(AppError::BadRequest(format!(
             "{} is a {} calculation; a formula draft runs on a formula calculation",
             script.name, script.engine
         )));
     }
-    let formulas = super::service::pin_draft_formulas(&state.db, &payload.formulas).await?;
+    let formulas = super::service::pin_draft_formulas(&state.db, formulas).await?;
     let replicated = replicated_for(&state.db).await?;
     let manifest_value = manifest_json(
         &script.label,
@@ -681,17 +730,21 @@ pub async fn draft_run_formulas(
         "script": body,
         "manifest": manifest_value,
     }));
-    let tool = ActiveTool::draft_formulas(&script, manifest, content_hash, formulas);
-    let inputs = serde_json::to_vec(&payload.inputs.unwrap_or_else(|| serde_json::json!({})))
-        .unwrap_or_default();
-    let outcome = run_tool_body(
-        &state,
-        &tool,
-        &inputs,
-        payload.constants.as_ref(),
-        MissingConstant::Omit,
-    )
-    .await;
+    Ok((
+        ActiveTool::draft_formulas(&script, manifest, content_hash, formulas),
+        manifest_value,
+    ))
+}
+
+/// One draft run of a formula tool over a calculate request body.
+async fn run_formula_draft(
+    state: &AppState,
+    tool: &ActiveTool,
+    inputs: &serde_json::Value,
+    constants: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> AppResult<FormulaDraftRun> {
+    let body = serde_json::to_vec(inputs).unwrap_or_default();
+    let outcome = run_tool_body(state, tool, &body, constants, Unresolved::Omit).await;
     let (run, failure) = match outcome {
         Ok(outcome) => (
             Some(FormulaDraftRunResults {
@@ -709,12 +762,11 @@ pub async fn draft_run_formulas(
         ),
         Err(e) => (None, Some(draft_failure(e)?)),
     };
-    Ok(Json(FormulaDraftRunResponse {
+    Ok(FormulaDraftRun {
         ran: run.is_some(),
         run,
         failure,
-        manifest: manifest_value,
-    }))
+    })
 }
 
 /// The message a refused formula carries, without the status prefix the error type adds.
@@ -843,8 +895,7 @@ pub async fn activate_version(
     // nothing (Q135).
     check_manifest_codes_resolve(&state.db, &summary.name, &version.manifest).await?;
     let catalog =
-        check_manifest_against_catalog(&state.db, &mut manifest, None, MissingConstant::Refuse)
-            .await?;
+        check_manifest_against_catalog(&state.db, &mut manifest, None, Unresolved::Refuse).await?;
     let lint: Vec<LintFinding> = catalog
         .errors
         .into_iter()
@@ -1396,6 +1447,10 @@ pub fn script_routes() -> Router<AppState> {
         .route(
             "/tool_scripts/{id}/formulas/draft_run",
             post(draft_run_formulas),
+        )
+        .route(
+            "/tool_scripts/{id}/formulas/draft_runs",
+            post(draft_run_formulas_batch),
         )
         .route("/tool_scripts/inspect", post(inspect_script))
         .route("/tool_scripts/{id}/versions", post(create_version))

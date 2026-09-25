@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use super::models::{
     ActiveTool, AppliedSite, AuditCounts, CalculationSites, Engine, EventAudit, EventContext,
-    EventPreview, EventRecompute, Manifest, MissingConstant, PreviewedValue, RecomputeOutcome,
-    RecomputeScope, RunOutcome, RunTrace, ToolCalculation, ToolResult, parse_manifest, run,
+    EventPreview, EventRecompute, Manifest, PreviewedValue, RecomputeOutcome, RecomputeScope,
+    RunOutcome, RunTrace, ToolCalculation, ToolResult, Unresolved, parse_manifest, run,
 };
 use super::service::{
     ParameterCatalog, ResolvedRun, VisitContext, build, evaluate_with_trace, execute_resolved,
@@ -970,7 +970,7 @@ async fn walk_event(
             tool,
             &body_bytes,
             None,
-            MissingConstant::Refuse,
+            Unresolved::Refuse,
             Some(&*staged),
         )
         .await
@@ -1685,6 +1685,7 @@ pub(super) async fn inputs_exist(
         Some(event.site_id),
         &mut body,
         &mut consumed,
+        Unresolved::Refuse,
     )
     .await;
     if site.is_err() {

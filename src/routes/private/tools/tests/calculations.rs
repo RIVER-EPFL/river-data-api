@@ -1,5 +1,5 @@
-use super::{ClosureQuery, closure_subject, parse_ids};
-use crate::routes::private::tools::models::Subject;
+use super::{ClosureQuery, closure_subject, parse_ids, without_site};
+use crate::routes::private::tools::models::{ManifestSiteInput, Subject, Unresolved};
 
 #[test]
 fn an_empty_or_absent_list_is_no_parameters_rather_than_an_error() {
@@ -112,4 +112,26 @@ fn janitor_fills_are_summed_per_calculation_and_site_across_runs() {
     let scoped = super::sum_janitor_fills(&details, Some(&[saxon]));
     assert_eq!(scoped[&pco2].len(), 1);
     assert_eq!(scoped[&pco2][&saxon], 14);
+}
+
+#[test]
+fn test_without_site_draft_leaves_a_site_property_awaiting_a_value() {
+    let latitude = ManifestSiteInput {
+        property: "latitude".to_string(),
+        param: None,
+        required: true,
+    };
+    assert!(without_site("pco2", &[&latitude], Unresolved::Omit).is_ok());
+    let refused = without_site("pco2", &[&latitude], Unresolved::Refuse).expect_err("stored run");
+    assert!(refused.to_string().contains("site property 'latitude'"));
+}
+
+#[test]
+fn test_without_site_optional_property_never_refuses() {
+    let altitude = ManifestSiteInput {
+        property: "altitude_m".to_string(),
+        param: None,
+        required: false,
+    };
+    assert!(without_site("pco2", &[&altitude], Unresolved::Refuse).is_ok());
 }
