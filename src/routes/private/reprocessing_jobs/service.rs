@@ -1014,28 +1014,35 @@ impl JobContext {
             .await;
     }
 
-    /// Atomically persist `progress` (and `total` when provided) onto the row **and** emit the
-    /// matching `JobProgress` event, so the stored row and the live SSE stream never disagree and a
-    /// crash leaves a truthful last-known checkpoint. Best-effort: a failed write is logged, never
-    /// fatal to the job.
+    /// Persist `progress` (and `total` when provided) onto the row, then emit a `JobProgress`
+    /// carrying the values the row now holds, so a count-only update keeps the stored total and
+    /// the live stream never announces what was not stored. Best-effort: a failed write is logged
+    /// and announces nothing, never fatal to the job.
     pub async fn set_progress(&self, progress: i32, total: Option<i32>) {
         let mut update = super::models::job::Entity::update_many()
             .col_expr(super::models::job::Column::Progress, Expr::value(progress));
         if let Some(t) = total {
             update = update.col_expr(super::models::job::Column::Total, Expr::value(t));
         }
-        if let Err(e) = update
+        let stored = match update
             .filter(super::models::job::Column::Id.eq(self.job_id))
-            .exec(&self.db)
+            .exec_with_returning(&self.db)
             .await
         {
-            tracing::warn!(error = %e, job_id = %self.job_id, "Failed to update job progress");
-        }
+            Ok(rows) => rows.into_iter().next(),
+            Err(e) => {
+                tracing::warn!(error = %e, job_id = %self.job_id, "Failed to update job progress");
+                return;
+            }
+        };
+        let Some(row) = stored else {
+            return;
+        };
         let _ = self.events.send(crate::common::AppEvent::JobProgress {
             job_id: self.job_id,
             status: "running".into(),
-            progress: Some(progress),
-            total,
+            progress: row.progress,
+            total: row.total,
         });
     }
 }
