@@ -30,7 +30,7 @@ use super::models::{
     VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
 };
 use super::service::{
-    FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
+    FormulaWrite, audit_after_activation, calculation_health, calculation_slots,
     calculations_fed_by_subject, canonical_hash, carry_renames, check_engine,
     check_manifest_against_catalog, check_manifest_codes_resolve, closure_subject,
     codes_held_elsewhere, coverage_for, decommission_reason, find_active_tool, find_run_in_scope,
@@ -261,22 +261,15 @@ pub async fn get_calculation_health(
     ))
 }
 
-/// List every calculation with its live version and how many versions it has. Requires
-/// Administrator.
-#[utoipa::path(get, path = "/api/tool_scripts",
+/// The calculations with their live version and how many versions each has, a page at a time,
+/// filtered and sorted as crudcrate's list is. Requires Administrator.
+#[utoipa::path(get, path = "/api/tool_scripts", params(crudcrate::FilterOptions),
     responses((status = 200, body = [ToolScriptList])), tag = "tool_scripts")]
-pub async fn list_scripts(State(state): State<AppState>) -> AppResult<Json<Vec<ToolScriptList>>> {
-    <ToolScript as CRUDResource>::get_all(
-        &state.db,
-        &sea_orm::Condition::all(),
-        super::models::script::Column::Name,
-        sea_orm::Order::Asc,
-        0,
-        LIST_LIMIT,
-    )
-    .await
-    .map(Json)
-    .map_err(|e| AppError::Internal(e.to_string()))
+pub async fn list_scripts(
+    State(state): State<AppState>,
+    query: Query<crudcrate::FilterOptions>,
+) -> Result<Response, crudcrate::ApiError> {
+    script_entity::get_all_handler(query, State(state.db.clone()), None, None).await
 }
 
 /// One calculation with its version history, newest first. Requires Administrator.

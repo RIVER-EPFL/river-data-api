@@ -6438,9 +6438,6 @@ impl CRUDOperations for ToolScriptOperations {
     }
 }
 
-/// A page big enough for a catalogue of calculations; the surface is a dozen rows, not a feed.
-pub(super) const LIST_LIMIT: u64 = 500;
-
 /// Packages a script may load or reach into with `::`: `riverdata.tools`' `SCRIPT_PACKAGES`, the
 /// calculation packages in its `Suggests` (pracma, signal, bigleaf), base R and the runner's own
 /// package. The image installs more than this, and none of the rest is a script's to reach.

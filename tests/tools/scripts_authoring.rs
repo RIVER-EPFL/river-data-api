@@ -1088,3 +1088,47 @@ async fn an_authored_hash_recomputes_from_the_stored_version() {
         "a fetched version posted back is the same version: {reposted}"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn test_list_scripts_pages_and_filters_by_name() {
+    if !crate::common::profile::Service::Keycloak
+        .require("test_list_scripts_pages_and_filters_by_name")
+        .await
+    {
+        return;
+    }
+    let (app, admin, id, db) = setup_with_db("list_probe_first").await;
+    remove_script(&db, "list_probe_second").await;
+    let (status, _) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tool_scripts",
+        &json!({ "name": "list_probe_second", "label": "List probe" }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // One row a page, with the whole count in the range header.
+    let (status, headers, body) =
+        crate::common::get_with_token_headers(&app, "/api/tool_scripts?range=%5B0%2C0%5D", &admin)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.len(), 1);
+    let range = headers["content-range"].to_str().unwrap();
+    let total: usize = range.rsplit('/').next().unwrap().parse().unwrap();
+    assert!(total >= 2, "content-range {range}");
+
+    // By name, whatever its place in the catalog.
+    let (status, _, body) = crate::common::get_with_token_headers(
+        &app,
+        "/api/tool_scripts?filter=%7B%22name%22%3A%22list_probe_first%22%7D",
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], id);
+}

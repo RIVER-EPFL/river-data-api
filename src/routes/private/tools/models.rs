@@ -115,6 +115,7 @@ pub mod script {
         name_singular = "tool_script",
         name_plural = "tool_scripts",
         derive_partial_eq,
+        generate_router,
         operations = ToolScriptOperations
     )]
     pub struct Model {
